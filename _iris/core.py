@@ -854,7 +854,7 @@ class VaultIndex:
     fts        – FTS5 full-text search over note body text
     """
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def __init__(self, vault_root: Path):
         self._root = vault_root
@@ -1256,6 +1256,19 @@ class VaultIndex:
             ORDER BY warranty_until DESC
         """)
 
+        # -- note_embeddings: semantic search vectors (one row per note per model)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS note_embeddings (
+                note_path     TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+                model         TEXT NOT NULL,
+                content_hash  TEXT NOT NULL,
+                dim           INTEGER NOT NULL,
+                embedding     BLOB NOT NULL,
+                embedded_at   TEXT NOT NULL,
+                PRIMARY KEY (note_path, model)
+            )
+        """)
+
         # -- useful indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_files_suffix ON files(suffix)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_notes_type ON notes(type)")
@@ -1274,6 +1287,7 @@ class VaultIndex:
         c.execute("CREATE INDEX IF NOT EXISTS idx_revisions_path ON revisions(path)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_revisions_saved ON revisions(saved_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_access_count ON note_access(access_count)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_model ON note_embeddings(model)")
 
         c.execute(
             "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)",

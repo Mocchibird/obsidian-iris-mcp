@@ -66,6 +66,33 @@ The `vault_cron.py` script (run from a launchd job or manually) syncs tasks and 
 ./vault_cron.py --sync
 ```
 
+### 5. (Optional) Semantic search
+
+Iris can rank notes by meaning, not just keyword. It calls any OpenAI-compatible `/v1/embeddings` endpoint — so the same code works against [Ollama](https://ollama.com/), LM Studio, or the OpenAI API.
+
+```bash
+# one-time setup with Ollama (free, fully local)
+brew install ollama
+ollama serve &
+ollama pull nomic-embed-text
+```
+
+In Claude:
+
+```
+> reindex_embeddings()        # one-time bulk index (~1–5 min for ~600 notes)
+> semantic_search("stressed about deadlines", top_k=5)
+> embedding_status()          # health check
+```
+
+Switch backends by setting env vars before launching Iris (defaults in parens):
+
+| Variable             | Default                                     |
+|----------------------|---------------------------------------------|
+| `IRIS_EMBED_URL`     | `http://localhost:11434/v1/embeddings`      |
+| `IRIS_EMBED_MODEL`   | `nomic-embed-text`                          |
+| `IRIS_EMBED_API_KEY` | _(unset; set for OpenAI or hosted models)_  |
+
 ## Architecture
 
 ```

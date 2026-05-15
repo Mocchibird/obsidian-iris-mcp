@@ -15,6 +15,7 @@ from . import sqlite        # noqa: F401
 from . import files         # noqa: F401
 from . import notes         # noqa: F401
 from . import search        # noqa: F401
+from . import semantic      # noqa: F401
 from . import tasks         # noqa: F401
 from . import calendar      # noqa: F401
 from . import links         # noqa: F401
