@@ -61,16 +61,26 @@ def embed_one(text: str) -> list[float]:
         raise EmbeddingError(f"Unexpected embed response: {data}") from e
 
 
-def embed_batch(texts: list[str], batch_size: int = 16) -> list[list[float]]:
-    """Embed many texts in batches. Returns vectors in input order."""
+def embed_batch(texts: list[str], batch_size: int = 8) -> list[list[float]]:
+    """Embed many texts in batches. Returns vectors in input order.
+
+    If a batch is rejected for length (typical 400 from embed servers when one
+    input exceeds context), retries each input individually with a halved
+    char limit so one oversized note doesn't kill its batch-mates.
+    """
     out: list[list[float]] = []
     for i in range(0, len(texts), batch_size):
         chunk = [t[:EMBED_MAX_CHARS] for t in texts[i : i + batch_size]]
-        data = _post({"model": EMBED_MODEL, "input": chunk})
         try:
+            data = _post({"model": EMBED_MODEL, "input": chunk})
             out.extend(item["embedding"] for item in data["data"])
-        except (KeyError, TypeError) as e:
-            raise EmbeddingError(f"Unexpected batch response: {data}") from e
+        except EmbeddingError:
+            # Fall back to one-at-a-time with aggressive truncation
+            fallback_limit = max(1000, EMBED_MAX_CHARS // 2)
+            for t in chunk:
+                trimmed = t[:fallback_limit]
+                data = _post({"model": EMBED_MODEL, "input": trimmed})
+                out.append(data["data"][0]["embedding"])
     return out
 
 

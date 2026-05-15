@@ -134,7 +134,7 @@ FOCUS_CONTEXT: dict[str, dict[str, list[str]]] = _toml_get("focus", {  # type: i
 EMBED_URL: str = _str("IRIS_EMBED_URL", ("embed", "url"), "http://localhost:11434/v1/embeddings")
 EMBED_MODEL: str = _str("IRIS_EMBED_MODEL", ("embed", "model"), "nomic-embed-text")
 EMBED_API_KEY: str = _str("IRIS_EMBED_API_KEY", ("embed", "api_key"), "")
-EMBED_MAX_CHARS: int = _int("IRIS_EMBED_MAX_CHARS", ("embed", "max_chars"), 16000)
+EMBED_MAX_CHARS: int = _int("IRIS_EMBED_MAX_CHARS", ("embed", "max_chars"), 6000)
 EMBED_TIMEOUT: int = _int("IRIS_EMBED_TIMEOUT", ("embed", "timeout"), 60)
 
 
