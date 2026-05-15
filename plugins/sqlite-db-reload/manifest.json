@@ -1,0 +1,9 @@
+{
+  "id": "sqlite-db-reload",
+  "name": "SQLite DB Companion",
+  "version": "1.1.0",
+  "minAppVersion": "0.15.0",
+  "description": "Companion to SQLite DB Plugin: (1) Reload command + obsidian:// URI handler so the MCP can refresh after writes. (2) Linkifies wikilink markup [[path|name]] inside SQL table cells — gives clickable internal links in live SQL views.",
+  "author": "Hyun-Min Chang",
+  "isDesktopOnly": true
+}

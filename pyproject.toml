@@ -1,0 +1,56 @@
+[project]
+name = "obsidian-iris-mcp"
+version = "0.1.0"
+description = "Iris — an MCP server that turns an Obsidian vault into long-term memory for Claude (and other MCP clients): SQLite-indexed notes, frontmatter, tasks, calendar, anime/people/vocab/warranty tables, Apple Reminders/Calendar sync, and live SQL views inside Obsidian."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Hyun-Min Chang" },
+]
+keywords = ["obsidian", "mcp", "claude", "anthropic", "memory", "knowledge-management", "sqlite"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+
+dependencies = [
+    "mcp>=1.0",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "ddgs>=9.0",                # DuckDuckGo search (rebranded from duckduckgo-search)
+    "python-docx>=1.0",
+    "openpyxl>=3.1",
+    "pypdf>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mocchibird/obsidian-iris-mcp"
+Repository = "https://github.com/Mocchibird/obsidian-iris-mcp"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["obsidian_memory_mcp", "vault_cron"]
+
+[tool.setuptools.packages.find]
+include = ["_iris*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

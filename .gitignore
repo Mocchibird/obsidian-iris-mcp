@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual env (the launcher path in claude_desktop_config.json points into this)
+obsidian-mcp/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project-local state
+.claude/
+*.bak
+.*.pre-split.bak
+_split.py
+
+# One-off / personal scratch
+_analyze_anime.py
+
+# Don't commit the SQLite cache or vault data — those live next to the user's
+# Obsidian vault under .ai_memory_cache/, not in this repo.
+*.db
+*.db-wal
+*.db-shm
+.ai_memory_cache/
+
+# Logs
+*.log
