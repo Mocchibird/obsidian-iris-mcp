@@ -48,10 +48,11 @@ def embedding_status() -> str:
         "SELECT COUNT(*) FROM files WHERE suffix = '.md'"
     ).fetchone()[0]
     embedded = c.execute(
-        "SELECT COUNT(*) FROM note_embeddings WHERE model = ?", (emb.EMBED_MODEL,)
+        "SELECT COUNT(DISTINCT note_path) FROM note_embeddings WHERE model = ?",
+        (emb.EMBED_MODEL,),
     ).fetchone()[0]
     stale = c.execute(
-        "SELECT COUNT(*) FROM note_embeddings ne "
+        "SELECT COUNT(DISTINCT ne.note_path) FROM note_embeddings ne "
         "JOIN files f ON ne.note_path = f.path "
         "WHERE ne.model = ? AND ne.content_hash != f.content_hash",
         (emb.EMBED_MODEL,),
@@ -140,12 +141,16 @@ def reindex_embeddings(force: bool = False, limit: int = 0) -> str:
         if len(vecs) != len(chunk):
             failed += len(chunk)
             continue
-        for (path, content_hash, _), vec in zip(chunk, vecs):
+        for (path, content_hash, src_text), vec in zip(chunk, vecs):
+            # v1: one whole-note chunk per note (chunk_id=0). Schema is ready
+            # for per-paragraph chunking later.
             c.execute(
                 "INSERT OR REPLACE INTO note_embeddings "
-                "(note_path, model, content_hash, dim, embedding, embedded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (path, emb.EMBED_MODEL, content_hash, len(vec), emb.pack(vec), now),
+                "(note_path, chunk_id, model, content_hash, chunk_start, chunk_end, "
+                " dim, embedding, embedded_at) "
+                "VALUES (?, 0, ?, ?, 0, ?, ?, ?, ?)",
+                (path, emb.EMBED_MODEL, content_hash, len(src_text),
+                 len(vec), emb.pack(vec), now),
             )
         c.commit()
         done += len(chunk)
@@ -188,7 +193,7 @@ def semantic_search(query: str, top_k: int = 10, filter_folder: str = "") -> str
         params.append(f"{filter_folder.strip().rstrip('/')}/%")
 
     rows = c.execute(
-        f"SELECT ne.note_path, ne.embedding, n.title "
+        f"SELECT ne.note_path, ne.chunk_id, ne.embedding, n.title "
         f"FROM note_embeddings ne "
         f"LEFT JOIN notes n ON n.path = ne.note_path "
         f"{where}",
@@ -206,16 +211,25 @@ def semantic_search(query: str, top_k: int = 10, filter_folder: str = "") -> str
     except emb.EmbeddingError as e:
         return f"Embedding query failed: {e}\n\n{emb.config_summary()}"
 
-    scored: list[tuple[float, str, str]] = []
+    # Score every chunk, then keep the best chunk per note (relevant once we
+    # actually have chunk_id > 0; harmless when there's only chunk_id=0).
+    best_per_note: dict[str, tuple[float, str, int]] = {}
     for r in rows:
         vec = emb.unpack(r["embedding"])
         score = emb.cosine(q_vec, vec)
         title = r["title"] or Path(r["note_path"]).stem
-        scored.append((score, r["note_path"], title))
-    scored.sort(reverse=True)
+        prev = best_per_note.get(r["note_path"])
+        if prev is None or score > prev[0]:
+            best_per_note[r["note_path"]] = (score, title, r["chunk_id"])
+
+    scored = sorted(
+        ((score, path, title, chunk_id)
+         for path, (score, title, chunk_id) in best_per_note.items()),
+        reverse=True,
+    )
 
     out = [f"Semantic search for: {query!r}   (model: {emb.EMBED_MODEL})"]
-    for score, path, title in scored[:top_k]:
+    for score, path, title, _chunk_id in scored[:top_k]:
         link = f"[[{path[:-3]}|{title}]]" if path.endswith(".md") else path
         out.append(f"{score:+.3f}  {link}")
     return "\n".join(out)

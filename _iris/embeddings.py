@@ -1,12 +1,7 @@
 """Embedding client and helpers for semantic search.
 
-Talks to any OpenAI-compatible /v1/embeddings endpoint. Configurable via env:
-
-    IRIS_EMBED_URL       default http://localhost:11434/v1/embeddings  (Ollama)
-    IRIS_EMBED_MODEL     default nomic-embed-text
-    IRIS_EMBED_API_KEY   default ""  (set for OpenAI proper)
-    IRIS_EMBED_MAX_CHARS default 16000   (~4K tokens, well under nomic's 8K limit)
-    IRIS_EMBED_TIMEOUT   default 60      (seconds)
+Talks to any OpenAI-compatible /v1/embeddings endpoint. All config lives in
+``iris_config`` (env vars + optional ~/.config/iris/config.toml).
 
 LM Studio: set IRIS_EMBED_URL=http://localhost:1234/v1/embeddings.
 OpenAI:    set IRIS_EMBED_URL=https://api.openai.com/v1/embeddings + IRIS_EMBED_API_KEY.
@@ -18,16 +13,18 @@ from __future__ import annotations
 
 import array
 import math
-import os
 
 import httpx
 
+import iris_config as cfg
 
-EMBED_URL = os.environ.get("IRIS_EMBED_URL", "http://localhost:11434/v1/embeddings")
-EMBED_MODEL = os.environ.get("IRIS_EMBED_MODEL", "nomic-embed-text")
-EMBED_API_KEY = os.environ.get("IRIS_EMBED_API_KEY", "")
-EMBED_MAX_CHARS = int(os.environ.get("IRIS_EMBED_MAX_CHARS", "16000"))
-EMBED_TIMEOUT = int(os.environ.get("IRIS_EMBED_TIMEOUT", "60"))
+
+# Re-exported for convenience so call sites don't need to import iris_config
+EMBED_URL = cfg.EMBED_URL
+EMBED_MODEL = cfg.EMBED_MODEL
+EMBED_API_KEY = cfg.EMBED_API_KEY
+EMBED_MAX_CHARS = cfg.EMBED_MAX_CHARS
+EMBED_TIMEOUT = cfg.EMBED_TIMEOUT
 
 
 class EmbeddingError(RuntimeError):
