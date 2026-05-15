@@ -817,3 +817,261 @@ def schedule_review(path: str, in_days: int = 7, reason: str = "") -> str:
     return f"ok {rel} review on {review_date}"
 
 
+# ─── Missed tasks: look backward and carry forward ──────────────────────────
+# =============================================================================
+# Surface unchecked tasks/reminders from past daily notes so the user (or Iris)
+# can roll them forward to today. Items already marked `rolled: <date>` are
+# skipped so we don't keep nagging.
+# =============================================================================
+
+_DAILY_NOTE_PATH_RE = re.compile(r"^30_Episodic/(\d{4})/(\d{4}-\d{2}-\d{2})\.md$")
+
+
+def _daily_dates_back(days_back: int) -> list[str]:
+    """Return ISO dates for [today-days_back, today-1] inclusive, newest first."""
+    today = datetime.now().date()
+    return [(today - timedelta(days=n)).isoformat() for n in range(1, days_back + 1)]
+
+
+def _collect_unfinished_in_daily_notes(
+    days_back: int, sections: tuple[str, ...] = ("Tasks", "Reminders"),
+) -> list[dict[str, Any]]:
+    """Walk past daily notes, return unchecked, non-rolled task bullets.
+
+    Each entry: {date, path, section, parsed (the parse_task_bullet dict)}.
+    """
+    out: list[dict[str, Any]] = []
+    for iso in _daily_dates_back(days_back):
+        rel = _daily_note_path(iso)
+        full = safe_path(rel)
+        if not full.exists():
+            continue
+        text = read_text(full)
+        if not text:
+            continue
+        for section in sections:
+            for offset, raw_line, parsed in find_task_lines_in_section(text, section):
+                if parsed["checked"]:
+                    continue
+                # Skip items already rolled forward
+                if "rolled" in parsed.get("extra", {}):
+                    continue
+                out.append({
+                    "date": iso,
+                    "path": rel,
+                    "section": section,
+                    "offset": offset,
+                    "raw_line": raw_line,
+                    "parsed": parsed,
+                })
+    return out
+
+
+@mcp.tool()
+def list_unfinished_tasks(days_back: int = 7, limit: int = 200) -> str:
+    """Surface tasks and reminders the user may have missed in the last N days.
+
+    Combines two sources:
+      1. Unchecked tasks and reminders in daily notes
+         (``30_Episodic/YYYY/YYYY-MM-DD.md``) for the past ``days_back`` days,
+         today excluded.
+      2. Any task with an explicit ``due:`` date that's now in the past
+         (regardless of which note it lives in).
+
+    Items already marked ``rolled: <date>`` in their metadata are filtered
+    out — those have already been carried forward, so this won't keep
+    nagging about them.
+
+    Useful for end-of-day check-ins ("anything I missed?") or when Iris wants
+    to prompt the user about stale work. Pair with ``carry_forward_tasks`` to
+    actually move items to today.
+
+    Args:
+        days_back: How many days back to scan daily notes (1–60).
+        limit: Maximum items to return.
+    """
+    days_back = max(1, min(int(days_back), 60))
+    limit = max(1, min(int(limit), 5000))
+    today_str = datetime.now().date().isoformat()
+
+    out_lines: list[str] = []
+
+    # 1. Daily-note bullets
+    bullets = _collect_unfinished_in_daily_notes(days_back)
+    if bullets:
+        out_lines.append(f"[unchecked in last {days_back} day(s) of daily notes: {len(bullets)}]")
+        for item in bullets[:limit]:
+            p = item["parsed"]
+            extras = []
+            if p["due"]:
+                extras.append(f"due:{p['due']}")
+            if p["remind_on"]:
+                extras.append(f"remind_on:{p['remind_on']}")
+            if p["priority"]:
+                extras.append(f"prio:{p['priority']}")
+            tail = f" [{', '.join(extras)}]" if extras else ""
+            out_lines.append(
+                f"{item['date']} {item['section'][:1]}| {p['text']}{tail}"
+            )
+
+    # 2. Overdue tasks with explicit due dates, ignoring daily-note bullets we
+    # already listed (dedup by note_path + text).
+    already = {(b["path"], b["parsed"]["text"]) for b in bullets}
+    idx = get_vault_index()
+    overdue_rows = idx.query_tasks(checked=False, limit=limit)
+    overdue: list[dict] = []
+    for t in overdue_rows:
+        due_dt = parse_iso_date(t["due"])
+        if due_dt is None:
+            continue
+        if due_dt.date().isoformat() >= today_str:
+            continue
+        if (t["note_path"], t["text"]) in already:
+            continue
+        overdue.append(t)
+    if overdue:
+        if out_lines:
+            out_lines.append("")
+        out_lines.append(f"[overdue tasks (due < today): {len(overdue)}]")
+        for t in overdue[:limit]:
+            prio = f" prio:{t['priority']}" if t["priority"] else ""
+            out_lines.append(f"{t['due']} | {t['note_path']} | {t['text']}{prio}")
+
+    if not out_lines:
+        return "none — no unfinished tasks or reminders found in the look-back window."
+    return "\n".join(out_lines)
+
+
+@mcp.tool()
+def carry_forward_tasks(
+    days_back: int = 7,
+    sections: list[str] | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Move unchecked tasks/reminders from recent daily notes to today's note.
+
+    For each unchecked bullet found in daily notes from the past ``days_back``
+    days (excluding today):
+
+      1. Append a copy of the bullet to **today's** daily note in the same
+         section. The new bullet adds ``rolled_from: <orig_date>`` so its
+         history is preserved.
+      2. Annotate the **source** bullet with ``rolled: <today>`` so
+         ``list_unfinished_tasks`` won't surface it again. The source bullet
+         stays unchecked — this is a "move," not a fake completion.
+
+    Idempotent in two ways: items already marked ``rolled`` are skipped, and
+    if today's note already has a bullet with identical text in the target
+    section, that one is skipped too (no duplicates).
+
+    Args:
+        days_back: How many days back to scan (1–60).
+        sections: Sections to scan. Default: ``["Tasks", "Reminders"]``.
+        dry_run: If True, describe what would happen without writing.
+    """
+    days_back = max(1, min(int(days_back), 60))
+    use_sections = tuple(sections) if sections else ("Tasks", "Reminders")
+    today_str = datetime.now().date().isoformat()
+
+    bullets = _collect_unfinished_in_daily_notes(days_back, sections=use_sections)
+    if not bullets:
+        return "Nothing to carry forward — no unchecked bullets in the look-back window."
+
+    if dry_run:
+        lines = [f"[dry-run] Would carry forward {len(bullets)} bullet(s) to {today_str}:"]
+        for b in bullets:
+            lines.append(f"  {b['date']} {b['section'][:1]}|  {b['parsed']['text']}")
+        return "\n".join(lines)
+
+    today_note = _ensure_daily_note(today_str)
+    today_text = read_text(today_note)
+
+    # Existing-text dedupe set (per section)
+    existing_by_section: dict[str, set[str]] = {}
+    for sec in use_sections:
+        existing_by_section[sec] = {
+            p["text"].strip()
+            for _, _, p in find_task_lines_in_section(today_text, sec)
+        }
+
+    # Group source-note edits so we touch each daily note at most once.
+    by_source_path: dict[str, list[dict[str, Any]]] = {}
+    for b in bullets:
+        by_source_path.setdefault(b["path"], []).append(b)
+
+    rolled_count = 0
+    skipped_dupe = 0
+
+    # ── 1. Append to today's note (one section at a time) ─────────────────
+    for sec in use_sections:
+        section_bullets = [b for b in bullets if b["section"] == sec]
+        for b in section_bullets:
+            text = b["parsed"]["text"].strip()
+            if text in existing_by_section[sec]:
+                skipped_dupe += 1
+                continue
+            p = b["parsed"]
+            extra = dict(p.get("extra") or {})
+            extra["rolled_from"] = b["date"]
+            new_bullet = format_task_bullet(
+                p["text"],
+                due=p["due"],
+                priority=p["priority"],
+                remind_on=p["remind_on"],
+                repeat=p["repeat"],
+                task_id=p["id"],
+                extra=extra,
+                checked=False,
+            )
+            today_text = append_bullet_to_section(today_text, sec, new_bullet)
+            existing_by_section[sec].add(text)
+            rolled_count += 1
+    today_note.write_text(today_text, encoding="utf-8")
+    _notify_index_of_write(today_note, text=today_text)
+
+    # ── 2. Mark each source bullet with rolled: <today> ───────────────────
+    # We rewrite each source note once, replacing all of its unchecked-and-
+    # not-yet-rolled bullets in one pass to avoid line-offset drift.
+    notes_touched = 0
+    for src_path, items in by_source_path.items():
+        full = safe_path(src_path)
+        if not full.exists():
+            continue
+        src_text = read_text(full)
+        for b in items:
+            text = b["parsed"]["text"].strip()
+            # Find the unchecked bullet currently in this section and rewrite it
+            for offset, raw_line, parsed in find_task_lines_in_section(src_text, b["section"]):
+                if parsed["checked"]:
+                    continue
+                if parsed["text"].strip() != text:
+                    continue
+                if "rolled" in parsed.get("extra", {}):
+                    continue
+                extra = dict(parsed.get("extra") or {})
+                extra["rolled"] = today_str
+                new_line = format_task_bullet(
+                    parsed["text"],
+                    due=parsed["due"],
+                    priority=parsed["priority"],
+                    remind_on=parsed["remind_on"],
+                    repeat=parsed["repeat"],
+                    task_id=parsed["id"],
+                    extra=extra,
+                    checked=False,
+                    indent=parsed["indent"],
+                )
+                src_text = replace_line_at(src_text, offset, raw_line, new_line)
+                break
+        full.write_text(src_text, encoding="utf-8")
+        _notify_index_of_write(full, text=src_text)
+        notes_touched += 1
+
+    summary = (
+        f"Rolled {rolled_count} bullet(s) forward to {today_str} "
+        f"from {notes_touched} source note(s)."
+    )
+    if skipped_dupe:
+        summary += f" Skipped {skipped_dupe} duplicate(s) already in today's note."
+    return summary
+
