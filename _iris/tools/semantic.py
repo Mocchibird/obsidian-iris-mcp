@@ -12,10 +12,14 @@ from pathlib import Path
 
 from .. import mcp
 from ..core import (
+    extract_wikilinks,
     get_vault_index,
     get_vault_root,
     is_ignored_path,
+    note_target_to_relative_md,
     read_text,
+    relative_to_vault,
+    safe_path,
     split_frontmatter,
     title_from_text,
 )
@@ -394,4 +398,112 @@ def semantic_search(
                     out.append(f"        ↳ {snippet}")
             except OSError:
                 pass
+    return "\n".join(out)
+
+
+@mcp.tool()
+def suggest_links_for(
+    path: str,
+    top_k: int = 10,
+    min_score: float = 0.45,
+    include_hubs: bool = False,
+) -> str:
+    """Suggest wikilinks for ``path`` based on semantic similarity.
+
+    Reads the note, embeds it, and ranks all other indexed notes by cosine
+    similarity. Filters out:
+      - the note itself
+      - notes already wikilinked from this note (extracted from its body)
+      - hub/index/dashboard/moc notes (unless include_hubs=True)
+      - results below ``min_score``
+
+    Use this to grow the vault graph after writing a note — surfaces related
+    content you forgot to link. Pairs nicely with ``add_wikilink``.
+
+    Args:
+        path: Vault-relative path to a Markdown note.
+        top_k: Maximum suggestions to return.
+        min_score: Cosine threshold (0–1). Default 0.45 filters weak matches.
+        include_hubs: If True, allow hub/index notes in the suggestions.
+    """
+    note = safe_path(path)
+    if not note.exists():
+        return f"err: note not found: {path}"
+    raw = read_text(note)
+    if not raw:
+        return f"err: note empty: {path}"
+    _, body = split_frontmatter(raw)
+
+    # Existing wikilinks targets (normalize to relative .md form for set membership)
+    existing: set[str] = set()
+    for link in extract_wikilinks(body):
+        target_md = note_target_to_relative_md(link.get("target", ""))
+        if target_md:
+            existing.add(target_md)
+
+    idx = get_vault_index()
+    c = idx.conn
+    rel = relative_to_vault(note)
+
+    where = "WHERE ne.model = ? AND ne.note_path != ?"
+    params: list = [emb.EMBED_MODEL, rel]
+    if not include_hubs:
+        placeholders = ",".join("?" * len(_HUB_TYPES))
+        where += f" AND (n.type IS NULL OR n.type NOT IN ({placeholders}))"
+        params.extend(_HUB_TYPES)
+
+    rows = c.execute(
+        f"SELECT ne.note_path, ne.chunk_id, ne.embedding, n.title, n.type "
+        f"FROM note_embeddings ne "
+        f"LEFT JOIN notes n ON n.path = ne.note_path "
+        f"{where}",
+        params,
+    ).fetchall()
+    if not rows:
+        return ("No embeddings to compare against. "
+                "Run `reindex_embeddings` first.")
+
+    # Build a query vector from the note itself (use the same chunked text as
+    # at index time — the *whole* note's average might dilute signal, but for
+    # link suggestions whole-note feels right since we want "what else might
+    # belong here as a link" not "where is this passage from").
+    query_text = _note_text_for_embedding(note)
+    if not query_text:
+        return f"err: note has no embeddable text: {path}"
+    try:
+        q_vec = emb.embed_one(query_text)
+    except emb.EmbeddingError as e:
+        return f"Embedding the source note failed: {e}\n\n{emb.config_summary()}"
+
+    best_per_note: dict[str, tuple[float, str]] = {}
+    for r in rows:
+        vec = emb.unpack(r["embedding"])
+        score = emb.cosine(q_vec, vec)
+        title = r["title"] or Path(r["note_path"]).stem
+        prev = best_per_note.get(r["note_path"])
+        if prev is None or score > prev[0]:
+            best_per_note[r["note_path"]] = (score, title)
+
+    # Drop already-linked + below-threshold
+    candidates = []
+    for p, (score, title) in best_per_note.items():
+        if score < min_score:
+            continue
+        if p in existing:
+            continue
+        candidates.append((score, p, title))
+    candidates.sort(reverse=True)
+
+    if not candidates:
+        return ("No new link candidates above threshold "
+                f"({min_score:+.2f}). All similar notes are either already "
+                "linked or below the score cutoff.")
+
+    out = [
+        f"Link suggestions for: {rel}",
+        f"(score ≥ {min_score:+.2f}, excluding {len(existing)} already-linked)",
+    ]
+    for score, p, title in candidates[:top_k]:
+        link = f"[[{p[:-3]}|{title}]]" if p.endswith(".md") else p
+        out.append(f"{score:+.3f}  {link}")
     return "\n".join(out)

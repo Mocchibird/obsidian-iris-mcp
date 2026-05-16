@@ -54,6 +54,16 @@ def is_configured() -> bool:
     return bool(LLM_MODEL)
 
 
+def _ollama_native_url() -> str | None:
+    """If LLM_URL points at Ollama's OpenAI-compat endpoint, return the native
+    /api/chat counterpart so we can pass Ollama-specific params like ``think``.
+    Returns None when the endpoint isn't recognizably Ollama.
+    """
+    if "/v1/chat/completions" in LLM_URL and ":11434" in LLM_URL:
+        return LLM_URL.replace("/v1/chat/completions", "/api/chat")
+    return None
+
+
 def chat(
     messages: list[dict[str, str]],
     *,
@@ -61,8 +71,20 @@ def chat(
     max_tokens: int | None = None,
     temperature: float | None = None,
     timeout: int | None = None,
+    think: bool = True,
 ) -> str:
     """Send chat completion. Returns the assistant's reply text.
+
+    ``think=False`` disables the chain-of-thought stage for reasoning models
+    (Gemma 4, Qwen3-thinking, DeepSeek-R1, …) when the backend is Ollama —
+    routes to Ollama's native ``/api/chat`` endpoint with ``think: false`` so
+    the model produces direct output instead of burning the token budget on
+    internal reasoning. For non-Ollama backends the flag is silently ignored
+    and the OpenAI-compat endpoint is used as normal.
+
+    Use ``think=False`` for routine prose tasks (summaries, captions, tags)
+    where you want fast direct output. Use the default ``think=True`` when
+    you actually want the model to reason through a hard problem.
 
     Raises LLMNotConfigured if no model is set; LLMError on transport/parse issues.
     """
@@ -70,18 +92,50 @@ def chat(
     if not use_model:
         raise LLMNotConfigured(
             "No LLM model configured. Set IRIS_LLM_MODEL or [llm].model in "
-            "~/.config/iris/config.toml (e.g. 'gemma3:4b' for Ollama or LM Studio)."
+            "~/.config/iris/config.toml (e.g. 'gemma4' for Ollama or LM Studio)."
         )
-    payload: dict = {
+    eff_timeout = timeout if timeout is not None else LLM_TIMEOUT
+    eff_max = max_tokens if max_tokens is not None else LLM_MAX_TOKENS
+    eff_temp = temperature if temperature is not None else LLM_TEMPERATURE
+
+    # When the caller wants to skip thinking AND we're talking to Ollama, use
+    # the native /api/chat endpoint where `think: false` actually takes effect.
+    native_url = _ollama_native_url() if not think else None
+    if native_url:
+        payload = {
+            "model": use_model,
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "options": {
+                "num_predict": eff_max,
+                "temperature": eff_temp,
+            },
+        }
+        try:
+            r = httpx.post(native_url, json=payload, headers=_headers(),
+                           timeout=eff_timeout)
+        except httpx.HTTPError as e:
+            raise LLMError(
+                f"Could not reach Ollama native endpoint {native_url}: {e}."
+            ) from e
+        if r.status_code >= 400:
+            raise LLMError(f"Native chat failed ({r.status_code}): {r.text[:400]}")
+        data = r.json()
+        try:
+            return data["message"]["content"]
+        except (KeyError, TypeError) as e:
+            raise LLMError(f"Unexpected native chat response: {data}") from e
+
+    payload = {
         "model": use_model,
         "messages": messages,
-        "max_tokens": max_tokens if max_tokens is not None else LLM_MAX_TOKENS,
-        "temperature": temperature if temperature is not None else LLM_TEMPERATURE,
+        "max_tokens": eff_max,
+        "temperature": eff_temp,
         "stream": False,
     }
     try:
-        r = httpx.post(LLM_URL, json=payload, headers=_headers(),
-                       timeout=timeout if timeout is not None else LLM_TIMEOUT)
+        r = httpx.post(LLM_URL, json=payload, headers=_headers(), timeout=eff_timeout)
     except httpx.HTTPError as e:
         raise LLMError(
             f"Could not reach chat endpoint {LLM_URL}: {e}. "

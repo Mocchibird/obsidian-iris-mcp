@@ -31,10 +31,55 @@ from ..core import *  # noqa: F401, F403  — includes parse_iso_date
 # =============================================================================
 
 
+def _llm_prose_summary(
+    role: str,
+    structured_data: str,
+    *,
+    max_tokens: int = 200,
+) -> str:
+    """Optionally generate a leading prose paragraph for a routine summary.
+
+    Returns empty string when no LLM is configured — callers should treat
+    prose as an enhancement, not a requirement.
+
+    ``role``: short label of what we're summarizing ("morning briefing",
+    "weekly review", "evening wrapup"). Goes into the system prompt.
+    """
+    try:
+        from .. import llm
+    except ImportError:
+        return ""
+    if not llm.is_configured():
+        return ""
+    system = (
+        f"You are Iris, a friendly personal-vault assistant writing a {role} "
+        "for the user (Hyun-Min). Given the structured data below, write a "
+        "single short paragraph (2–4 sentences) that captures the highlights "
+        "in a natural voice. Don't enumerate everything — pick what matters. "
+        "Don't use bullet points; the structured list follows separately."
+    )
+    try:
+        return llm.chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": structured_data},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.6,
+            think=False,   # routine prose — skip chain-of-thought
+        ).strip()
+    except llm.LLMError:
+        return ""
+
+
 @mcp.tool()
 def morning_briefing(date: str = "today") -> str:
     """
     Comprehensive daily overview: schedule, tasks, reminders, inbox, projects.
+
+    If an LLM is configured (IRIS_LLM_MODEL), a short prose summary is
+    prepended above the structured sections. Otherwise the structured
+    output is returned alone.
 
     ``date`` accepts natural language: "today", "tomorrow", etc.
     """
@@ -116,7 +161,27 @@ def morning_briefing(date: str = "today") -> str:
         for r in remind_today:
             lines.append(f"- 🔔 {r['text']}")
 
-    # 4. Inbox count
+    # 4. Unfinished items from recent daily notes (only when briefing TODAY)
+    if d == today:
+        try:
+            from .tasks import _collect_unfinished_in_daily_notes
+            unfinished = _collect_unfinished_in_daily_notes(days_back=7)
+            if unfinished:
+                lines.append(f"\n## Unfinished from Recent Days ({len(unfinished)})")
+                for item in unfinished[:10]:
+                    p = item["parsed"]
+                    lines.append(f"- {item['date']} {item['section'][:1]}| {p['text']}")
+                if len(unfinished) > 10:
+                    lines.append(f"- _…and {len(unfinished) - 10} more_")
+                lines.append(
+                    "→ Say _\"roll them forward\"_ and I'll move these to today "
+                    "with `carry_forward_tasks` (originals stay unchecked and get "
+                    "a `rolled:` marker)."
+                )
+        except ImportError:
+            pass
+
+    # 5. Inbox count
     root = get_vault_root()
     inbox_dir = root / "90_Inbox" / "inbox"
     inbox_count = len(list(inbox_dir.glob("*.md"))) if inbox_dir.is_dir() else 0
@@ -134,7 +199,11 @@ def morning_briefing(date: str = "today") -> str:
         for pr in project_rows:
             lines.append(f"- {make_wikilink(pr['path'], pr['title'])}")
 
-    return "\n".join(lines)
+    structured = "\n".join(lines)
+    prose = _llm_prose_summary("morning briefing", structured, max_tokens=180)
+    if prose:
+        return f"{lines[0]}\n\n_{prose}_\n\n" + "\n".join(lines[1:])
+    return structured
 
 
 @mcp.tool()
@@ -202,7 +271,11 @@ def weekly_review(date: str = "today") -> str:
     for r in recent_rows[:20]:
         lines.append(f"- {make_wikilink(r['path'], r['title'])}")
 
-    return "\n".join(lines)
+    structured = "\n".join(lines)
+    prose = _llm_prose_summary("weekly review", structured, max_tokens=220)
+    if prose:
+        return f"{lines[0]}\n\n_{prose}_\n\n" + "\n".join(lines[1:])
+    return structured
 
 
 

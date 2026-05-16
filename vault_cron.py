@@ -50,6 +50,7 @@ REMINDERS_LIST = cfg.REMINDERS_LIST
 CALENDAR_NAME = cfg.CALENDAR_NAME
 CALENDAR_EXCLUDE = cfg.CALENDAR_EXCLUDE
 FOCUS_CONTEXT = cfg.FOCUS_CONTEXT
+HEALTH_SHORTCUT = cfg.HEALTH_SHORTCUT
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -1788,6 +1789,121 @@ def cmd_import_drop_zone(args: argparse.Namespace) -> None:
         print(line)
 
 
+# ── Quick capture (standalone, MCP-free) ─────────────────────────────────────
+# Write a thought to 90_Inbox/inbox/ without going through Claude/MCP. Designed
+# for iOS Shortcuts, hotkey scripts, terminal one-liners, etc.
+
+def quick_capture_cli(thought: str, title: str = "", tags: list[str] | None = None) -> str:
+    if not thought.strip():
+        return "err: nothing to capture (empty thought)"
+    now = datetime.now()
+    date_str = now.date().isoformat()
+    time_slug = now.strftime("%H%M%S")
+    if title.strip():
+        slug_chars = [ch.lower() if ch.isalnum() else "_" for ch in title.strip()]
+        slug = "_".join(p for p in "".join(slug_chars).split("_") if p) or "capture"
+    else:
+        slug = "capture"
+    filename = f"{date_str}_{time_slug}_{slug}.md"
+    target = VAULT_ROOT / "90_Inbox" / "inbox" / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    tag_list = ["inbox"] + [t.strip() for t in (tags or []) if t.strip()]
+    fm_lines = [
+        "---",
+        "type: capture",
+        f"created: {date_str}",
+        "status: inbox",
+        "tags:",
+        *(f"  - {t}" for t in tag_list),
+        "---",
+        "",
+        f"# {title.strip() or 'Quick Capture'}",
+        "",
+        thought.strip(),
+        "",
+    ]
+    target.write_text("\n".join(fm_lines), encoding="utf-8")
+    log.info(f"Quick capture → {target.relative_to(VAULT_ROOT)}")
+    return str(target.relative_to(VAULT_ROOT))
+
+
+# ── Apple Health snapshot ────────────────────────────────────────────────────
+# Run a user-defined Apple Shortcut (default name: "Iris Health") and drop its
+# output into today's daily note ## Health section. The shortcut can return
+# whatever the user wants — newline-separated metrics, JSON, narrative — Iris
+# just inserts it verbatim. Re-running replaces the section (idempotent).
+
+def pull_health_snapshot(target_date: str | None = None, dry_run: bool = False) -> str:
+    """Run the configured health shortcut and stash its output in the daily note."""
+    d = date.fromisoformat(target_date) if target_date else date.today()
+    d_str = d.isoformat()
+    day_name = d.strftime("%A")
+    log.info(f"Pulling Apple Health snapshot for {d_str} ({day_name}) "
+             f"via shortcut {HEALTH_SHORTCUT!r}")
+
+    output = run_shortcut(HEALTH_SHORTCUT)
+    if not output or output.startswith("Shortcut"):
+        # run_shortcut returns "Shortcut 'X' failed: ..." or "... not found"
+        msg = output or "(empty output)"
+        log.warning(f"Health shortcut returned no usable data: {msg}")
+        return f"err: {msg}"
+    output = output.strip()
+
+    if dry_run:
+        return f"[DRY RUN] Would write to {d_str}.md ## Health:\n{output}"
+
+    # Ensure the daily note exists
+    ensure_daily_note(d)
+    note_path = VAULT_ROOT / "30_Episodic" / str(d.year) / f"{d_str}.md"
+    file_text = note_path.read_text("utf-8")
+
+    block_lines = output.splitlines()
+    block_body = "\n".join(block_lines)
+    timestamp = datetime.now().strftime("%H:%M")
+    new_section = (
+        f"## Health\n"
+        f"_Captured {timestamp} via Shortcut `{HEALTH_SHORTCUT}`_\n\n"
+        f"{block_body}"
+    )
+
+    # Replace existing ## Health section or append one
+    bounds = _find_section_bounds(file_text, "Health")
+    if bounds:
+        start, end = bounds
+        file_text = file_text[:start] + new_section + "\n" + file_text[end:]
+    else:
+        file_text = file_text.rstrip() + f"\n\n{new_section}\n"
+    note_path.write_text(file_text, "utf-8")
+    log.info(f"Wrote ## Health section to {d_str}.md ({len(block_body)} chars)")
+    return f"ok {note_path.relative_to(VAULT_ROOT)}\n\n{output}"
+
+
+def cmd_health(args: argparse.Namespace) -> None:
+    result = pull_health_snapshot(target_date=args.date, dry_run=args.dry_run)
+    print(result)
+
+
+def cmd_capture(args: argparse.Namespace) -> None:
+    # Source priority: --text > positional text > stdin (if --stdin or piped)
+    text = ""
+    if getattr(args, "text", None):
+        text = args.text
+    elif getattr(args, "text_args", None):
+        text = " ".join(args.text_args)
+    if not text and (args.stdin or not sys.stdin.isatty()):
+        text = sys.stdin.read()
+    text = text.strip()
+    if not text:
+        print("err: nothing to capture — pass text as arg, --text, or via stdin")
+        sys.exit(1)
+    tags = [t.strip() for t in (args.tag or []) if t.strip()]
+    rel = quick_capture_cli(text, title=args.title or "", tags=tags)
+    print(rel)
+    if args.notify:
+        notify("📝 Captured to inbox", rel)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Obsidian vault automation (MocchiMind)")
     sub = parser.add_subparsers(dest="command")
@@ -1829,6 +1945,31 @@ if __name__ == "__main__":
     p_import = sub.add_parser("import-drop-zone", help="Process files in 90_Inbox/inbox/")
     p_import.add_argument("--dry-run", action="store_true")
     p_import.set_defaults(func=cmd_import_drop_zone)
+
+    # health — run the user's Apple Shortcut and append output to daily note
+    p_health = sub.add_parser(
+        "health",
+        help="Pull Apple Health snapshot via a user-defined Shortcut",
+    )
+    p_health.add_argument("--date", default=None, help="YYYY-MM-DD (default: today)")
+    p_health.add_argument("--dry-run", action="store_true")
+    p_health.set_defaults(func=cmd_health)
+
+    # capture — standalone (no MCP needed) for iOS Shortcuts / hotkeys / pipelines
+    p_cap = sub.add_parser(
+        "capture",
+        help="Drop a thought into 90_Inbox/inbox/ (iOS Shortcuts / CLI / piped stdin)",
+    )
+    p_cap.add_argument("text_args", nargs="*", help="Positional capture text")
+    p_cap.add_argument("--text", default="", help="The thought text")
+    p_cap.add_argument("--title", default="", help="Optional title (becomes # heading)")
+    p_cap.add_argument("--tag", action="append", default=[],
+                       help="Tag to add (repeatable). 'inbox' is always added.")
+    p_cap.add_argument("--stdin", action="store_true",
+                       help="Read text from stdin (auto-detected when piped)")
+    p_cap.add_argument("--notify", action="store_true",
+                       help="Show a macOS notification when done")
+    p_cap.set_defaults(func=cmd_capture)
 
     # weekly-summary
     p_weekly = sub.add_parser("weekly-summary", help="Generate weekly summary note")
