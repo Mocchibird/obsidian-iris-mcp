@@ -23,12 +23,14 @@
 
 # Shared docker network so a sibling Ollama stack (see docker/ollama/) can be
 # reached by name (`http://ollama:11434`) instead of via the host IP.
-# `external: false` means this compose file creates the network if it doesn't
-# already exist; the ollama stack joins the same name and they connect.
+# `external: true` means BOTH stacks assume the network was created outside
+# of compose. Pre-create it once with:
+#     docker network create ai-models
+# Then both stacks join without arguing over ownership.
 networks:
   ai:
     name: ai-models
-    external: false
+    external: true
 
 services:
   iris:
