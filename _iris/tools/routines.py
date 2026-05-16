@@ -116,7 +116,27 @@ def morning_briefing(date: str = "today") -> str:
         for r in remind_today:
             lines.append(f"- 🔔 {r['text']}")
 
-    # 4. Inbox count
+    # 4. Unfinished items from recent daily notes (only when briefing TODAY)
+    if d == today:
+        try:
+            from .tasks import _collect_unfinished_in_daily_notes
+            unfinished = _collect_unfinished_in_daily_notes(days_back=7)
+            if unfinished:
+                lines.append(f"\n## Unfinished from Recent Days ({len(unfinished)})")
+                for item in unfinished[:10]:
+                    p = item["parsed"]
+                    lines.append(f"- {item['date']} {item['section'][:1]}| {p['text']}")
+                if len(unfinished) > 10:
+                    lines.append(f"- _…and {len(unfinished) - 10} more_")
+                lines.append(
+                    "→ Say _\"roll them forward\"_ and I'll move these to today "
+                    "with `carry_forward_tasks` (originals stay unchecked and get "
+                    "a `rolled:` marker)."
+                )
+        except ImportError:
+            pass
+
+    # 5. Inbox count
     root = get_vault_root()
     inbox_dir = root / "90_Inbox" / "inbox"
     inbox_count = len(list(inbox_dir.glob("*.md"))) if inbox_dir.is_dir() else 0
