@@ -44,3 +44,7 @@ _analyze_anime.py
 
 # Logs
 *.log
+
+# Docker — secrets and persisted Claude CLI auth
+docker/.env
+docker/claude-auth/

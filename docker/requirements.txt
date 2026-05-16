@@ -1,0 +1,5 @@
+# Phase 1 — text bot dependencies. Iris's own runtime deps (mcp, httpx, etc.)
+# come from pyproject.toml via `pip install -e .` in the Dockerfile.
+
+discord.py>=2.4
+claude-agent-sdk>=0.0.18

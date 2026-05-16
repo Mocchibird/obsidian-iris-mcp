@@ -2523,20 +2523,36 @@ def get_vault_index() -> VaultIndex:
 
 
 def _notify_index_of_write(path: Path, text: str | None = None):
-    """Call after writing/updating a file so the index stays current."""
+    """Call after writing/updating a file so the index stays current.
+
+    Index updates are best-effort: the markdown file on disk is the source
+    of truth, and a stale index can always be rebuilt with rebuild_vault_index.
+    Failures here MUST NOT bubble up — otherwise every write tool returns an
+    error to the caller even though the markdown write succeeded (e.g. when
+    running in a fresh container where the index hasn't been built yet).
+    """
     if _vault_index is None:
-        return  # index not initialized yet, nothing to update
-    if text is not None:
-        _vault_index.sync_note_text(path, text)
-    else:
-        _vault_index.sync_file(path)
+        return
+    try:
+        if text is not None:
+            _vault_index.sync_note_text(path, text)
+        else:
+            _vault_index.sync_file(path)
+    except Exception:
+        # Index out of sync — non-fatal. Caller will see "ok" on the write
+        # tool and can run rebuild_vault_index() if results look stale.
+        pass
 
 
 def _notify_index_of_delete(rel_path: str):
-    """Call after deleting a file so the index drops it."""
+    """Call after deleting a file so the index drops it. Best-effort — see
+    _notify_index_of_write for why exceptions are swallowed."""
     if _vault_index is None:
         return
-    _vault_index.remove_path(rel_path)
+    try:
+        _vault_index.remove_path(rel_path)
+    except Exception:
+        pass
 
 
 

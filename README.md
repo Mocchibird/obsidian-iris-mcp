@@ -85,6 +85,12 @@ In Claude:
 > embedding_status()          # health check
 ```
 
+### 6. (Optional) Run Iris on TrueNAS / Docker as a Discord bot
+
+You can run Iris in a container that connects to Discord and uses **your Claude subscription** (no Anthropic API key needed). See [`docker/README.md`](docker/README.md) for full setup.
+
+Apple-integration tools are macOS-only — leave the `vault_cron.py` launchd job running on your Mac to feed Apple Reminders/Calendar/Health data into the vault, and the Discord bot reads it from there.
+
 ## Configuration
 
 All Iris config — vault path, Apple list names, focus mappings, embedding/LLM endpoints — lives in [`iris_config.py`](iris_config.py). Precedence: **env var > `~/.config/iris/config.toml` > built-in default**.

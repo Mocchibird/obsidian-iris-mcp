@@ -1,0 +1,84 @@
+# docker-compose.yml — Iris Discord brain on TrueNAS (or any Docker host).
+#
+# Two host paths are configurable via .env so this same file works whether
+# you run it from inside the repo (cd obsidian-iris-mcp/docker && docker compose up)
+# OR from a Dockge stack directory (/opt/stacks/iris-discord/compose.yaml,
+# pointing at the syncthing-replicated repo somewhere else on disk):
+#
+#   IRIS_REPO_DIR   absolute path to the obsidian-iris-mcp/ repo on the host.
+#                   Default: ..   (works from inside the repo's docker/ folder)
+#   IRIS_VAULT_DIR  absolute path to the AI_Memory vault on the host.
+#                   No default — must be set.
+#   IRIS_AUTH_DIR   absolute path for persisted Claude CLI auth.
+#                   Default: ./claude-auth (next to the compose file)
+#
+# Quick start (Dockge stack):
+#   1. In Dockge, create a new stack "iris-discord".
+#   2. Paste this compose file into Dockge's editor.
+#   3. In the stack's .env (Dockge UI → Environment), set:
+#        IRIS_REPO_DIR=/mnt/<pool>/<dataset>/obsidian-vaults/obsidian-iris-mcp
+#        IRIS_VAULT_DIR=/mnt/<pool>/<dataset>/obsidian-vaults/AI_Memory
+#        DISCORD_BOT_TOKEN=...
+#   4. Deploy. First run: open a shell on the container and run `claude login`.
+
+services:
+  iris:
+    build:
+      context: ${IRIS_REPO_DIR:-..}
+      dockerfile: docker/Dockerfile
+    image: iris-discord:latest
+    container_name: iris-discord
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # ── Iris core ────────────────────────────────────────────────────────
+      IRIS_VAULT_ROOT: /vault
+      IRIS_CONFIG:     /vault/.iris-config.toml   # optional: per-vault overrides
+
+      # ── Claude Code CLI auth ─────────────────────────────────────────────
+      CLAUDE_CONFIG_DIR: /claude-auth
+      # Tell Claude Code it's OK to run as root — we're in a Docker sandbox.
+      # Without this, --dangerously-skip-permissions (which the bot uses to
+      # avoid interactive permission prompts) refuses to run for root.
+      IS_SANDBOX: "1"
+
+      # ── Bot ──────────────────────────────────────────────────────────────
+      IRIS_DISCORD_MODEL: claude-sonnet-4-6        # change to claude-opus-4 etc.
+      # IRIS_DISCORD_ALLOWED_CHANNELS: "123,456"   # optional CSV of channel IDs
+      # IRIS_DISCORD_ALLOWED_USERS:    "789,012"   # optional CSV of user IDs
+      # IRIS_DISCORD_SYSTEM_PROMPT_PATH: /vault/00_Index/iris_system_prompt.md
+
+      # ── Embeddings / local LLM (optional) ────────────────────────────────
+      # If you want semantic search inside the container, point at an Ollama
+      # reachable from here. Could be Ollama on the Mac (use the Mac's LAN IP)
+      # or a second Ollama container on the same host.
+      # IRIS_EMBED_URL:  http://192.168.1.10:11434/v1/embeddings
+      # IRIS_LLM_URL:    http://192.168.1.10:11434/v1/chat/completions
+      # IRIS_LLM_MODEL:  gemma4
+
+    volumes:
+      # ── Vault (THE source of truth — read+write) ─────────────────────────
+      - ${IRIS_VAULT_DIR}:/vault
+
+      # ── Claude CLI auth (persisted across container restarts) ────────────
+      - ${IRIS_AUTH_DIR:-./claude-auth}:/claude-auth
+
+      # ── Optional: shared MCP config so claude knows about Iris ───────────
+      # Already baked into the image via iris_mcp.example.json — only mount
+      # this if you want to override per-deployment.
+      # - ./settings.json:/claude-auth/settings.json:ro
+
+    # Phase 1 (text) needs no inbound ports. Discord uses outbound WebSocket.
+    # Phase 2 (voice) will need either UDP port forwarding or `network_mode: host`.
+    # ports:
+    #   - "0:0/udp"   # filled in when we add voice
+
+    # Resource hints. The bot itself is tiny; claude CLI is also tiny.
+    # If embeddings/LLM run in another container, this one stays small.
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
