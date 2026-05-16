@@ -200,9 +200,11 @@ The Claude auth token and your vault stay put (separate volumes).
 ## Troubleshooting
 
 - **"DISCORD_BOT_TOKEN is not set"** → fill in `docker/.env`.
-- **Bot connects but doesn't reply** → check `Message Content Intent` is enabled in the Discord Developer Portal.
-- **`claude` errors with "not authenticated"** → run step 4 again. The token directory must be writable by the container.
-- **Tool calls hang / time out** → check that the vault mount is correct: `docker exec -it iris ls /vault` should list your note folders.
+- **Bot connects but doesn't reply** → check `Message Content Intent` is enabled in the Discord Developer Portal. Also check the bot has permission to see the channel (right-click channel → Edit → Permissions).
+- **`claude` errors with "not authenticated"** → run the `claude login` step again. Inside the interactive prompt, use the slash command `/login` (not `claude login` at the shell — newer CLI versions only authenticate via the in-prompt slash command).
+- **`--dangerously-skip-permissions cannot be used with root/sudo privileges`** → the compose file already sets `IS_SANDBOX: "1"` to opt out of this check. If you're using an older version of this repo, add `IS_SANDBOX=1` to your `.env`.
+- **TrueNAS app: `unable to prepare context: path ... not found`** → Dockge's container can't see the host path. Edit the Dockge TrueNAS app and add the synced repo's parent dir as a Host Path (Source = Target = the same absolute path so compose references match host paths).
+- **Tool calls hang / time out** → check that the vault mount is correct: `docker exec -it iris-discord ls /vault` should list your note folders.
 
 ## Phase 2 — voice (planned)
 

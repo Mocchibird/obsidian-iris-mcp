@@ -38,6 +38,10 @@ services:
 
       # ── Claude Code CLI auth ─────────────────────────────────────────────
       CLAUDE_CONFIG_DIR: /claude-auth
+      # Tell Claude Code it's OK to run as root — we're in a Docker sandbox.
+      # Without this, --dangerously-skip-permissions (which the bot uses to
+      # avoid interactive permission prompts) refuses to run for root.
+      IS_SANDBOX: "1"
 
       # ── Bot ──────────────────────────────────────────────────────────────
       IRIS_DISCORD_MODEL: claude-sonnet-4-6        # change to claude-opus-4 etc.
