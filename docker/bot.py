@@ -91,6 +91,20 @@ LISTEN_ALWAYS_CHANNELS = _parse_csv_ids(
 # stays the canonical long-term memory; Discord history covers the short term.
 # Set to 0 to disable (each restart = clean slate).
 CONTEXT_MINUTES = int(os.environ.get("IRIS_DISCORD_CONTEXT_MINUTES", "60"))
+# Soft token budget for the injection. ~3 chars/token for mixed-language
+# content (CJK is denser than the English-typical 4 chars/token), so a 2000-
+# token budget is ~6000 chars. The actual selection is "fuzzy" — see below.
+CONTEXT_TOKEN_BUDGET = int(os.environ.get("IRIS_DISCORD_CONTEXT_TOKEN_BUDGET", "2000"))
+# How much we'll overshoot the budget to keep a coherent "burst" of related
+# messages intact rather than chopping it mid-conversation. 1.5 means the
+# absolute hard ceiling is 1.5 × budget.
+CONTEXT_FUZZ_FACTOR = float(os.environ.get("IRIS_DISCORD_CONTEXT_FUZZ_FACTOR", "1.5"))
+# Time gap (minutes) that ends one conversation burst and starts another.
+# Messages within this gap of each other are treated as one topic block;
+# trimming snaps to burst boundaries, never mid-block.
+CONTEXT_BURST_GAP_MIN = int(os.environ.get("IRIS_DISCORD_CONTEXT_BURST_GAP_MIN", "10"))
+# Rough conservative char-per-token estimate for budget math (CJK-friendly).
+_CHARS_PER_TOKEN = 3
 
 # ── Proactive notifications ─────────────────────────────────────────────────
 # When IRIS_DISCORD_PING_CHANNEL (legacy alias: IRIS_DISCORD_NOTIFY_CHANNEL)
@@ -287,53 +301,144 @@ def _build_options(system_prompt: str | None = None) -> ClaudeAgentOptions:
     )
 
 
+_PROACTIVE_PING_LEADS = ("⏰", "🔔", "🌅", "🌙", "💤", "🗺️")
+
+
+def _is_proactive_ping(content: str, author_is_iris: bool) -> bool:
+    if not author_is_iris:
+        return False
+    return any(content.startswith(lead) for lead in _PROACTIVE_PING_LEADS)
+
+
+def _group_into_bursts(
+    msgs: list[tuple[datetime, str]], gap_minutes: int,
+) -> list[list[tuple[datetime, str]]]:
+    """Split (timestamp, formatted-line) tuples into conversation bursts.
+
+    A "burst" is a run of messages where consecutive items are <= gap_minutes
+    apart. Trimming will snap to burst boundaries, never mid-burst.
+    """
+    if not msgs:
+        return []
+    bursts: list[list[tuple[datetime, str]]] = [[msgs[0]]]
+    for prev, current in zip(msgs, msgs[1:]):
+        gap = (current[0] - prev[0]).total_seconds() / 60
+        if gap > gap_minutes:
+            bursts.append([current])
+        else:
+            bursts[-1].append(current)
+    return bursts
+
+
+def _select_bursts_within_budget(
+    bursts: list[list[tuple[datetime, str]]],
+    char_budget: int,
+    fuzz_factor: float,
+) -> list[list[tuple[datetime, str]]]:
+    """Walk newest-burst to oldest. Include each burst whose addition keeps
+    total chars under ``char_budget * fuzz_factor``. The first burst is
+    always included even if oversized (newest = most relevant). If a single
+    burst is itself bigger than the hard ceiling, it's still returned in
+    full — the caller will then truncate from the OLDER end of that burst
+    so the most recent messages survive.
+    """
+    if not bursts:
+        return []
+    hard_cap = int(char_budget * fuzz_factor)
+    selected: list[list[tuple[datetime, str]]] = []
+    total = 0
+    for burst in reversed(bursts):
+        burst_chars = sum(len(line) + 1 for _, line in burst)  # +1 for newline
+        if not selected:
+            # Always include the newest burst, even if huge
+            selected.append(burst)
+            total += burst_chars
+            continue
+        # Fuzz rule: include if the resulting total is still within the
+        # hard cap. This implicitly allows overshoot up to fuzz_factor when
+        # an upcoming burst would push us past the soft budget — we keep
+        # the full burst together.
+        if total + burst_chars <= hard_cap:
+            selected.insert(0, burst)
+            total += burst_chars
+            # If we're past the soft budget AND the next burst is far back
+            # in time, stop. Otherwise keep going up to the hard cap.
+            if total >= char_budget:
+                continue
+        else:
+            break
+    return selected
+
+
 async def _fetch_recent_history(message: discord.Message) -> str:
-    """Pull the last CONTEXT_MINUTES of messages in this channel as a
-    string, ready to inject into a cold-start session's system prompt.
+    """Pull recent channel history for cold-start context injection.
 
-    Excludes:
-      - the triggering message itself (passed to Claude separately)
-      - bot proactive pings (event reminders / briefings / snooze replays);
-        identified by leading emoji from `_PROACTIVE_PING_LEADS`
-      - empty messages and bot embed-only payloads
+    Selection strategy:
+      1. Fetch up to CONTEXT_MINUTES of past messages (outer time bound).
+      2. Drop empty + bot proactive pings (event reminders, briefings).
+      3. Group surviving messages into bursts (gaps > CONTEXT_BURST_GAP_MIN
+         start a new burst).
+      4. Walk newest-burst to oldest, accumulating until the soft token
+         budget is hit. Allow overshoot up to CONTEXT_FUZZ_FACTOR × budget
+         so a coherent burst is never truncated mid-conversation. If a
+         single burst is itself bigger than the hard cap, truncate its
+         OLDER end to fit.
 
-    Returns an empty string if there's nothing useful or context is disabled.
+    Returns an empty string if disabled or nothing useful in the window.
     """
     if CONTEXT_MINUTES <= 0 or client.user is None:
         return ""
+
     after_ts = datetime.now(timezone.utc) - timedelta(minutes=CONTEXT_MINUTES)
-    lines: list[str] = []
+    formatted: list[tuple[datetime, str]] = []  # (created_at, "[hh:mm] Author: line")
     try:
         async for m in message.channel.history(
-            before=message, after=after_ts, limit=200, oldest_first=True
+            before=message, after=after_ts, limit=400, oldest_first=True
         ):
             content = (m.content or "").strip()
             if not content:
                 continue
-            # Skip our own proactive pings — they're noise, not conversation
-            if m.author.id == client.user.id and any(
-                content.startswith(lead) for lead in _PROACTIVE_PING_LEADS
-            ):
+            author_is_iris = (m.author.id == client.user.id)
+            if _is_proactive_ping(content, author_is_iris):
                 continue
-            author = ("Iris" if m.author.id == client.user.id
+            author = ("Iris" if author_is_iris
                       else (m.author.display_name or m.author.name))
             ts = m.created_at.astimezone().strftime("%H:%M")
-            # Trim each message to keep the injection bounded
-            line = content if len(content) <= 400 else content[:397] + "…"
-            lines.append(f"[{ts}] {author}: {line}")
+            # Per-line cap so a single pasted wall doesn't dominate
+            line_body = content if len(content) <= 800 else content[:797] + "…"
+            formatted.append((m.created_at, f"[{ts}] {author}: {line_body}"))
     except discord.HTTPException as e:
         log.warning("fetch_recent_history: %s", e)
         return ""
-    if not lines:
+
+    if not formatted:
         return ""
-    # Cap total injected size so a flood of messages doesn't blow the prompt
-    joined = "\n".join(lines)
-    if len(joined) > 8000:
-        joined = "…(older messages truncated)…\n" + joined[-8000:]
+
+    char_budget = CONTEXT_TOKEN_BUDGET * _CHARS_PER_TOKEN
+    bursts = _group_into_bursts(formatted, CONTEXT_BURST_GAP_MIN)
+    chosen = _select_bursts_within_budget(bursts, char_budget, CONTEXT_FUZZ_FACTOR)
+
+    # Flatten back to lines
+    flat_lines: list[str] = []
+    for i, burst in enumerate(chosen):
+        if i > 0:
+            flat_lines.append("…")  # visual marker between non-adjacent bursts
+        flat_lines.extend(line for _, line in burst)
+    joined = "\n".join(flat_lines)
+
+    # Hard ceiling — only relevant if a single burst exceeded fuzz × budget.
+    # Truncate from the older end so the newest stuff survives.
+    hard_cap = int(char_budget * CONTEXT_FUZZ_FACTOR)
+    if len(joined) > hard_cap:
+        joined = "…(earlier portion of this burst truncated)…\n" + joined[-hard_cap:]
+
+    total_msgs = sum(len(b) for b in chosen)
+    log.info(
+        "history: %d messages in %d burst(s), %d chars "
+        "(soft budget %d, hard cap %d)",
+        total_msgs, len(chosen), len(joined), char_budget, hard_cap,
+    )
     return joined
-
-
-_PROACTIVE_PING_LEADS = ("⏰", "🔔", "🌅", "🌙", "💤", "🗺️")
 
 
 # ── Discord-side streaming helper ────────────────────────────────────────────
@@ -468,9 +573,10 @@ async def on_ready() -> None:
     if LISTEN_ALWAYS_CHANNELS:
         log.info("always-listen channels: %s", sorted(LISTEN_ALWAYS_CHANNELS))
     log.info(
-        "cold-start context injection: last %d min of Discord history "
-        "(set IRIS_DISCORD_CONTEXT_MINUTES=0 to disable)",
-        CONTEXT_MINUTES,
+        "cold-start context: ≤%d min, soft %d tokens, fuzz ×%.1f, "
+        "burst-gap %d min (IRIS_DISCORD_CONTEXT_MINUTES=0 disables)",
+        CONTEXT_MINUTES, CONTEXT_TOKEN_BUDGET,
+        CONTEXT_FUZZ_FACTOR, CONTEXT_BURST_GAP_MIN,
     )
     if PING_CHANNEL:
         active_tz = _resolve_active_tz()

@@ -171,7 +171,9 @@ In Discord: `@Iris what notes did I touch last week?`
 ## How conversations work
 
 - One **session per Discord channel/thread**. Iris remembers context within a channel across messages, but channels don't bleed into each other. Open a thread for a fresh slate.
-- Sessions live **in-process only**. On bot restart they're discarded — but the bot fetches the last `IRIS_DISCORD_CONTEXT_MINUTES` of channel messages (default 60) and injects them into the new session's system prompt as background context. The model treats them as memory and continues naturally. Net effect: a restart is mostly invisible from the user's side, and you don't need to persist Claude sessions to disk. The vault stays the canonical long-term memory; Discord history is the short-term buffer.
+- Sessions live **in-process only**. On bot restart they're discarded — but the bot fetches recent channel messages and injects them into the new session's system prompt as background context. The model treats them as memory and continues naturally. Net effect: a restart is mostly invisible from the user's side, and you don't need to persist Claude sessions to disk. The vault stays the canonical long-term memory; Discord history is the short-term buffer.
+
+  Selection is **fuzzy and burst-aware**. The bot groups recent messages into conversation bursts (gaps longer than `IRIS_DISCORD_CONTEXT_BURST_GAP_MIN` start a new burst) and walks newest-to-oldest including whole bursts up to the soft token budget. To avoid amputating a coherent topic that spans several messages, it'll overshoot the budget by up to `IRIS_DISCORD_CONTEXT_FUZZ_FACTOR` × budget rather than cut a burst in half. So if you discussed a government appointment 20 minutes ago and the budget would only cover half those messages, the bot keeps the whole appointment thread intact.
 - **Long sessions auto-compact.** Claude Code (which powers the SDK) summarizes earlier turns when the context window fills up, replacing them with a recap. You don't manage this; it just happens.
 - Iris responds when **any** of these is true:
   - You're DMing the bot
@@ -190,7 +192,10 @@ In Discord: `@Iris what notes did I touch last week?`
 | `IRIS_DISCORD_ALLOWED_USERS` | _(unset)_ | CSV of user IDs |
 | `IRIS_DISCORD_SYSTEM_PROMPT` | _(built-in)_ | Inline prompt override |
 | `IRIS_DISCORD_SYSTEM_PROMPT_PATH` | _(unset)_ | Path to markdown file inside container (e.g. `/vault/00_Index/iris_system_prompt.md`) |
-| `IRIS_DISCORD_CONTEXT_MINUTES` | `60` | How many minutes of recent channel history to inject into a fresh Claude session. `0` disables. |
+| `IRIS_DISCORD_CONTEXT_MINUTES` | `60` | Outer time bound for recent-history injection. `0` disables. |
+| `IRIS_DISCORD_CONTEXT_TOKEN_BUDGET` | `2000` | Soft token budget for the injection. Fuzzy — see below. |
+| `IRIS_DISCORD_CONTEXT_FUZZ_FACTOR` | `1.5` | How much to overshoot the budget to keep a topic burst intact. |
+| `IRIS_DISCORD_CONTEXT_BURST_GAP_MIN` | `10` | Minutes between messages that end one burst and start another. |
 | `IRIS_VAULT_ROOT` | `/vault` | Should match the docker-compose volume target |
 | `CLAUDE_CONFIG_DIR` | `/claude-auth` | Where `claude login` stores its token |
 | `IRIS_DISCORD_PING_CHANNEL` | _(unset)_ | Channel ID for proactive pings. Blank = all proactive output disabled. Legacy alias `IRIS_DISCORD_NOTIFY_CHANNEL` still works. |
