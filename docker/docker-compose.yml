@@ -36,6 +36,14 @@ services:
       IRIS_VAULT_ROOT: /vault
       IRIS_CONFIG:     /vault/.iris-config.toml   # optional: per-vault overrides
 
+      # Container's system timezone — affects logs and any naive datetime use.
+      # The bot ALSO supports per-day timezone overrides via daily-note
+      # frontmatter (`timezone: Asia/Seoul` etc.) — useful when travelling.
+      TZ: ${TZ:-Europe/Zurich}
+      # Optional explicit override for Iris's "home" zone. If unset, falls
+      # back to the TZ above.
+      # IRIS_TIMEZONE: Europe/Zurich
+
       # ── Claude Code CLI auth ─────────────────────────────────────────────
       CLAUDE_CONFIG_DIR: /claude-auth
       # Tell Claude Code it's OK to run as root — we're in a Docker sandbox.

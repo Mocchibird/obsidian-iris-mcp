@@ -42,6 +42,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 
@@ -112,6 +113,67 @@ SNOOZE_PATH = Path("/claude-auth/discord-snoozed.json")
 _HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
 SNOOZE_EMOJI_MINUTES = {"⏰": 5, "🛏️": 15, "💤": 60}
 
+# ── Timezone resolution ───────────────────────────────────────────────────
+# Default zone for "what time is it for the user right now". Override per-day
+# by setting `timezone: <IANA>` in the daily note's frontmatter — useful when
+# travelling so morning briefings still fire at 08:00 *local time* in Korea
+# instead of 08:00 your home zone.
+HOME_TZ_NAME = (os.environ.get("IRIS_TIMEZONE")
+                or os.environ.get("TZ")
+                or "Europe/Zurich").strip()
+
+
+def _safe_zoneinfo(name: str) -> ZoneInfo | None:
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return None
+
+
+HOME_TZ = _safe_zoneinfo(HOME_TZ_NAME) or ZoneInfo("UTC")
+# Match `timezone: Asia/Seoul` or `timezone: "Asia/Seoul"` in YAML frontmatter
+_TZ_FRONTMATTER_RE = re.compile(
+    r'^\s*timezone\s*:\s*[\'"]?([A-Za-z_/+\-0-9]+)[\'"]?\s*$',
+    re.MULTILINE,
+)
+
+
+def _resolve_active_tz() -> ZoneInfo:
+    """Return the timezone to use for "now" right now.
+
+    Reads the daily note for *today in HOME_TZ* and honours its
+    ``timezone:`` frontmatter if present, otherwise falls back to HOME_TZ.
+    """
+    try:
+        import iris_config as cfg
+    except Exception:
+        return HOME_TZ
+    today_iso = datetime.now(HOME_TZ).date().isoformat()
+    daily = cfg.VAULT_ROOT / "30_Episodic" / today_iso[:4] / f"{today_iso}.md"
+    if not daily.exists():
+        return HOME_TZ
+    try:
+        head = daily.read_text(encoding="utf-8", errors="ignore")[:2000]
+    except OSError:
+        return HOME_TZ
+    # Only honour frontmatter (between the first two `---` lines)
+    if not head.startswith("---"):
+        return HOME_TZ
+    end = head.find("\n---", 4)
+    if end == -1:
+        return HOME_TZ
+    m = _TZ_FRONTMATTER_RE.search(head[:end])
+    if not m:
+        return HOME_TZ
+    tz = _safe_zoneinfo(m.group(1).strip())
+    return tz or HOME_TZ
+
+
+def _now_local() -> datetime:
+    """`datetime.now()` in the currently active timezone (may shift mid-day
+    when you transition into a travel daily note with a different `timezone:` set)."""
+    return datetime.now(_resolve_active_tz())
+
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -140,7 +202,13 @@ def _load_system_prompt() -> str | None:
         "Obsidian vault via the `iris` MCP server — use those tools to "
         "look up notes, manage tasks, schedule events, etc. Keep replies "
         "concise enough for chat; long structured output is fine when "
-        "asked for it. Use Discord-flavored markdown."
+        "asked for it. Use Discord-flavored markdown.\n\n"
+        "Timezone convention: when Hyun-Min plans a trip to another "
+        "timezone (e.g. Korea), set `timezone: <IANA name>` (e.g. "
+        "`Asia/Seoul`) in the frontmatter of each daily note for the "
+        "travel days, using `set_frontmatter_field`. The Discord bot "
+        "reads this and shifts the morning briefing and evening wrap-up "
+        "to fire at 08:00 / 22:00 *local* time wherever he is."
     )
 
 
@@ -270,14 +338,16 @@ async def on_ready() -> None:
     if LISTEN_ALWAYS_CHANNELS:
         log.info("always-listen channels: %s", sorted(LISTEN_ALWAYS_CHANNELS))
     if PING_CHANNEL:
+        active_tz = _resolve_active_tz()
         log.info(
             "ping channel: %s — events/reminders every %ss (lead %s min)",
             PING_CHANNEL, NOTIFY_INTERVAL_SECS, NOTIFY_LEAD_MIN,
         )
+        log.info("home TZ: %s — active TZ now: %s", HOME_TZ_NAME, active_tz)
         if NOTIFY_MORNING_AT != "off":
-            log.info("morning briefing at %s daily", NOTIFY_MORNING_AT)
+            log.info("morning briefing at %s daily (in active TZ)", NOTIFY_MORNING_AT)
         if NOTIFY_EVENING_AT != "off":
-            log.info("evening wrap-up at %s daily", NOTIFY_EVENING_AT)
+            log.info("evening wrap-up at %s daily (in active TZ)", NOTIFY_EVENING_AT)
         client.loop.create_task(_notification_loop())
         client.loop.create_task(_scheduled_briefings_loop())
         client.loop.create_task(_snooze_replay_loop())
@@ -363,16 +433,17 @@ def _minutes_until(target_time: str, today_iso: str) -> float | None:
         return None
     try:
         hh, mm = target_time.split(":")[:2]
-        target = datetime.now().replace(
+        now = _now_local()
+        target = now.replace(
             hour=int(hh), minute=int(mm), second=0, microsecond=0
         )
     except ValueError:
         return None
-    return (target - datetime.now()).total_seconds() / 60
+    return (target - now).total_seconds() / 60
 
 
 async def _check_events(conn: sqlite3.Connection) -> None:
-    today = datetime.now().date().isoformat()
+    today = _now_local().date().isoformat()
     rows = conn.execute(
         "SELECT date, time, end_time, title, location FROM events "
         "WHERE date = ? AND time != '' AND time NOT IN ('00:00', '0:00')",
@@ -396,7 +467,7 @@ async def _check_events(conn: sqlite3.Connection) -> None:
 
 
 async def _check_reminders(conn: sqlite3.Connection) -> None:
-    today = datetime.now().date().isoformat()
+    today = _now_local().date().isoformat()
     rows = conn.execute(
         "SELECT text, remind_on, repeat, note_path FROM reminders "
         "WHERE checked = 0 AND remind_on = ?",
@@ -430,13 +501,18 @@ async def _check_reminders(conn: sqlite3.Connection) -> None:
 # ── Scheduled morning briefing + evening wrap-up ────────────────────────────
 
 async def _scheduled_briefings_loop() -> None:
-    """Once a minute, check whether morning/evening briefing should fire."""
+    """Once a minute, check whether morning/evening briefing should fire.
+
+    Uses the *active* timezone (the daily note's `timezone:` frontmatter or
+    HOME_TZ) so e.g. 08:00 always means 08:00 in your current location.
+    """
     global _last_morning_fired, _last_evening_fired
     await asyncio.sleep(10)
     while not client.is_closed():
         try:
-            now_hm = datetime.now().strftime("%H:%M")
-            today = datetime.now().date().isoformat()
+            now = _now_local()
+            now_hm = now.strftime("%H:%M")
+            today = now.date().isoformat()
             if (NOTIFY_MORNING_AT != "off"
                     and now_hm >= NOTIFY_MORNING_AT
                     and _last_morning_fired != today):
@@ -480,11 +556,14 @@ async def _snooze_replay_loop() -> None:
     while not client.is_closed():
         try:
             items = _load_snoozed()
-            now = datetime.now()
+            now = _now_local()
             still_pending: list[dict] = []
             for item in items:
                 try:
                     resend_at = datetime.fromisoformat(item["resend_at"])
+                    # Stored as naive ISO; pin to active TZ for comparison
+                    if resend_at.tzinfo is None:
+                        resend_at = resend_at.replace(tzinfo=now.tzinfo)
                 except (KeyError, ValueError):
                     continue
                 if now >= resend_at:
@@ -522,7 +601,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         return
     items = _load_snoozed()
     items.append({
-        "resend_at": (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds"),
+        "resend_at": (_now_local() + timedelta(minutes=minutes)).isoformat(timespec="seconds"),
         "content": message.content,
         "snoozed_by": payload.user_id,
         "original_message_id": payload.message_id,
