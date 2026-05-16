@@ -40,7 +40,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -83,6 +83,14 @@ ALLOWED_USERS = _parse_csv_ids(os.environ.get("IRIS_DISCORD_ALLOWED_USERS", ""))
 LISTEN_ALWAYS_CHANNELS = _parse_csv_ids(
     os.environ.get("IRIS_DISCORD_LISTEN_ALWAYS_CHANNELS", "")
 )
+
+# When creating a NEW Claude session for a channel (cold-start or post-restart),
+# the bot fetches the last N minutes of channel messages and injects them into
+# the system prompt as "recent context". This way conversations feel continuous
+# across bot restarts, without persisting Claude sessions to disk — the vault
+# stays the canonical long-term memory; Discord history covers the short term.
+# Set to 0 to disable (each restart = clean slate).
+CONTEXT_MINUTES = int(os.environ.get("IRIS_DISCORD_CONTEXT_MINUTES", "60"))
 
 # ── Proactive notifications ─────────────────────────────────────────────────
 # When IRIS_DISCORD_PING_CHANNEL (legacy alias: IRIS_DISCORD_NOTIFY_CHANNEL)
@@ -257,12 +265,14 @@ def _load_system_prompt() -> str | None:
 
 # ── Claude Agent SDK wiring ──────────────────────────────────────────────────
 
-def _build_options() -> ClaudeAgentOptions:
-    """Per-turn options. The MCP server config tells Claude how to launch Iris."""
+def _build_options(system_prompt: str | None = None) -> ClaudeAgentOptions:
+    """Per-session options. The MCP server config tells Claude how to launch
+    Iris. ``system_prompt`` overrides the default (used to inject recent
+    Discord history into a cold-start session)."""
     return ClaudeAgentOptions(
         model=MODEL,
         cwd="/opt/iris",
-        system_prompt=_load_system_prompt(),
+        system_prompt=system_prompt if system_prompt is not None else _load_system_prompt(),
         mcp_servers={
             "iris": {
                 "type": "stdio",
@@ -275,6 +285,55 @@ def _build_options() -> ClaudeAgentOptions:
         # baked in; this is a personal-use bot in a private Discord.
         permission_mode="bypassPermissions",
     )
+
+
+async def _fetch_recent_history(message: discord.Message) -> str:
+    """Pull the last CONTEXT_MINUTES of messages in this channel as a
+    string, ready to inject into a cold-start session's system prompt.
+
+    Excludes:
+      - the triggering message itself (passed to Claude separately)
+      - bot proactive pings (event reminders / briefings / snooze replays);
+        identified by leading emoji from `_PROACTIVE_PING_LEADS`
+      - empty messages and bot embed-only payloads
+
+    Returns an empty string if there's nothing useful or context is disabled.
+    """
+    if CONTEXT_MINUTES <= 0 or client.user is None:
+        return ""
+    after_ts = datetime.now(timezone.utc) - timedelta(minutes=CONTEXT_MINUTES)
+    lines: list[str] = []
+    try:
+        async for m in message.channel.history(
+            before=message, after=after_ts, limit=200, oldest_first=True
+        ):
+            content = (m.content or "").strip()
+            if not content:
+                continue
+            # Skip our own proactive pings — they're noise, not conversation
+            if m.author.id == client.user.id and any(
+                content.startswith(lead) for lead in _PROACTIVE_PING_LEADS
+            ):
+                continue
+            author = ("Iris" if m.author.id == client.user.id
+                      else (m.author.display_name or m.author.name))
+            ts = m.created_at.astimezone().strftime("%H:%M")
+            # Trim each message to keep the injection bounded
+            line = content if len(content) <= 400 else content[:397] + "…"
+            lines.append(f"[{ts}] {author}: {line}")
+    except discord.HTTPException as e:
+        log.warning("fetch_recent_history: %s", e)
+        return ""
+    if not lines:
+        return ""
+    # Cap total injected size so a flood of messages doesn't blow the prompt
+    joined = "\n".join(lines)
+    if len(joined) > 8000:
+        joined = "…(older messages truncated)…\n" + joined[-8000:]
+    return joined
+
+
+_PROACTIVE_PING_LEADS = ("⏰", "🔔", "🌅", "🌙", "💤", "🗺️")
 
 
 # ── Discord-side streaming helper ────────────────────────────────────────────
@@ -342,13 +401,41 @@ async def _get_lock(key: int) -> asyncio.Lock:
     return _session_locks[key]
 
 
-async def _get_or_create_client(key: int) -> ClaudeSDKClient:
-    if key not in _sessions:
-        client = ClaudeSDKClient(options=_build_options())
-        await client.connect()
-        _sessions[key] = client
-        log.info("opened new Claude session for channel %s", key)
-    return _sessions[key]
+async def _get_or_create_client(
+    key: int,
+    seed_message: discord.Message | None = None,
+) -> ClaudeSDKClient:
+    """Return an existing in-process Claude session or open a new one.
+
+    On a cold start (no session for this channel), fetch the last
+    CONTEXT_MINUTES of Discord history and inject it into the new session's
+    system prompt as "recent context". Keeps conversations feeling continuous
+    across bot restarts without persisting Claude sessions to disk.
+    """
+    if key in _sessions:
+        return _sessions[key]
+
+    sys_prompt = _load_system_prompt() or ""
+    if seed_message is not None and CONTEXT_MINUTES > 0:
+        recent = await _fetch_recent_history(seed_message)
+        if recent:
+            sys_prompt = (
+                sys_prompt
+                + "\n\n## Recent Discord history in this channel\n\n"
+                + "Below are the last "
+                + f"{CONTEXT_MINUTES} minutes of messages in this channel "
+                + "for context. Treat them as background memory; don't reply "
+                + "to them, just remember.\n\n"
+                + recent
+            )
+            log.info("seeded channel %s with %d chars of recent history",
+                     key, len(recent))
+
+    sdk_client = ClaudeSDKClient(options=_build_options(system_prompt=sys_prompt))
+    await sdk_client.connect()
+    _sessions[key] = sdk_client
+    log.info("opened new Claude session for channel %s", key)
+    return sdk_client
 
 
 # ── Discord bot ──────────────────────────────────────────────────────────────
@@ -380,6 +467,11 @@ async def on_ready() -> None:
         log.info("restricted to users: %s", sorted(ALLOWED_USERS))
     if LISTEN_ALWAYS_CHANNELS:
         log.info("always-listen channels: %s", sorted(LISTEN_ALWAYS_CHANNELS))
+    log.info(
+        "cold-start context injection: last %d min of Discord history "
+        "(set IRIS_DISCORD_CONTEXT_MINUTES=0 to disable)",
+        CONTEXT_MINUTES,
+    )
     if PING_CHANNEL:
         active_tz = _resolve_active_tz()
         log.info(
@@ -764,7 +856,7 @@ async def on_message(message: discord.Message) -> None:
             placeholder = await message.reply("…")
             stream = StreamingReply(placeholder)
             try:
-                agent = await _get_or_create_client(key)
+                agent = await _get_or_create_client(key, seed_message=message)
                 await agent.query(content)
                 async for msg in agent.receive_response():
                     if isinstance(msg, AssistantMessage):
