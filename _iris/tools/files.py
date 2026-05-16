@@ -528,6 +528,122 @@ def delete_files(
 
 
 @mcp.tool()
+def empty_trash(
+    older_than_days: int = 0,
+    confirm: bool = False,
+    dry_run: bool = False,
+) -> str:
+    """Permanently delete entries from the vault's trash (``90_Inbox/_trash/``).
+
+    The trash is populated by ``delete_files(trash=True)`` and by the
+    drop-zone importer when it routes binaries elsewhere. Both create a
+    timestamped subdirectory like ``90_Inbox/_trash/20260516_143022/...``.
+    Use this tool to free that space for real.
+
+    Safety:
+    - Only touches paths beneath ``90_Inbox/_trash/`` (resolved via safe_path).
+      Nothing else in the vault can be deleted by this tool.
+    - Requires ``confirm=True`` to actually delete. Otherwise returns a
+      preview with counts + total size.
+    - ``dry_run=True`` always shows the preview, even if confirmed.
+
+    Args:
+        older_than_days: Only delete entries whose top-level timestamped
+            folder is older than this many days. ``0`` (default) = all.
+            Useful for "trim everything older than 30 days" sweeps.
+        confirm: Must be True to actually delete. Defaults to False (preview).
+        dry_run: If True, never delete — always preview. Equivalent to
+            ``confirm=False`` but more explicit when scripted.
+    """
+    trash_root = safe_path("90_Inbox/_trash")
+    if not trash_root.exists() or not trash_root.is_dir():
+        return "Trash is already empty (90_Inbox/_trash/ doesn't exist)."
+
+    # Collect top-level timestamp dirs to evaluate. Each is named YYYYMMDD_HHMMSS;
+    # we use that to compute age. Anything not matching the pattern is treated
+    # as age-unknown and only deleted when older_than_days == 0.
+    cutoff = None
+    if older_than_days > 0:
+        cutoff = datetime.now() - timedelta(days=older_than_days)
+
+    targets: list[Path] = []
+    skipped_recent: list[str] = []
+    total_files = 0
+    total_bytes = 0
+
+    for entry in sorted(trash_root.iterdir()):
+        if not entry.exists():  # race
+            continue
+        # Age check
+        if cutoff is not None:
+            try:
+                ts = datetime.strptime(entry.name[:15], "%Y%m%d_%H%M%S")
+            except ValueError:
+                # Non-timestamped — use mtime as fallback
+                ts = datetime.fromtimestamp(entry.stat().st_mtime)
+            if ts >= cutoff:
+                skipped_recent.append(entry.name)
+                continue
+        # Tally
+        if entry.is_file():
+            try:
+                total_bytes += entry.stat().st_size
+                total_files += 1
+            except OSError:
+                pass
+        else:
+            for p in entry.rglob("*"):
+                if p.is_file():
+                    try:
+                        total_bytes += p.stat().st_size
+                        total_files += 1
+                    except OSError:
+                        pass
+        targets.append(entry)
+
+    if not targets:
+        msg = "Nothing to delete."
+        if skipped_recent:
+            msg += f" (Skipped {len(skipped_recent)} newer than {older_than_days}d.)"
+        return msg
+
+    size_mb = total_bytes / (1024 * 1024)
+    preview = (
+        f"{'[DRY RUN] ' if (dry_run or not confirm) else ''}"
+        f"{len(targets)} trash entr{'y' if len(targets) == 1 else 'ies'}, "
+        f"{total_files} file(s), {size_mb:.1f} MB"
+    )
+    if skipped_recent:
+        preview += f" (skipped {len(skipped_recent)} newer than {older_than_days}d)"
+
+    if dry_run or not confirm:
+        listing = "\n".join(f"  - {p.name}" for p in targets[:20])
+        if len(targets) > 20:
+            listing += f"\n  - …and {len(targets) - 20} more"
+        return (
+            f"{preview}\n\n"
+            f"Would delete:\n{listing}\n\n"
+            f"Re-call with confirm=True to actually delete."
+        )
+
+    # Actually delete
+    failed: list[str] = []
+    for entry in targets:
+        try:
+            if entry.is_file() or entry.is_symlink():
+                entry.unlink()
+            else:
+                shutil.rmtree(entry)
+        except OSError as e:
+            failed.append(f"{entry.name}: {e}")
+
+    result = f"Permanently deleted {preview}"
+    if failed:
+        result += f"\nFailed:\n" + "\n".join(f"  - {f}" for f in failed)
+    return result
+
+
+@mcp.tool()
 def backup_files(
     path: str = "",
     paths: list[str] | None = None,
