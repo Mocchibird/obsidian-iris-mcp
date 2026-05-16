@@ -1557,6 +1557,65 @@ def cmd_import_drop_zone(args: argparse.Namespace) -> None:
         print(line)
 
 
+# ── Quick capture (standalone, MCP-free) ─────────────────────────────────────
+# Write a thought to 90_Inbox/inbox/ without going through Claude/MCP. Designed
+# for iOS Shortcuts, hotkey scripts, terminal one-liners, etc.
+
+def quick_capture_cli(thought: str, title: str = "", tags: list[str] | None = None) -> str:
+    if not thought.strip():
+        return "err: nothing to capture (empty thought)"
+    now = datetime.now()
+    date_str = now.date().isoformat()
+    time_slug = now.strftime("%H%M%S")
+    if title.strip():
+        slug_chars = [ch.lower() if ch.isalnum() else "_" for ch in title.strip()]
+        slug = "_".join(p for p in "".join(slug_chars).split("_") if p) or "capture"
+    else:
+        slug = "capture"
+    filename = f"{date_str}_{time_slug}_{slug}.md"
+    target = VAULT_ROOT / "90_Inbox" / "inbox" / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    tag_list = ["inbox"] + [t.strip() for t in (tags or []) if t.strip()]
+    fm_lines = [
+        "---",
+        "type: capture",
+        f"created: {date_str}",
+        "status: inbox",
+        "tags:",
+        *(f"  - {t}" for t in tag_list),
+        "---",
+        "",
+        f"# {title.strip() or 'Quick Capture'}",
+        "",
+        thought.strip(),
+        "",
+    ]
+    target.write_text("\n".join(fm_lines), encoding="utf-8")
+    log.info(f"Quick capture → {target.relative_to(VAULT_ROOT)}")
+    return str(target.relative_to(VAULT_ROOT))
+
+
+def cmd_capture(args: argparse.Namespace) -> None:
+    # Source priority: --text > positional text > stdin (if --stdin or piped)
+    text = ""
+    if getattr(args, "text", None):
+        text = args.text
+    elif getattr(args, "text_args", None):
+        text = " ".join(args.text_args)
+    if not text and (args.stdin or not sys.stdin.isatty()):
+        text = sys.stdin.read()
+    text = text.strip()
+    if not text:
+        print("err: nothing to capture — pass text as arg, --text, or via stdin")
+        sys.exit(1)
+    tags = [t.strip() for t in (args.tag or []) if t.strip()]
+    rel = quick_capture_cli(text, title=args.title or "", tags=tags)
+    print(rel)
+    if args.notify:
+        notify("📝 Captured to inbox", rel)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Obsidian vault automation (MocchiMind)")
     sub = parser.add_subparsers(dest="command")
@@ -1598,6 +1657,22 @@ if __name__ == "__main__":
     p_import = sub.add_parser("import-drop-zone", help="Process files in 90_Inbox/inbox/")
     p_import.add_argument("--dry-run", action="store_true")
     p_import.set_defaults(func=cmd_import_drop_zone)
+
+    # capture — standalone (no MCP needed) for iOS Shortcuts / hotkeys / pipelines
+    p_cap = sub.add_parser(
+        "capture",
+        help="Drop a thought into 90_Inbox/inbox/ (iOS Shortcuts / CLI / piped stdin)",
+    )
+    p_cap.add_argument("text_args", nargs="*", help="Positional capture text")
+    p_cap.add_argument("--text", default="", help="The thought text")
+    p_cap.add_argument("--title", default="", help="Optional title (becomes # heading)")
+    p_cap.add_argument("--tag", action="append", default=[],
+                       help="Tag to add (repeatable). 'inbox' is always added.")
+    p_cap.add_argument("--stdin", action="store_true",
+                       help="Read text from stdin (auto-detected when piped)")
+    p_cap.add_argument("--notify", action="store_true",
+                       help="Show a macOS notification when done")
+    p_cap.set_defaults(func=cmd_capture)
 
     args = parser.parse_args()
     if hasattr(args, "func"):
