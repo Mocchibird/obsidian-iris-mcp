@@ -632,13 +632,38 @@ class StreamingReply:
         self._last_edit = time.monotonic()
 
 
+# Background-task pinboard. asyncio.create_task() only keeps a WEAK reference,
+# so fire-and-forget tasks can be garbage-collected mid-execution if we don't
+# pin them somewhere. We add to this set on launch and remove on completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> asyncio.Task:
+    """Spawn a background task that won't get GC'd before completion.
+    Logs unhandled exceptions instead of swallowing them silently."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            log.warning("background task raised: %r", exc)
+
+    task.add_done_callback(_on_done)
+    return task
+
+
 async def _completion_ping(channel: discord.abc.Messageable) -> None:
     """Send a tiny new message so Discord plays its new-message notification
     sound, then auto-delete after TTL. Discord doesn't notify on edits, so
     this is the only way to ding the user when a streamed reply completes.
-    Fire-and-forget; failures are swallowed."""
+    Failures are logged but never raised."""
     try:
         msg = await channel.send(COMPLETION_PING_EMOJI)
+        log.info("completion ping sent to channel %s", getattr(channel, "id", "?"))
     except discord.HTTPException as e:
         log.warning("completion ping send failed: %s", e)
         return
@@ -1162,8 +1187,9 @@ async def on_message(message: discord.Message) -> None:
                 # normal new-message notification sound. The placeholder
                 # was only edited during streaming, which Discord doesn't
                 # notify on. Auto-deletes after TTL to keep the channel clean.
+                # _fire_and_forget pins the task so it isn't GC'd mid-flight.
                 if COMPLETION_PING_ENABLED:
-                    asyncio.create_task(_completion_ping(message.channel))
+                    _fire_and_forget(_completion_ping(message.channel))
             except Exception as e:
                 log.exception("query failed")
                 try:
