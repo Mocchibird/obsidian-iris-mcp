@@ -66,6 +66,7 @@ def _llm_prose_summary(
             ],
             max_tokens=max_tokens,
             temperature=0.6,
+            think=False,   # routine prose — skip chain-of-thought
         ).strip()
     except llm.LLMError:
         return ""

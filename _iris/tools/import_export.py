@@ -587,6 +587,7 @@ def summarize_note_with_llm(
              {"role": "user", "content": user}],
             max_tokens=max_tokens,
             temperature=0.4,
+            think=False,   # note summary — direct output, no reasoning needed
         ).strip()
     except llm.LLMError as e:
         return f"err: LLM call failed: {e}"
