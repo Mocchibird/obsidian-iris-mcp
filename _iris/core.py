@@ -853,7 +853,7 @@ class VaultIndex:
     fts        – FTS5 full-text search over note body text
     """
 
-    SCHEMA_VERSION = 9
+    SCHEMA_VERSION = 10
 
     def __init__(self, vault_root: Path):
         self._root = vault_root
@@ -1127,6 +1127,20 @@ class VaultIndex:
         c.execute("CREATE INDEX IF NOT EXISTS idx_vocab_lang ON vocab(language)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_vocab_word ON vocab(word)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_vocab_category ON vocab(category)")
+        # v10: spaced repetition (SM-2). Additive — existing entries default to
+        # "due immediately" so they show up in the first review session.
+        for col, typedef in [
+            ("interval_days", "INTEGER NOT NULL DEFAULT 0"),
+            ("ease_factor", "REAL NOT NULL DEFAULT 2.5"),
+            ("reps", "INTEGER NOT NULL DEFAULT 0"),
+            ("lapses", "INTEGER NOT NULL DEFAULT 0"),
+            ("due_at", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE vocab ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        c.execute("CREATE INDEX IF NOT EXISTS idx_vocab_due ON vocab(due_at)")
 
         # -- v8: people (family, friends, colleagues — anyone with birthday/contact info)
         c.execute("""
