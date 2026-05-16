@@ -15,6 +15,8 @@ Subcommands:
   python3 vault_cron.py shortcut <name>   # run an Apple Shortcut by name
   python3 vault_cron.py morning           # full morning routine (sync + pull-calendar + daily note)
   python3 vault_cron.py import-drop-zone  # process files in 90_Inbox/inbox/
+  python3 vault_cron.py weekly-summary    # generate weekly summary note (ISO week of today)
+  python3 vault_cron.py weekly-summary --end-date 2026-05-17 --force
 """
 
 from __future__ import annotations
@@ -1119,6 +1121,225 @@ def evening_wrapup(target_date: str | None = None, dry_run: bool = False) -> str
     return summary_text
 
 
+# ── Weekly Summary ─────────────────────────────────────────────────────────────
+
+WEEKLY_DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _iso_week_bounds(end_date: date) -> tuple[date, date, int, int]:
+    """Return (monday, sunday, iso_year, iso_week) for the ISO week containing end_date."""
+    iso_year, iso_week, iso_weekday = end_date.isocalendar()
+    monday = end_date - timedelta(days=iso_weekday - 1)
+    sunday = monday + timedelta(days=6)
+    return monday, sunday, iso_year, iso_week
+
+
+def _weekly_note_path(iso_year: int, iso_week: int) -> Path:
+    return VAULT_ROOT / "30_Episodic" / str(iso_year) / "Weekly" / f"{iso_year}-W{iso_week:02d}.md"
+
+
+def weekly_summary(
+    end_date: str | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+) -> str:
+    """Generate a weekly summary note covering the ISO week containing end_date.
+
+    Writes to 30_Episodic/{iso_year}/Weekly/{iso_year}-W{NN}.md.
+    Skips if the file already exists unless force=True.
+    """
+    d = date.fromisoformat(end_date) if end_date else date.today()
+    monday, sunday, iso_year, iso_week = _iso_week_bounds(d)
+    start_str = monday.isoformat()
+    end_str = sunday.isoformat()
+    week_label = f"{iso_year}-W{iso_week:02d}"
+
+    log.info(f"Weekly summary for {week_label} ({start_str} → {end_str})")
+
+    note_path = _weekly_note_path(iso_year, iso_week)
+    if note_path.exists() and not force and not dry_run:
+        log.info(f"Weekly note already exists: {note_path.name} (use --force to overwrite)")
+        return f"Already exists: {note_path.relative_to(VAULT_ROOT)} (use --force to overwrite)"
+
+    conn = get_db()
+
+    # Tasks completed in the window
+    completed_tasks = conn.execute(
+        "SELECT text, done, note_path FROM tasks "
+        "WHERE checked = 1 AND done != '' AND done BETWEEN ? AND ? "
+        "ORDER BY done, text",
+        (start_str, end_str),
+    ).fetchall()
+
+    # Reminders done in the window
+    completed_reminders = conn.execute(
+        "SELECT text, done, note_path FROM reminders "
+        "WHERE checked = 1 AND done != '' AND done BETWEEN ? AND ? "
+        "ORDER BY done, text",
+        (start_str, end_str),
+    ).fetchall()
+
+    # Events in the window
+    events = conn.execute(
+        "SELECT date, time, end_time, title, location FROM events "
+        "WHERE date BETWEEN ? AND ? "
+        "ORDER BY date, time",
+        (start_str, end_str),
+    ).fetchall()
+
+    # Open tasks (still incomplete) — surface ones overdue or due soon
+    open_tasks = conn.execute(
+        "SELECT text, due, note_path FROM tasks "
+        "WHERE checked = 0 AND due != '' AND due <= ? "
+        "ORDER BY due, text",
+        (end_str,),
+    ).fetchall()
+
+    # Notes modified during the week (excluding daily notes, weekly notes, and caches)
+    cutoff_start_ns = int(datetime.combine(monday, datetime.min.time()).timestamp() * 1e9)
+    cutoff_end_ns = int(datetime.combine(sunday + timedelta(days=1), datetime.min.time()).timestamp() * 1e9)
+    try:
+        recent_rows = conn.execute(
+            "SELECT path, mtime_ns FROM files "
+            "WHERE mtime_ns >= ? AND mtime_ns < ? AND path LIKE '%.md' "
+            "ORDER BY mtime_ns DESC",
+            (cutoff_start_ns, cutoff_end_ns),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # `files` table might not exist in older indexes — fall back to filesystem scan
+        recent_rows = []
+        for p in VAULT_ROOT.rglob("*.md"):
+            if ".ai_memory_cache" in str(p) or ".trash" in str(p):
+                continue
+            try:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime).date()
+                if monday <= mtime <= sunday:
+                    recent_rows.append({"path": str(p.relative_to(VAULT_ROOT)), "mtime_ns": 0})
+            except OSError:
+                continue
+
+    conn.close()
+
+    def _is_periodic_note(path: str) -> bool:
+        """Skip daily notes and the weekly note itself when listing notes-touched."""
+        return (
+            re.search(r"30_Episodic/\d{4}/\d{4}-\d{2}-\d{2}\.md$", path) is not None
+            or "30_Episodic/" in path and "/Weekly/" in path
+        )
+
+    modified_notes = [
+        dict(r) if not isinstance(r, dict) else r
+        for r in recent_rows
+        if not _is_periodic_note(r["path"] if not isinstance(r, dict) else r["path"])
+    ]
+
+    # ── Build markdown ─────────────────────────────────────────────────────
+    pretty_start = monday.strftime("%b %d")
+    pretty_end = sunday.strftime("%b %d, %Y")
+
+    lines: list[str] = [
+        "---",
+        f"week: {week_label}",
+        f"start: {start_str}",
+        f"end: {end_str}",
+        "tags:",
+        "  - weekly",
+        "type: weekly",
+        f"generated: {datetime.now().isoformat(timespec='seconds')}",
+        "---",
+        f"# {week_label} — {pretty_start} → {pretty_end}",
+        "",
+        "## Highlights",
+        f"- **{len(completed_tasks)}** tasks completed",
+        f"- **{len(completed_reminders)}** reminders done",
+        f"- **{len(events)}** calendar events",
+        f"- **{len(modified_notes)}** notes touched",
+    ]
+    if open_tasks:
+        lines.append(f"- **{len(open_tasks)}** open tasks carried over")
+
+    # Tasks completed
+    lines.append("")
+    lines.append(f"## Tasks Completed ({len(completed_tasks)})")
+    if completed_tasks:
+        for t in completed_tasks:
+            note_link = f" — [[{t['note_path'][:-3]}]]" if t["note_path"].endswith(".md") else ""
+            lines.append(f"- [x] {t['text']} _(done {t['done']})_{note_link}")
+    else:
+        lines.append("_None this week._")
+
+    # Reminders done
+    if completed_reminders:
+        lines.append("")
+        lines.append(f"## Reminders Done ({len(completed_reminders)})")
+        for r in completed_reminders:
+            lines.append(f"- ~~{r['text']}~~ _(done {r['done']})_")
+
+    # Events — grouped by day
+    lines.append("")
+    lines.append(f"## Events ({len(events)})")
+    if events:
+        current_day = ""
+        for ev in events:
+            if ev["date"] != current_day:
+                current_day = ev["date"]
+                try:
+                    weekday = WEEKLY_DAY_NAMES[date.fromisoformat(current_day).weekday()]
+                except ValueError:
+                    weekday = ""
+                lines.append(f"### {weekday} {current_day}")
+            t = ev["time"] or ""
+            if ev["end_time"]:
+                t = f"{t}–{ev['end_time']}"
+            line = f"- {t} {ev['title']}".rstrip()
+            if ev["location"]:
+                line += f" @ {ev['location']}"
+            lines.append(line)
+    else:
+        lines.append("_No events._")
+
+    # Notes touched
+    lines.append("")
+    lines.append(f"## Notes Touched ({len(modified_notes)})")
+    if modified_notes:
+        for n in modified_notes[:30]:
+            path = n["path"]
+            if path.endswith(".md"):
+                lines.append(f"- [[{path[:-3]}]]")
+            else:
+                lines.append(f"- {path}")
+        if len(modified_notes) > 30:
+            lines.append(f"- _…and {len(modified_notes) - 30} more_")
+    else:
+        lines.append("_No notes modified._")
+
+    # Still open
+    if open_tasks:
+        lines.append("")
+        lines.append(f"## Still Open ({len(open_tasks)})")
+        for t in open_tasks[:20]:
+            due_str = f" _(due {t['due']})_" if t["due"] else ""
+            note_link = f" — [[{t['note_path'][:-3]}]]" if t["note_path"].endswith(".md") else ""
+            lines.append(f"- [ ] {t['text']}{due_str}{note_link}")
+        if len(open_tasks) > 20:
+            lines.append(f"- _…and {len(open_tasks) - 20} more_")
+
+    content = "\n".join(lines) + "\n"
+
+    if dry_run:
+        log.info(f"[DRY RUN] Would write weekly note to {note_path.relative_to(VAULT_ROOT)}")
+        return content
+
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_path.write_text(content, "utf-8")
+    log.info(f"Wrote weekly summary: {note_path.relative_to(VAULT_ROOT)}")
+    notify(
+        f"📅 Weekly summary {week_label}",
+        f"{len(completed_tasks)} tasks · {len(events)} events · {len(modified_notes)} notes",
+    )
+    return f"Wrote {note_path.relative_to(VAULT_ROOT)}\n\n{content}"
+
+
 # ── Focus Mode ─────────────────────────────────────────────────────────────────
 
 def get_focus_mode() -> str:
@@ -1334,6 +1555,16 @@ def cmd_shortcut(args) -> None:
     else:
         result = run_shortcut(args.name)
         print(result)
+
+
+def cmd_weekly_summary(args) -> None:
+    """Subcommand: generate weekly summary note."""
+    result = weekly_summary(
+        end_date=args.end_date,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
+    print(result)
 
 
 def cmd_morning(args) -> None:
@@ -1739,6 +1970,15 @@ if __name__ == "__main__":
     p_cap.add_argument("--notify", action="store_true",
                        help="Show a macOS notification when done")
     p_cap.set_defaults(func=cmd_capture)
+
+    # weekly-summary
+    p_weekly = sub.add_parser("weekly-summary", help="Generate weekly summary note")
+    p_weekly.add_argument("--end-date", default=None,
+                          help="YYYY-MM-DD (any day in target week; default: today)")
+    p_weekly.add_argument("--force", action="store_true",
+                          help="Overwrite existing weekly note")
+    p_weekly.add_argument("--dry-run", action="store_true")
+    p_weekly.set_defaults(func=cmd_weekly_summary)
 
     args = parser.parse_args()
     if hasattr(args, "func"):

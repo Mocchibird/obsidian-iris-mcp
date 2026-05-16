@@ -282,7 +282,7 @@ def daily_agenda(date: str = "today", days: int = 1) -> str:
 # Apple Integration (delegates to vault_cron.py)
 # =============================================================================
 
-_VAULT_CRON = str(Path(__file__).parent / "vault_cron.py")
+_VAULT_CRON = str(Path(__file__).resolve().parent.parent.parent / "vault_cron.py")
 
 
 def _run_vault_cron(*args: str, timeout: int = 30) -> str:
@@ -378,6 +378,32 @@ def pull_health_snapshot(date: str = "today", dry_run: bool = False) -> str:
     if resolved is None:
         return f"Cannot parse date: {date}"
     args = ["health", "--date", resolved]
+    if dry_run:
+        args.append("--dry-run")
+    return _run_vault_cron(*args, timeout=60)
+
+
+@mcp.tool()
+def weekly_summary(date: str = "today", force: bool = False, dry_run: bool = False) -> str:
+    """Generate and save a weekly summary note for the ISO week containing the given date.
+
+    Writes to 30_Episodic/{iso_year}/Weekly/{iso_year}-W{NN}.md.
+    Summarizes: tasks completed, reminders done, calendar events,
+    notes touched, and open tasks carried over.
+
+    Skips if the file already exists unless ``force=True``.
+
+    Args:
+        date: Any day in the target ISO week — "today" or YYYY-MM-DD.
+        force: Overwrite the file if it already exists.
+        dry_run: Build the summary but do not write or notify.
+    """
+    resolved = resolve_natural_date(date)
+    if resolved is None:
+        return f"Cannot parse date: {date}"
+    args = ["weekly-summary", "--end-date", resolved]
+    if force:
+        args.append("--force")
     if dry_run:
         args.append("--dry-run")
     return _run_vault_cron(*args, timeout=60)
