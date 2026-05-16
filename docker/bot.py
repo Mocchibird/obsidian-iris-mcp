@@ -40,7 +40,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import discord
@@ -83,21 +83,34 @@ LISTEN_ALWAYS_CHANNELS = _parse_csv_ids(
 )
 
 # ── Proactive notifications ─────────────────────────────────────────────────
-# When IRIS_DISCORD_NOTIFY_CHANNEL is set, a background loop scans the vault
-# every IRIS_NOTIFY_INTERVAL_SECS and posts pings for:
-#   - calendar events starting in <= IRIS_NOTIFY_LEAD_MIN minutes
-#   - reminders whose remind_on date is today (with optional HH:MM prefix in
-#     the reminder text → same lead-time logic as events)
-# Sent messages are deduped via a small JSON file under /claude-auth so
-# restarts don't double-ping.
+# When IRIS_DISCORD_PING_CHANNEL (legacy alias: IRIS_DISCORD_NOTIFY_CHANNEL)
+# is set, Iris posts to that channel unprompted, in three flavours:
+#
+#   1. Upcoming-event/reminder pings    every IRIS_NOTIFY_INTERVAL_SECS
+#                                       within IRIS_NOTIFY_LEAD_MIN
+#   2. Morning briefing                 once a day at IRIS_NOTIFY_MORNING_AT
+#   3. Evening wrap-up                  once a day at IRIS_NOTIFY_EVENING_AT
+#
+# Reactions on Iris's own pings act as snooze controls:
+#   ⏰ = +5 min     🛏️ = +15 min     💤 = +1 hr
+#
+# Persistence (deduped sends, snoozed resends) lives under /claude-auth.
 try:
-    NOTIFY_CHANNEL = int(os.environ.get("IRIS_DISCORD_NOTIFY_CHANNEL", "0") or "0")
+    PING_CHANNEL = int(
+        os.environ.get("IRIS_DISCORD_PING_CHANNEL")
+        or os.environ.get("IRIS_DISCORD_NOTIFY_CHANNEL")
+        or "0"
+    )
 except ValueError:
-    NOTIFY_CHANNEL = 0
+    PING_CHANNEL = 0
 NOTIFY_INTERVAL_SECS = int(os.environ.get("IRIS_NOTIFY_INTERVAL_SECS", "300"))
 NOTIFY_LEAD_MIN = int(os.environ.get("IRIS_NOTIFY_LEAD_MIN", "15"))
+NOTIFY_MORNING_AT = os.environ.get("IRIS_NOTIFY_MORNING_AT", "08:00").strip() or "off"
+NOTIFY_EVENING_AT = os.environ.get("IRIS_NOTIFY_EVENING_AT", "22:00").strip() or "off"
 NOTIFIED_PATH = Path("/claude-auth/discord-notified.json")
+SNOOZE_PATH = Path("/claude-auth/discord-snoozed.json")
 _HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
+SNOOZE_EMOJI_MINUTES = {"⏰": 5, "🛏️": 15, "💤": 60}
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -233,6 +246,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
 intents.guilds = True
+intents.reactions = True  # for snooze emoji
 
 client = discord.Client(intents=intents)
 
@@ -255,31 +269,39 @@ async def on_ready() -> None:
         log.info("restricted to users: %s", sorted(ALLOWED_USERS))
     if LISTEN_ALWAYS_CHANNELS:
         log.info("always-listen channels: %s", sorted(LISTEN_ALWAYS_CHANNELS))
-    if NOTIFY_CHANNEL:
+    if PING_CHANNEL:
         log.info(
-            "proactive notifications → channel %s every %ss, lead %s min",
-            NOTIFY_CHANNEL, NOTIFY_INTERVAL_SECS, NOTIFY_LEAD_MIN,
+            "ping channel: %s — events/reminders every %ss (lead %s min)",
+            PING_CHANNEL, NOTIFY_INTERVAL_SECS, NOTIFY_LEAD_MIN,
         )
+        if NOTIFY_MORNING_AT != "off":
+            log.info("morning briefing at %s daily", NOTIFY_MORNING_AT)
+        if NOTIFY_EVENING_AT != "off":
+            log.info("evening wrap-up at %s daily", NOTIFY_EVENING_AT)
         client.loop.create_task(_notification_loop())
+        client.loop.create_task(_scheduled_briefings_loop())
+        client.loop.create_task(_snooze_replay_loop())
 
 
 # ── Proactive notification loop ─────────────────────────────────────────────
 # Persisted dedupe — JSON file under /claude-auth so restarts don't re-ping
 # events/reminders we already sent.
 
-def _load_notified() -> set[str]:
-    if not NOTIFIED_PATH.exists():
-        return set()
+def _load_json(path: Path, default):
+    if not path.exists():
+        return default
     try:
-        data = json.loads(NOTIFIED_PATH.read_text())
-        return set(data.get("keys", []))
+        return json.loads(path.read_text())
     except Exception:
-        return set()
+        return default
+
+
+def _load_notified() -> set[str]:
+    return set(_load_json(NOTIFIED_PATH, {}).get("keys", []))
 
 
 def _save_notified(keys: set[str]) -> None:
     NOTIFIED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # Keep only the most recent 1000 keys to bound the file size
     recent = list(keys)[-1000:]
     NOTIFIED_PATH.write_text(json.dumps({
         "keys": recent,
@@ -287,15 +309,31 @@ def _save_notified(keys: set[str]) -> None:
     }))
 
 
+# Snooze persistence: list of {"resend_at": iso, "content": str} entries.
+def _load_snoozed() -> list[dict]:
+    return _load_json(SNOOZE_PATH, {"items": []}).get("items", [])
+
+
+def _save_snoozed(items: list[dict]) -> None:
+    SNOOZE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SNOOZE_PATH.write_text(json.dumps({
+        "items": items,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }))
+
+
 _notified: set[str] = set()
+# Track last-fire dates for scheduled briefings so they don't repeat on the
+# same day if the bot restarts.
+_last_morning_fired: str = ""
+_last_evening_fired: str = ""
 
 
 async def _notification_loop() -> None:
     """Scan vault every NOTIFY_INTERVAL_SECS for events/reminders to ping."""
     global _notified
     _notified = _load_notified()
-    # Brief delay so on_ready finishes before the first scan
-    await asyncio.sleep(5)
+    await asyncio.sleep(5)  # let on_ready finish
     while not client.is_closed():
         try:
             await _check_upcoming()
@@ -305,9 +343,8 @@ async def _notification_loop() -> None:
 
 
 async def _check_upcoming() -> None:
-    if NOTIFY_CHANNEL == 0:
+    if PING_CHANNEL == 0:
         return
-    # Local import so the bot still boots if Iris's package isn't yet on path
     import iris_config as cfg
     db_path = cfg.vault_db_path()
     if not db_path.exists():
@@ -322,7 +359,6 @@ async def _check_upcoming() -> None:
 
 
 def _minutes_until(target_time: str, today_iso: str) -> float | None:
-    """Parse 'HH:MM' for today; return minutes from now (negative if past)."""
     if not target_time or ":" not in target_time:
         return None
     try:
@@ -332,8 +368,7 @@ def _minutes_until(target_time: str, today_iso: str) -> float | None:
         )
     except ValueError:
         return None
-    delta = (target - datetime.now()).total_seconds() / 60
-    return delta
+    return (target - datetime.now()).total_seconds() / 60
 
 
 async def _check_events(conn: sqlite3.Connection) -> None:
@@ -353,7 +388,7 @@ async def _check_events(conn: sqlite3.Connection) -> None:
         _notified.add(key)
         loc = f" @ {r['location']}" if r["location"] else ""
         end = f"–{r['end_time']}" if r["end_time"] else ""
-        await _send_notification(
+        await _send_ping(
             f"⏰ **{r['title']}** in {int(round(lead))} min — "
             f"{r['time']}{end}{loc}"
         )
@@ -380,34 +415,162 @@ async def _check_reminders(conn: sqlite3.Connection) -> None:
             if key in _notified:
                 continue
             _notified.add(key)
-            await _send_notification(
+            await _send_ping(
                 f"🔔 **Reminder** in {int(round(lead))} min — {clean}"
             )
         else:
-            # No time embedded — single all-day ping at first check of the day
             key = f"rem-allday:{r['remind_on']}:{text}"
             if key in _notified:
                 continue
             _notified.add(key)
-            await _send_notification(f"🔔 **Reminder today** — {text}")
+            await _send_ping(f"🔔 **Reminder today** — {text}")
     _save_notified(_notified)
 
 
-async def _send_notification(content: str) -> None:
-    channel = client.get_channel(NOTIFY_CHANNEL)
+# ── Scheduled morning briefing + evening wrap-up ────────────────────────────
+
+async def _scheduled_briefings_loop() -> None:
+    """Once a minute, check whether morning/evening briefing should fire."""
+    global _last_morning_fired, _last_evening_fired
+    await asyncio.sleep(10)
+    while not client.is_closed():
+        try:
+            now_hm = datetime.now().strftime("%H:%M")
+            today = datetime.now().date().isoformat()
+            if (NOTIFY_MORNING_AT != "off"
+                    and now_hm >= NOTIFY_MORNING_AT
+                    and _last_morning_fired != today):
+                await _fire_morning_briefing()
+                _last_morning_fired = today
+            if (NOTIFY_EVENING_AT != "off"
+                    and now_hm >= NOTIFY_EVENING_AT
+                    and _last_evening_fired != today):
+                await _fire_evening_wrapup()
+                _last_evening_fired = today
+        except Exception:
+            log.exception("scheduled briefings loop")
+        await asyncio.sleep(60)
+
+
+async def _fire_morning_briefing() -> None:
+    try:
+        from _iris.tools.routines import morning_briefing
+        text = await asyncio.to_thread(morning_briefing, "today")
+    except Exception as e:
+        log.warning("morning_briefing failed: %s", e)
+        return
+    await _send_ping(f"🌅 **Good morning!** Here's your day:\n\n{text}")
+
+
+async def _fire_evening_wrapup() -> None:
+    try:
+        from _iris.tools.calendar import evening_wrapup
+        text = await asyncio.to_thread(evening_wrapup, "today")
+    except Exception as e:
+        log.warning("evening_wrapup failed: %s", e)
+        return
+    await _send_ping(f"🌙 **Evening wrap-up** — \n\n{text}")
+
+
+# ── Snooze: reactions on Iris's pings re-send after a delay ────────────────
+
+async def _snooze_replay_loop() -> None:
+    """Check the snooze list every 30 s; resend any items whose time has come."""
+    await asyncio.sleep(15)
+    while not client.is_closed():
+        try:
+            items = _load_snoozed()
+            now = datetime.now()
+            still_pending: list[dict] = []
+            for item in items:
+                try:
+                    resend_at = datetime.fromisoformat(item["resend_at"])
+                except (KeyError, ValueError):
+                    continue
+                if now >= resend_at:
+                    await _send_ping(
+                        f"💤 (snoozed) {item.get('content', '(no content)')}"
+                    )
+                else:
+                    still_pending.append(item)
+            if len(still_pending) != len(items):
+                _save_snoozed(still_pending)
+        except Exception:
+            log.exception("snooze replay")
+        await asyncio.sleep(30)
+
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    # Only act on reactions to messages WE sent in the ping channel
+    if payload.channel_id != PING_CHANNEL:
+        return
+    if payload.user_id == (client.user.id if client.user else 0):
+        return
+    emoji = str(payload.emoji)
+    minutes = SNOOZE_EMOJI_MINUTES.get(emoji)
+    if minutes is None:
+        return
+    # Verify the message author is Iris
+    try:
+        channel = client.get_channel(payload.channel_id) or await client.fetch_channel(payload.channel_id)
+        message = await channel.fetch_message(payload.message_id)  # type: ignore[union-attr]
+    except discord.HTTPException as e:
+        log.warning("snooze: could not fetch message %s: %s", payload.message_id, e)
+        return
+    if message.author.id != (client.user.id if client.user else 0):
+        return
+    items = _load_snoozed()
+    items.append({
+        "resend_at": (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds"),
+        "content": message.content,
+        "snoozed_by": payload.user_id,
+        "original_message_id": payload.message_id,
+    })
+    _save_snoozed(items)
+    log.info("snoozed message %s for %s min (emoji=%s)",
+             payload.message_id, minutes, emoji)
+    try:
+        await message.add_reaction("✅")  # ack
+    except discord.HTTPException:
+        pass
+
+
+# ── Discord send helper (chunks at 2000-char limit) ────────────────────────
+
+async def _send_ping(content: str) -> None:
+    if PING_CHANNEL == 0:
+        return
+    channel = client.get_channel(PING_CHANNEL)
     if channel is None:
         try:
-            channel = await client.fetch_channel(NOTIFY_CHANNEL)
+            channel = await client.fetch_channel(PING_CHANNEL)
         except discord.HTTPException as e:
-            log.warning("could not fetch notify channel %s: %s",
-                        NOTIFY_CHANNEL, e)
+            log.warning("could not fetch ping channel %s: %s", PING_CHANNEL, e)
             return
-    try:
-        await channel.send(content)  # type: ignore[union-attr]
-        log.info("notification → #%s: %s",
-                 getattr(channel, "name", NOTIFY_CHANNEL), content[:80])
-    except discord.HTTPException as e:
-        log.warning("notification send failed: %s", e)
+    # Split at 1900 chars (room for code-fence wrappers etc.) and split at line
+    # boundaries when possible.
+    LIMIT = 1900
+    chunks: list[str] = []
+    remaining = content
+    while len(remaining) > LIMIT:
+        cut = remaining.rfind("\n", 0, LIMIT)
+        if cut <= 0:
+            cut = LIMIT
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+
+    for i, chunk in enumerate(chunks):
+        try:
+            await channel.send(chunk)  # type: ignore[union-attr]
+        except discord.HTTPException as e:
+            log.warning("ping send failed: %s", e)
+            return
+    log.info("ping → #%s (%s chunks): %s",
+             getattr(channel, "name", PING_CHANNEL), len(chunks),
+             content[:80].replace("\n", " "))
 
 
 def _is_reply_to_bot(message: discord.Message) -> bool:
