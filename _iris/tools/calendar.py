@@ -356,6 +356,34 @@ def evening_wrapup(date: str = "today") -> str:
 
 
 @mcp.tool()
+def pull_health_snapshot(date: str = "today", dry_run: bool = False) -> str:
+    """Pull an Apple Health snapshot and write it into the daily note.
+
+    Runs a user-defined Apple Shortcut (default name: ``Iris Health``,
+    configurable via ``IRIS_HEALTH_SHORTCUT`` env or ``[apple].health_shortcut``
+    in ``~/.config/iris/config.toml``). The shortcut can return any text —
+    newline-delimited metrics, JSON, prose — and Iris drops the output verbatim
+    into today's daily note's ``## Health`` section. Re-running replaces the
+    existing section (idempotent).
+
+    To set up: in macOS Shortcuts.app create a shortcut named ``Iris Health``
+    that fetches Health Samples (sleep, steps, HRV, weight, workouts, etc.) and
+    returns them as text. macOS only.
+
+    Args:
+        date: Target date — "today" or YYYY-MM-DD.
+        dry_run: Show what would be written without modifying the note.
+    """
+    resolved = resolve_natural_date(date)
+    if resolved is None:
+        return f"Cannot parse date: {date}"
+    args = ["health", "--date", resolved]
+    if dry_run:
+        args.append("--dry-run")
+    return _run_vault_cron(*args, timeout=60)
+
+
+@mcp.tool()
 def get_focus_context(mode: str = "") -> str:
     """Get the current macOS Focus mode and show relevant vault context.
 

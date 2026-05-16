@@ -48,6 +48,7 @@ REMINDERS_LIST = cfg.REMINDERS_LIST
 CALENDAR_NAME = cfg.CALENDAR_NAME
 CALENDAR_EXCLUDE = cfg.CALENDAR_EXCLUDE
 FOCUS_CONTEXT = cfg.FOCUS_CONTEXT
+HEALTH_SHORTCUT = cfg.HEALTH_SHORTCUT
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -1596,6 +1597,62 @@ def quick_capture_cli(thought: str, title: str = "", tags: list[str] | None = No
     return str(target.relative_to(VAULT_ROOT))
 
 
+# ── Apple Health snapshot ────────────────────────────────────────────────────
+# Run a user-defined Apple Shortcut (default name: "Iris Health") and drop its
+# output into today's daily note ## Health section. The shortcut can return
+# whatever the user wants — newline-separated metrics, JSON, narrative — Iris
+# just inserts it verbatim. Re-running replaces the section (idempotent).
+
+def pull_health_snapshot(target_date: str | None = None, dry_run: bool = False) -> str:
+    """Run the configured health shortcut and stash its output in the daily note."""
+    d = date.fromisoformat(target_date) if target_date else date.today()
+    d_str = d.isoformat()
+    day_name = d.strftime("%A")
+    log.info(f"Pulling Apple Health snapshot for {d_str} ({day_name}) "
+             f"via shortcut {HEALTH_SHORTCUT!r}")
+
+    output = run_shortcut(HEALTH_SHORTCUT)
+    if not output or output.startswith("Shortcut"):
+        # run_shortcut returns "Shortcut 'X' failed: ..." or "... not found"
+        msg = output or "(empty output)"
+        log.warning(f"Health shortcut returned no usable data: {msg}")
+        return f"err: {msg}"
+    output = output.strip()
+
+    if dry_run:
+        return f"[DRY RUN] Would write to {d_str}.md ## Health:\n{output}"
+
+    # Ensure the daily note exists
+    ensure_daily_note(d)
+    note_path = VAULT_ROOT / "30_Episodic" / str(d.year) / f"{d_str}.md"
+    file_text = note_path.read_text("utf-8")
+
+    block_lines = output.splitlines()
+    block_body = "\n".join(block_lines)
+    timestamp = datetime.now().strftime("%H:%M")
+    new_section = (
+        f"## Health\n"
+        f"_Captured {timestamp} via Shortcut `{HEALTH_SHORTCUT}`_\n\n"
+        f"{block_body}"
+    )
+
+    # Replace existing ## Health section or append one
+    bounds = _find_section_bounds(file_text, "Health")
+    if bounds:
+        start, end = bounds
+        file_text = file_text[:start] + new_section + "\n" + file_text[end:]
+    else:
+        file_text = file_text.rstrip() + f"\n\n{new_section}\n"
+    note_path.write_text(file_text, "utf-8")
+    log.info(f"Wrote ## Health section to {d_str}.md ({len(block_body)} chars)")
+    return f"ok {note_path.relative_to(VAULT_ROOT)}\n\n{output}"
+
+
+def cmd_health(args: argparse.Namespace) -> None:
+    result = pull_health_snapshot(target_date=args.date, dry_run=args.dry_run)
+    print(result)
+
+
 def cmd_capture(args: argparse.Namespace) -> None:
     # Source priority: --text > positional text > stdin (if --stdin or piped)
     text = ""
@@ -1657,6 +1714,15 @@ if __name__ == "__main__":
     p_import = sub.add_parser("import-drop-zone", help="Process files in 90_Inbox/inbox/")
     p_import.add_argument("--dry-run", action="store_true")
     p_import.set_defaults(func=cmd_import_drop_zone)
+
+    # health — run the user's Apple Shortcut and append output to daily note
+    p_health = sub.add_parser(
+        "health",
+        help="Pull Apple Health snapshot via a user-defined Shortcut",
+    )
+    p_health.add_argument("--date", default=None, help="YYYY-MM-DD (default: today)")
+    p_health.add_argument("--dry-run", action="store_true")
+    p_health.set_defaults(func=cmd_health)
 
     # capture — standalone (no MCP needed) for iOS Shortcuts / hotkeys / pipelines
     p_cap = sub.add_parser(

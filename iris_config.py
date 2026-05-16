@@ -130,6 +130,15 @@ FOCUS_CONTEXT: dict[str, dict[str, list[str]]] = _toml_get("focus", {  # type: i
 }
 
 
+# ── Apple Health ───────────────────────────────────────────────────────────
+# A single Apple Shortcut named here is run by `vault_cron.py health` and its
+# output is written verbatim into today's daily note's ## Health section.
+# Define the shortcut in iOS / macOS Shortcuts.app — it can pull whatever
+# metrics you want (sleep, steps, HRV, weight, workouts) and return them as
+# plain text or JSON.
+HEALTH_SHORTCUT: str = _str("IRIS_HEALTH_SHORTCUT", ("apple", "health_shortcut"), "Iris Health")
+
+
 # ── Embeddings ─────────────────────────────────────────────────────────────
 EMBED_URL: str = _str("IRIS_EMBED_URL", ("embed", "url"), "http://localhost:11434/v1/embeddings")
 EMBED_MODEL: str = _str("IRIS_EMBED_MODEL", ("embed", "model"), "nomic-embed-text")
@@ -157,6 +166,7 @@ def config_summary() -> str:
         f"apple.reminders  = {REMINDERS_LIST}\n"
         f"apple.calendar   = {CALENDAR_NAME}\n"
         f"apple.exclude    = {sorted(CALENDAR_EXCLUDE)}\n"
+        f"apple.health     = {HEALTH_SHORTCUT}\n"
         f"focus.modes      = {sorted(FOCUS_CONTEXT.keys())}\n"
         f"embed.url        = {EMBED_URL}\n"
         f"embed.model      = {EMBED_MODEL}\n"
