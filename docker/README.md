@@ -193,8 +193,10 @@ In Discord: `@Iris what notes did I touch last week?`
 | `IRIS_DISCORD_PING_CHANNEL` | _(unset)_ | Channel ID for proactive pings. Blank = all proactive output disabled. Legacy alias `IRIS_DISCORD_NOTIFY_CHANNEL` still works. |
 | `IRIS_NOTIFY_INTERVAL_SECS` | `300` | How often the notification loop scans the vault |
 | `IRIS_NOTIFY_LEAD_MIN` | `15` | Lead time before an event/reminder for the ping |
-| `IRIS_NOTIFY_MORNING_AT` | `08:00` | Daily morning briefing time (HH:MM, 24 h). `off` to skip. |
-| `IRIS_NOTIFY_EVENING_AT` | `22:00` | Daily evening wrap-up time. `off` to skip. |
+| `IRIS_NOTIFY_MORNING_AT` | `08:00` | Daily morning briefing time (HH:MM, 24 h, in *active* TZ). `off` to skip. |
+| `IRIS_NOTIFY_EVENING_AT` | `22:00` | Daily evening wrap-up time (in active TZ). `off` to skip. |
+| `TZ` | `Europe/Zurich` | Container's system timezone — Iris uses this as the home zone |
+| `IRIS_TIMEZONE` | _(falls back to `TZ`)_ | Optional override for Iris's home TZ if different from container TZ |
 
 ## Proactive notifications
 
@@ -235,6 +237,22 @@ Iris will mark the message with ✅ to confirm and resend the same content after
 - Snoozes via `/claude-auth/discord-snoozed.json`
 
 Pick any channel — `#iris-alerts`, `#general`, or one of your dedicated iris channels. Clear the env var and restart to disable everything.
+
+### Travel: per-day timezone override
+
+Briefings and event/reminder pings fire in your local time. If you're travelling to a different timezone, set `timezone: <IANA name>` in the daily note's frontmatter for the relevant dates — the bot reads it at each check and shifts the schedule accordingly. Example:
+
+```markdown
+---
+type: daily
+date: 2026-07-15
+timezone: Asia/Seoul
+---
+# 2026-07-15 — Wednesday (Seoul)
+...
+```
+
+While that note is "today" from your home TZ's perspective, the bot uses `Asia/Seoul` so 08:00 means 08:00 in Korea, not Zurich. Iris is also told about this convention in her system prompt so she'll set the field herself when you tell her you're going somewhere.
 
 ## Updating
 
