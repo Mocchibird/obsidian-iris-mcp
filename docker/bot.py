@@ -42,6 +42,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
@@ -116,6 +117,13 @@ SNOOZE_EMOJI_MINUTES = {"⏰": 5, "🛏️": 15, "💤": 60}
 # the reminder text. Examples that match: "lead: 2h", "lead:30m", "lead 120".
 # Bare number = minutes. Suffix h = hours, m = minutes.
 _LEAD_HINT_RE = re.compile(r"\blead\s*:?\s*(\d+)\s*([hm]?)\b", re.IGNORECASE)
+
+
+def _looks_like_url(s: str) -> bool:
+    """True if the string already starts with http(s)://. Used to skip
+    auto-generating a maps link when the user's `location` field is itself
+    a URL (e.g. they pasted a Maps link directly)."""
+    return bool(re.match(r"^\s*https?://", s or ""))
 
 
 def _parse_lead_min(text: str | None, default: int) -> int:
@@ -235,7 +243,15 @@ def _load_system_prompt() -> str | None:
         "event's `description` field when calling `schedule_event`. The "
         "bot parses that and uses it as the per-event lead window. So "
         "'meeting in Basel at 14:00' → description=`lead: 2h` → "
-        "ping at 12:00. Reminders can carry the same hint in their text."
+        "ping at 12:00. Reminders can carry the same hint in their text.\n\n"
+        "Useful links in chat: Discord auto-renders URLs (Google Maps "
+        "shows a preview card, YouTube embeds the player, etc.). When a "
+        "location, address, restaurant, or venue comes up, drop a Google "
+        "Maps URL like https://www.google.com/maps/search/?api=1&query=<URL-encoded address>. "
+        "Same for transit (SBB/Trainline/etc.), flight status pages, "
+        "Wikipedia, recipe links, anything useful — Discord renders them "
+        "inline and saves him from having to search. Don't ask permission, "
+        "just include the link."
     )
 
 
@@ -490,10 +506,18 @@ async def _check_events(conn: sqlite3.Connection) -> None:
         _notified.add(key)
         loc = f" @ {r['location']}" if r["location"] else ""
         end = f"–{r['end_time']}" if r["end_time"] else ""
-        await _send_ping(
+        msg = (
             f"⏰ **{r['title']}** in {int(round(minutes_to_go))} min — "
             f"{r['time']}{end}{loc}"
         )
+        if r["location"] and not _looks_like_url(r["location"]):
+            maps_url = (
+                "https://www.google.com/maps/search/?api=1&query="
+                + quote_plus(r["location"])
+            )
+            # No angle brackets — let Discord render the embed/preview card.
+            msg += f"\n🗺️ {maps_url}"
+        await _send_ping(msg)
     _save_notified(_notified)
 
 
