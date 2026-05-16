@@ -2,7 +2,10 @@
 
 > Turn your Obsidian vault into long-term memory for Claude (or any MCP client).
 
-**About the name.** In Greek mythology, Iris (Ἶρις) is the messenger goddess and the personification of the rainbow — the bridge that lets gods and humans speak to each other. This project plays the same role: the bridge between you and your vault, carrying messages, looking things up, and tying the world above (Claude, your conversations) to the world below (your notes on disk).
+**About the name.** Iris is both:
+
+- An acronym — **I**ntelligent **R**ecall & **I**ndexing **S**ystem.
+- A reference to Greek mythology — Iris (Ἶρις) is the messenger goddess and the personification of the rainbow, the bridge that lets gods and humans speak to each other. This project plays the same role: the bridge between you and your vault, carrying messages, looking things up, and tying the world above (Claude, your conversations) to the world below (your notes on disk).
 
 Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidian vault into SQLite and exposes ~130 tools for searching, editing, linking, and analysing it. It can:
 
