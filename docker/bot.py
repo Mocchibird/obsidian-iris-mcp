@@ -112,6 +112,25 @@ NOTIFIED_PATH = Path("/claude-auth/discord-notified.json")
 SNOOZE_PATH = Path("/claude-auth/discord-snoozed.json")
 _HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
 SNOOZE_EMOJI_MINUTES = {"⏰": 5, "🛏️": 15, "💤": 60}
+# Per-event lead override — parsed from the event's `description` field or
+# the reminder text. Examples that match: "lead: 2h", "lead:30m", "lead 120".
+# Bare number = minutes. Suffix h = hours, m = minutes.
+_LEAD_HINT_RE = re.compile(r"\blead\s*:?\s*(\d+)\s*([hm]?)\b", re.IGNORECASE)
+
+
+def _parse_lead_min(text: str | None, default: int) -> int:
+    """Pull a per-item lead override from arbitrary text. Falls back to default."""
+    if not text:
+        return default
+    m = _LEAD_HINT_RE.search(text)
+    if not m:
+        return default
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "h":
+        n *= 60
+    # Cap so a typo like "lead: 99999" doesn't permanently silence the ping
+    return max(1, min(n, 24 * 60))
 
 # ── Timezone resolution ───────────────────────────────────────────────────
 # Default zone for "what time is it for the user right now". Override per-day
@@ -208,7 +227,15 @@ def _load_system_prompt() -> str | None:
         "`Asia/Seoul`) in the frontmatter of each daily note for the "
         "travel days, using `set_frontmatter_field`. The Discord bot "
         "reads this and shifts the morning briefing and evening wrap-up "
-        "to fire at 08:00 / 22:00 *local* time wherever he is."
+        "to fire at 08:00 / 22:00 *local* time wherever he is.\n\n"
+        "Per-event ping lead time: the Discord bot pings 15 minutes "
+        "before an event by default. For events that need a longer "
+        "head-start (travel to another city, packing before a trip, "
+        "etc.), include `lead: 2h` (or `lead: 30m`, `lead: 90`) in the "
+        "event's `description` field when calling `schedule_event`. The "
+        "bot parses that and uses it as the per-event lead window. So "
+        "'meeting in Basel at 14:00' → description=`lead: 2h` → "
+        "ping at 12:00. Reminders can carry the same hint in their text."
     )
 
 
@@ -445,13 +472,17 @@ def _minutes_until(target_time: str, today_iso: str) -> float | None:
 async def _check_events(conn: sqlite3.Connection) -> None:
     today = _now_local().date().isoformat()
     rows = conn.execute(
-        "SELECT date, time, end_time, title, location FROM events "
+        "SELECT date, time, end_time, title, location, description FROM events "
         "WHERE date = ? AND time != '' AND time NOT IN ('00:00', '0:00')",
         (today,),
     ).fetchall()
     for r in rows:
-        lead = _minutes_until(r["time"], today)
-        if lead is None or lead <= 0 or lead > NOTIFY_LEAD_MIN:
+        minutes_to_go = _minutes_until(r["time"], today)
+        if minutes_to_go is None or minutes_to_go <= 0:
+            continue
+        # Per-event lead override from description ("lead: 2h", "lead:30m", etc.)
+        lead_window = _parse_lead_min(r["description"], NOTIFY_LEAD_MIN)
+        if minutes_to_go > lead_window:
             continue
         key = f"event:{r['date']}:{r['time']}:{r['title']}"
         if key in _notified:
@@ -460,7 +491,7 @@ async def _check_events(conn: sqlite3.Connection) -> None:
         loc = f" @ {r['location']}" if r["location"] else ""
         end = f"–{r['end_time']}" if r["end_time"] else ""
         await _send_ping(
-            f"⏰ **{r['title']}** in {int(round(lead))} min — "
+            f"⏰ **{r['title']}** in {int(round(minutes_to_go))} min — "
             f"{r['time']}{end}{loc}"
         )
     _save_notified(_notified)
@@ -478,8 +509,11 @@ async def _check_reminders(conn: sqlite3.Connection) -> None:
         m = _HHMM_PREFIX_RE.match(text)
         if m:
             hhmm = f"{m.group(1)}:{m.group(2)}"
-            lead = _minutes_until(hhmm, today)
-            if lead is None or lead <= 0 or lead > NOTIFY_LEAD_MIN:
+            minutes_to_go = _minutes_until(hhmm, today)
+            if minutes_to_go is None or minutes_to_go <= 0:
+                continue
+            lead_window = _parse_lead_min(text, NOTIFY_LEAD_MIN)
+            if minutes_to_go > lead_window:
                 continue
             clean = _HHMM_PREFIX_RE.sub("", text).strip() or "(reminder)"
             key = f"rem:{r['remind_on']}:{hhmm}:{clean}"
@@ -487,7 +521,7 @@ async def _check_reminders(conn: sqlite3.Connection) -> None:
                 continue
             _notified.add(key)
             await _send_ping(
-                f"🔔 **Reminder** in {int(round(lead))} min — {clean}"
+                f"🔔 **Reminder** in {int(round(minutes_to_go))} min — {clean}"
             )
         else:
             key = f"rem-allday:{r['remind_on']}:{text}"
