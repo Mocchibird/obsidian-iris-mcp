@@ -1,0 +1,61 @@
+# Sibling Ollama stack for Iris on TrueNAS.
+#
+# Runs Ollama with NVIDIA GPU passthrough (1080Ti tested). Serves both
+# embedding and chat models to the Iris Discord container — and to anything
+# else on the LAN that speaks the OpenAI-compatible API.
+#
+# After first deploy, pull the models you want:
+#   docker exec -it ollama ollama pull nomic-embed-text
+#   docker exec -it ollama ollama pull gemma4         # heavy: ~9.6 GB on disk, ~10 GB VRAM
+#   # or smaller:
+#   docker exec -it ollama ollama pull gemma3:4b
+#
+# Then wire the iris stack to it by setting in iris's .env:
+#   IRIS_EMBED_URL=http://<truenas-ip>:11434/v1/embeddings
+#   IRIS_LLM_URL=http://<truenas-ip>:11434/v1/chat/completions
+#   IRIS_LLM_MODEL=gemma4
+# (Or use a shared docker network and reference the container by name.)
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      # Bind on the LAN so Iris-container and any other host on the network
+      # can reach the API. If you only want it exposed to other containers,
+      # remove the host port and rely on the docker network.
+      - "11434:11434"
+    environment:
+      # Tell Ollama to listen on all interfaces (not just localhost).
+      OLLAMA_HOST: "0.0.0.0:11434"
+      # Optional: keep models warm forever instead of unloading after 5 min.
+      # Useful if you call Ollama frequently and don't want the cold-start hit.
+      # OLLAMA_KEEP_ALIVE: "-1"
+      # Optional: cap how much VRAM Ollama is willing to use (in GB).
+      # OLLAMA_MAX_VRAM: "10"
+    volumes:
+      - ${OLLAMA_DATA_DIR:-./data}:/root/.ollama
+
+    # ── NVIDIA GPU passthrough ──────────────────────────────────────────────
+    # Requires the NVIDIA Container Toolkit on the host. TrueNAS SCALE 24.10+
+    # ships this when the NVIDIA driver is enabled in Apps Settings.
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 4G
+          cpus: '2.0'
+
+    # Health check — Ollama exposes /api/tags as a simple liveness probe.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 30s

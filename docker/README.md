@@ -210,6 +210,10 @@ The Claude auth token and your vault stay put (separate volumes).
 - **TrueNAS app: `unable to prepare context: path ... not found`** → Dockge's container can't see the host path. Edit the Dockge TrueNAS app and add the synced repo's parent dir as a Host Path (Source = Target = the same absolute path so compose references match host paths).
 - **Tool calls hang / time out** → check that the vault mount is correct: `docker exec -it iris-discord ls /vault` should list your note folders.
 
+## Companion: Ollama sibling stack
+
+For semantic search and LLM-using features without depending on the Mac being awake, run [`docker/ollama/`](ollama/README.md) as a sibling Dockge stack. With NVIDIA GPU passthrough on TrueNAS (1080Ti and similar), it'll hold both an embedding model and a chat model on-GPU with low latency.
+
 ## Phase 2 — voice (planned)
 
 Voice is a separate add-on that will:
