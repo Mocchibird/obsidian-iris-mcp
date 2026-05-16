@@ -91,6 +91,15 @@ LISTEN_ALWAYS_CHANNELS = _parse_csv_ids(
 # stays the canonical long-term memory; Discord history covers the short term.
 # Set to 0 to disable (each restart = clean slate).
 CONTEXT_MINUTES = int(os.environ.get("IRIS_DISCORD_CONTEXT_MINUTES", "60"))
+# When True, after Iris finishes a streamed reply, the bot sends a tiny new
+# message (default "✓") so Discord plays its normal new-message notification
+# sound. The placeholder reply is edit-only during streaming, which Discord
+# does NOT notify on — this is the only way to get a "done" ding. The little
+# completion message auto-deletes after IRIS_DISCORD_COMPLETION_PING_TTL secs.
+_completion_on = os.environ.get("IRIS_DISCORD_COMPLETION_PING", "on").strip().lower()
+COMPLETION_PING_ENABLED = _completion_on in ("1", "on", "true", "yes")
+COMPLETION_PING_EMOJI = os.environ.get("IRIS_DISCORD_COMPLETION_PING_EMOJI", "✓")
+COMPLETION_PING_TTL = int(os.environ.get("IRIS_DISCORD_COMPLETION_PING_TTL", "4"))
 # Soft token budget for the injection. ~3 chars/token for mixed-language
 # content (CJK is denser than the English-typical 4 chars/token), so a 2000-
 # token budget is ~6000 chars. The actual selection is "fuzzy" — see below.
@@ -623,6 +632,25 @@ class StreamingReply:
         self._last_edit = time.monotonic()
 
 
+async def _completion_ping(channel: discord.abc.Messageable) -> None:
+    """Send a tiny new message so Discord plays its new-message notification
+    sound, then auto-delete after TTL. Discord doesn't notify on edits, so
+    this is the only way to ding the user when a streamed reply completes.
+    Fire-and-forget; failures are swallowed."""
+    try:
+        msg = await channel.send(COMPLETION_PING_EMOJI)
+    except discord.HTTPException as e:
+        log.warning("completion ping send failed: %s", e)
+        return
+    if COMPLETION_PING_TTL <= 0:
+        return  # leave the marker permanently if TTL is 0/negative
+    await asyncio.sleep(COMPLETION_PING_TTL)
+    try:
+        await msg.delete()
+    except discord.HTTPException:
+        pass  # already gone, channel locked, etc. — not worth complaining
+
+
 # ── Per-channel session memory ───────────────────────────────────────────────
 # We keep one ClaudeSDKClient per channel/thread so conversations persist.
 
@@ -1130,6 +1158,12 @@ async def on_message(message: discord.Message) -> None:
                             if isinstance(block, TextBlock):
                                 await stream.append(block.text)
                 await stream.finalize()
+                # Fire-and-forget completion ping so Discord plays its
+                # normal new-message notification sound. The placeholder
+                # was only edited during streaming, which Discord doesn't
+                # notify on. Auto-deletes after TTL to keep the channel clean.
+                if COMPLETION_PING_ENABLED:
+                    asyncio.create_task(_completion_ping(message.channel))
             except Exception as e:
                 log.exception("query failed")
                 try:

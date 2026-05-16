@@ -201,6 +201,9 @@ In Discord: `@Iris what notes did I touch last week?`
 | `IRIS_DISCORD_CONTEXT_FUZZ_FACTOR` | `1.5` | How much to overshoot the budget to keep a topic burst intact. |
 | `IRIS_DISCORD_CONTEXT_BURST_GAP_MIN` | `10` | Minutes between messages that end one burst and start another. |
 | `IRIS_DISCORD_HISTORY_DIR` | `/claude-auth/discord-channels` | Where the bot writes per-channel JSONL logs (read on-demand by `fetch_discord_history`). |
+| `IRIS_DISCORD_COMPLETION_PING` | `on` | Send a tiny new message after streaming finishes so Discord plays the normal new-message notification sound. Edits don't notify. |
+| `IRIS_DISCORD_COMPLETION_PING_EMOJI` | `✓` | Content of the completion ping. |
+| `IRIS_DISCORD_COMPLETION_PING_TTL` | `4` | Seconds before the ping auto-deletes. `0` = keep forever. |
 | `IRIS_VAULT_ROOT` | `/vault` | Should match the docker-compose volume target |
 | `CLAUDE_CONFIG_DIR` | `/claude-auth` | Where `claude login` stores its token |
 | `IRIS_DISCORD_PING_CHANNEL` | _(unset)_ | Channel ID for proactive pings. Blank = all proactive output disabled. Legacy alias `IRIS_DISCORD_NOTIFY_CHANNEL` still works. |
