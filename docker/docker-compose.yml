@@ -21,6 +21,15 @@
 #        DISCORD_BOT_TOKEN=...
 #   4. Deploy. First run: open a shell on the container and run `claude login`.
 
+# Shared docker network so a sibling Ollama stack (see docker/ollama/) can be
+# reached by name (`http://ollama:11434`) instead of via the host IP.
+# `external: false` means this compose file creates the network if it doesn't
+# already exist; the ollama stack joins the same name and they connect.
+networks:
+  ai:
+    name: ai-models
+    external: false
+
 services:
   iris:
     build:
@@ -82,11 +91,17 @@ services:
     # ports:
     #   - "0:0/udp"   # filled in when we add voice
 
+    networks:
+      - ai        # for reaching ollama by name (when sibling stack is up)
+      - default   # keep the per-stack default network too
+
     # Resource hints. The bot itself is tiny; claude CLI is also tiny.
     # If embeddings/LLM run in another container, this one stays small.
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
+          cpus: '2.0'
         reservations:
-          memory: 256M
+          memory: 512M
+          cpus: '0.5'
