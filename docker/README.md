@@ -300,6 +300,14 @@ The Claude auth token and your vault stay put (separate volumes).
 
 For semantic search and LLM-using features without depending on the Mac being awake, run [`docker/ollama/`](ollama/README.md) as a sibling Dockge stack. With NVIDIA GPU passthrough on TrueNAS (1080Ti and similar), it'll hold both an embedding model and a chat model on-GPU with low latency.
 
+Both stacks join a shared docker network called `ai-models` so the iris container can reach Ollama at `http://ollama:11434`. **One-time setup**, before deploying either stack:
+
+```bash
+docker network create ai-models
+```
+
+Both compose files then join it as `external: true`. Order of stack startup doesn't matter.
+
 ## Phase 2 — voice (planned)
 
 Voice is a separate add-on that will:
