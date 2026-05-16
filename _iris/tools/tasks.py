@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from .. import mcp
 from ..core import *  # noqa: F401, F403  — all helpers and VaultIndex accessor
+from ..core import _notify_index_of_write, _notify_index_of_delete  # underscore-prefixed names are excluded by `import *` so import them explicitly
 
 
 # ─── from original L1715-2380: Tasks + frontmatter editing ───
