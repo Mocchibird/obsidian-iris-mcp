@@ -171,7 +171,11 @@ In Discord: `@Iris what notes did I touch last week?`
 ## How conversations work
 
 - One **session per Discord channel/thread**. Iris remembers context within a channel across messages, but channels don't bleed into each other. Open a thread for a fresh slate.
-- In **DMs**, Iris responds to every human message. In **guild channels**, you must @-mention the bot (so it doesn't reply to everything).
+- Iris responds when **any** of these is true:
+  - You're DMing the bot
+  - You @-mention the bot in a guild channel
+  - You reply (Discord's reply feature) to one of the bot's earlier messages
+  - The channel ID is in `IRIS_DISCORD_LISTEN_ALWAYS_CHANNELS` — good for dedicated rooms like `#iris-tasks`, `#iris-notes`, where you don't want to type `@Iris` every time
 - Replies **stream** — you see the text appear as Claude generates it. The bot edits a single message up to Discord's 2000-char limit, then continues in a new message.
 
 ## Configuration knobs
