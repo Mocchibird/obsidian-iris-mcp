@@ -190,6 +190,22 @@ In Discord: `@Iris what notes did I touch last week?`
 | `IRIS_DISCORD_SYSTEM_PROMPT_PATH` | _(unset)_ | Path to markdown file inside container (e.g. `/vault/00_Index/iris_system_prompt.md`) |
 | `IRIS_VAULT_ROOT` | `/vault` | Should match the docker-compose volume target |
 | `CLAUDE_CONFIG_DIR` | `/claude-auth` | Where `claude login` stores its token |
+| `IRIS_DISCORD_NOTIFY_CHANNEL` | _(unset)_ | Channel ID for proactive event/reminder pings. Leave blank to disable. |
+| `IRIS_NOTIFY_INTERVAL_SECS` | `300` | How often the notification loop scans the vault |
+| `IRIS_NOTIFY_LEAD_MIN` | `15` | How many minutes before an event/reminder to ping |
+
+## Proactive notifications
+
+If you set `IRIS_DISCORD_NOTIFY_CHANNEL` to a channel ID, a background loop scans the vault every `IRIS_NOTIFY_INTERVAL_SECS` and posts pings for:
+
+- **Calendar events** starting in ≤ `IRIS_NOTIFY_LEAD_MIN` minutes
+- **Reminders** whose `remind_on` is today
+  - If the reminder text starts with `HH:MM —` (your convention), Iris uses that time and the same lead-min window
+  - Otherwise it's treated as an all-day ping (one message at the first scan of the day)
+
+Sent messages are deduped in `/claude-auth/discord-notified.json` so restarts don't re-ping the same item.
+
+Pick a channel like `#iris-alerts` (or just reuse `#general`). Disable any time by clearing the env var and restarting the stack.
 
 ## Updating
 
