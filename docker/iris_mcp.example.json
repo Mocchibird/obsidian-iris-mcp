@@ -1,0 +1,12 @@
+{
+  "_comment": "Reference MCP config — the bot loads this shape via the Claude Agent SDK rather than reading this file directly. Kept as a checked-in example so users can hand-tweak if needed.",
+  "mcpServers": {
+    "iris": {
+      "command": "python",
+      "args": ["/opt/iris/obsidian_memory_mcp.py"],
+      "env": {
+        "IRIS_VAULT_ROOT": "/vault"
+      }
+    }
+  }
+}
