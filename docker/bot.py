@@ -71,6 +71,12 @@ def _parse_csv_ids(raw: str) -> set[int]:
 
 ALLOWED_CHANNELS = _parse_csv_ids(os.environ.get("IRIS_DISCORD_ALLOWED_CHANNELS", ""))
 ALLOWED_USERS = _parse_csv_ids(os.environ.get("IRIS_DISCORD_ALLOWED_USERS", ""))
+# Channels where Iris responds to every human message (no @-mention needed).
+# Use this for dedicated Iris channels like #iris-tasks, #iris-notes, etc.
+# DMs are always treated this way regardless of this setting.
+LISTEN_ALWAYS_CHANNELS = _parse_csv_ids(
+    os.environ.get("IRIS_DISCORD_LISTEN_ALWAYS_CHANNELS", "")
+)
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -226,6 +232,19 @@ async def on_ready() -> None:
         log.info("restricted to channels: %s", sorted(ALLOWED_CHANNELS))
     if ALLOWED_USERS:
         log.info("restricted to users: %s", sorted(ALLOWED_USERS))
+    if LISTEN_ALWAYS_CHANNELS:
+        log.info("always-listen channels: %s", sorted(LISTEN_ALWAYS_CHANNELS))
+
+
+def _is_reply_to_bot(message: discord.Message) -> bool:
+    """True if this message is a Discord 'reply' to one of the bot's messages."""
+    ref = message.reference
+    if ref is None or ref.resolved is None:
+        return False
+    resolved = ref.resolved
+    if isinstance(resolved, discord.Message):
+        return resolved.author.id == (client.user.id if client.user else 0)
+    return False
 
 
 @client.event
@@ -234,12 +253,16 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
-    # If we're in a guild and the bot is NOT mentioned and NOT in a DM, ignore.
-    # In DMs (and threads where the bot was explicitly invited), respond to all
-    # human messages. Adjust to taste.
+    # Iris responds in any of these situations:
+    #   1. The message is a DM to the bot
+    #   2. The message @-mentions the bot
+    #   3. The message replies to one of the bot's previous messages
+    #   4. The channel is in the always-listen list (e.g. dedicated #iris-* rooms)
     in_dm = isinstance(message.channel, discord.DMChannel)
     is_mention = client.user in message.mentions
-    if not in_dm and not is_mention:
+    is_reply_to_bot = _is_reply_to_bot(message)
+    is_always_listen = message.channel.id in LISTEN_ALWAYS_CHANNELS
+    if not (in_dm or is_mention or is_reply_to_bot or is_always_listen):
         return
 
     if not _is_allowed(message):
