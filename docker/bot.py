@@ -106,6 +106,13 @@ CONTEXT_BURST_GAP_MIN = int(os.environ.get("IRIS_DISCORD_CONTEXT_BURST_GAP_MIN",
 # Rough conservative char-per-token estimate for budget math (CJK-friendly).
 _CHARS_PER_TOKEN = 3
 
+# Per-channel JSONL log of every message we see. Iris can read this on
+# demand via the `fetch_discord_history` MCP tool when a conversation
+# references something older than the cold-start context window.
+HISTORY_DIR = Path(
+    os.environ.get("IRIS_DISCORD_HISTORY_DIR", "/claude-auth/discord-channels")
+)
+
 # ── Proactive notifications ─────────────────────────────────────────────────
 # When IRIS_DISCORD_PING_CHANNEL (legacy alias: IRIS_DISCORD_NOTIFY_CHANNEL)
 # is set, Iris posts to that channel unprompted, in three flavours:
@@ -273,16 +280,36 @@ def _load_system_prompt() -> str | None:
         "Same for transit (SBB/Trainline/etc.), flight status pages, "
         "Wikipedia, recipe links, anything useful — Discord renders them "
         "inline and saves him from having to search. Don't ask permission, "
-        "just include the link."
+        "just include the link.\n\n"
+        "Extended Discord memory: your in-context view of this channel is "
+        "the most recent burst of conversation. If Hyun-Min references "
+        "something said earlier that isn't in your immediate context — and "
+        "checking the vault for it doesn't help — call the "
+        "`fetch_discord_history(hours_back=N)` tool to pull the relevant "
+        "older messages from the bot's stored log. Don't pre-fetch on every "
+        "turn; only when a reference clearly points past your current window."
     )
 
 
 # ── Claude Agent SDK wiring ──────────────────────────────────────────────────
 
-def _build_options(system_prompt: str | None = None) -> ClaudeAgentOptions:
+def _build_options(
+    system_prompt: str | None = None,
+    channel_id: int | None = None,
+) -> ClaudeAgentOptions:
     """Per-session options. The MCP server config tells Claude how to launch
     Iris. ``system_prompt`` overrides the default (used to inject recent
-    Discord history into a cold-start session)."""
+    Discord history into a cold-start session). ``channel_id`` is passed via
+    env so the ``fetch_discord_history`` MCP tool knows which channel's log
+    to read.
+    """
+    iris_env: dict[str, str] = {
+        **os.environ,
+        "IRIS_VAULT_ROOT": VAULT_ROOT,
+        "IRIS_DISCORD_HISTORY_DIR": str(HISTORY_DIR),
+    }
+    if channel_id is not None:
+        iris_env["IRIS_DISCORD_CHANNEL_ID"] = str(channel_id)
     return ClaudeAgentOptions(
         model=MODEL,
         cwd="/opt/iris",
@@ -292,13 +319,43 @@ def _build_options(system_prompt: str | None = None) -> ClaudeAgentOptions:
                 "type": "stdio",
                 "command": "python",
                 "args": ["/opt/iris/obsidian_memory_mcp.py"],
-                "env": {"IRIS_VAULT_ROOT": VAULT_ROOT, **os.environ},
+                "env": iris_env,
             }
         },
         # Trust all Iris tools. Iris's own write tools have validation
         # baked in; this is a personal-use bot in a private Discord.
         permission_mode="bypassPermissions",
     )
+
+
+async def _log_channel_message(message: discord.Message) -> None:
+    """Append a single message to the per-channel JSONL log.
+
+    Called from on_message for every message we observe in any channel the
+    bot can see — including the bot's own messages so the history is
+    complete. Iris reads these later via `fetch_discord_history`.
+    """
+    if client.user is None:
+        return
+    content = (message.content or "")
+    if not content.strip():
+        return
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    path = HISTORY_DIR / f"{message.channel.id}.jsonl"
+    is_iris = message.author.id == client.user.id
+    entry = {
+        "ts": message.created_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        "author_id": message.author.id,
+        "author": (message.author.display_name or message.author.name),
+        "is_iris": is_iris,
+        "is_proactive": _is_proactive_ping(content.strip(), is_iris),
+        "content": content,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("channel-log write failed: %s", e)
 
 
 _PROACTIVE_PING_LEADS = ("⏰", "🔔", "🌅", "🌙", "💤", "🗺️")
@@ -536,7 +593,9 @@ async def _get_or_create_client(
             log.info("seeded channel %s with %d chars of recent history",
                      key, len(recent))
 
-    sdk_client = ClaudeSDKClient(options=_build_options(system_prompt=sys_prompt))
+    sdk_client = ClaudeSDKClient(
+        options=_build_options(system_prompt=sys_prompt, channel_id=key)
+    )
     await sdk_client.connect()
     _sessions[key] = sdk_client
     log.info("opened new Claude session for channel %s", key)
@@ -921,9 +980,18 @@ def _is_reply_to_bot(message: discord.Message) -> bool:
 
 @client.event
 async def on_message(message: discord.Message) -> None:
-    # Ignore self and other bots
+    # Log Iris's own messages to the per-channel history JSONL so the
+    # fetch_discord_history MCP tool can include them. Then exit — Iris
+    # doesn't respond to herself.
+    is_iris_self = client.user and message.author.id == client.user.id
+    if is_iris_self:
+        await _log_channel_message(message)
+        return
+    # Other bots — ignore (don't log to keep noise out of Iris's view)
     if message.author.bot:
         return
+    # Real human message — log first, then decide whether to respond.
+    await _log_channel_message(message)
 
     # Iris responds in any of these situations:
     #   1. The message is a DM to the bot

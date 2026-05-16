@@ -174,6 +174,8 @@ In Discord: `@Iris what notes did I touch last week?`
 - Sessions live **in-process only**. On bot restart they're discarded — but the bot fetches recent channel messages and injects them into the new session's system prompt as background context. The model treats them as memory and continues naturally. Net effect: a restart is mostly invisible from the user's side, and you don't need to persist Claude sessions to disk. The vault stays the canonical long-term memory; Discord history is the short-term buffer.
 
   Selection is **fuzzy and burst-aware**. The bot groups recent messages into conversation bursts (gaps longer than `IRIS_DISCORD_CONTEXT_BURST_GAP_MIN` start a new burst) and walks newest-to-oldest including whole bursts up to the soft token budget. To avoid amputating a coherent topic that spans several messages, it'll overshoot the budget by up to `IRIS_DISCORD_CONTEXT_FUZZ_FACTOR` × budget rather than cut a burst in half. So if you discussed a government appointment 20 minutes ago and the budget would only cover half those messages, the bot keeps the whole appointment thread intact.
+
+- **Extended on-demand recall** via `fetch_discord_history(hours_back=N)`. The bot logs every message it sees to a per-channel JSONL log at `IRIS_DISCORD_HISTORY_DIR`. If Iris needs to reach further back than the cold-start window — e.g. the user says "what did I tell you yesterday about the appointment?" — she can call this MCP tool to pull older messages on demand. By default it filters out her own proactive pings (event reminders, briefings) since those aren't conversational.
 - **Long sessions auto-compact.** Claude Code (which powers the SDK) summarizes earlier turns when the context window fills up, replacing them with a recap. You don't manage this; it just happens.
 - Iris responds when **any** of these is true:
   - You're DMing the bot
@@ -196,6 +198,7 @@ In Discord: `@Iris what notes did I touch last week?`
 | `IRIS_DISCORD_CONTEXT_TOKEN_BUDGET` | `2000` | Soft token budget for the injection. Fuzzy — see below. |
 | `IRIS_DISCORD_CONTEXT_FUZZ_FACTOR` | `1.5` | How much to overshoot the budget to keep a topic burst intact. |
 | `IRIS_DISCORD_CONTEXT_BURST_GAP_MIN` | `10` | Minutes between messages that end one burst and start another. |
+| `IRIS_DISCORD_HISTORY_DIR` | `/claude-auth/discord-channels` | Where the bot writes per-channel JSONL logs (read on-demand by `fetch_discord_history`). |
 | `IRIS_VAULT_ROOT` | `/vault` | Should match the docker-compose volume target |
 | `CLAUDE_CONFIG_DIR` | `/claude-auth` | Where `claude login` stores its token |
 | `IRIS_DISCORD_PING_CHANNEL` | _(unset)_ | Channel ID for proactive pings. Blank = all proactive output disabled. Legacy alias `IRIS_DISCORD_NOTIFY_CHANNEL` still works. |
