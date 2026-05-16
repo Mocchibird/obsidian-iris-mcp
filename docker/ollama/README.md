@@ -24,8 +24,10 @@ Paste the contents of [`compose.yaml`](compose.yaml) into the editor.
 Switch to the `.env` tab and paste:
 
 ```dotenv
-# Adjust <pool> to your actual pool name
-OLLAMA_DATA_DIR=/mnt/HDDs/Applications/ollama
+# Adjust <pool> to your actual pool name.
+# Convention: keep all local AI-model dirs under a shared ai-models/ parent
+# so future tools (Whisper, Piper, LM Studio, …) live next to Ollama.
+OLLAMA_DATA_DIR=/mnt/HDDs/Applications/ai-models/ollama
 ```
 
 The directory will be created on first start; models land there (each is multi-GB so pick a path with space).
