@@ -33,10 +33,14 @@ Env vars (all optional unless noted):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
+import sqlite3
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import discord
@@ -77,6 +81,23 @@ ALLOWED_USERS = _parse_csv_ids(os.environ.get("IRIS_DISCORD_ALLOWED_USERS", ""))
 LISTEN_ALWAYS_CHANNELS = _parse_csv_ids(
     os.environ.get("IRIS_DISCORD_LISTEN_ALWAYS_CHANNELS", "")
 )
+
+# ── Proactive notifications ─────────────────────────────────────────────────
+# When IRIS_DISCORD_NOTIFY_CHANNEL is set, a background loop scans the vault
+# every IRIS_NOTIFY_INTERVAL_SECS and posts pings for:
+#   - calendar events starting in <= IRIS_NOTIFY_LEAD_MIN minutes
+#   - reminders whose remind_on date is today (with optional HH:MM prefix in
+#     the reminder text → same lead-time logic as events)
+# Sent messages are deduped via a small JSON file under /claude-auth so
+# restarts don't double-ping.
+try:
+    NOTIFY_CHANNEL = int(os.environ.get("IRIS_DISCORD_NOTIFY_CHANNEL", "0") or "0")
+except ValueError:
+    NOTIFY_CHANNEL = 0
+NOTIFY_INTERVAL_SECS = int(os.environ.get("IRIS_NOTIFY_INTERVAL_SECS", "300"))
+NOTIFY_LEAD_MIN = int(os.environ.get("IRIS_NOTIFY_LEAD_MIN", "15"))
+NOTIFIED_PATH = Path("/claude-auth/discord-notified.json")
+_HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -234,6 +255,159 @@ async def on_ready() -> None:
         log.info("restricted to users: %s", sorted(ALLOWED_USERS))
     if LISTEN_ALWAYS_CHANNELS:
         log.info("always-listen channels: %s", sorted(LISTEN_ALWAYS_CHANNELS))
+    if NOTIFY_CHANNEL:
+        log.info(
+            "proactive notifications → channel %s every %ss, lead %s min",
+            NOTIFY_CHANNEL, NOTIFY_INTERVAL_SECS, NOTIFY_LEAD_MIN,
+        )
+        client.loop.create_task(_notification_loop())
+
+
+# ── Proactive notification loop ─────────────────────────────────────────────
+# Persisted dedupe — JSON file under /claude-auth so restarts don't re-ping
+# events/reminders we already sent.
+
+def _load_notified() -> set[str]:
+    if not NOTIFIED_PATH.exists():
+        return set()
+    try:
+        data = json.loads(NOTIFIED_PATH.read_text())
+        return set(data.get("keys", []))
+    except Exception:
+        return set()
+
+
+def _save_notified(keys: set[str]) -> None:
+    NOTIFIED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Keep only the most recent 1000 keys to bound the file size
+    recent = list(keys)[-1000:]
+    NOTIFIED_PATH.write_text(json.dumps({
+        "keys": recent,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }))
+
+
+_notified: set[str] = set()
+
+
+async def _notification_loop() -> None:
+    """Scan vault every NOTIFY_INTERVAL_SECS for events/reminders to ping."""
+    global _notified
+    _notified = _load_notified()
+    # Brief delay so on_ready finishes before the first scan
+    await asyncio.sleep(5)
+    while not client.is_closed():
+        try:
+            await _check_upcoming()
+        except Exception:
+            log.exception("notification check failed")
+        await asyncio.sleep(NOTIFY_INTERVAL_SECS)
+
+
+async def _check_upcoming() -> None:
+    if NOTIFY_CHANNEL == 0:
+        return
+    # Local import so the bot still boots if Iris's package isn't yet on path
+    import iris_config as cfg
+    db_path = cfg.vault_db_path()
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        await _check_events(conn)
+        await _check_reminders(conn)
+    finally:
+        conn.close()
+
+
+def _minutes_until(target_time: str, today_iso: str) -> float | None:
+    """Parse 'HH:MM' for today; return minutes from now (negative if past)."""
+    if not target_time or ":" not in target_time:
+        return None
+    try:
+        hh, mm = target_time.split(":")[:2]
+        target = datetime.now().replace(
+            hour=int(hh), minute=int(mm), second=0, microsecond=0
+        )
+    except ValueError:
+        return None
+    delta = (target - datetime.now()).total_seconds() / 60
+    return delta
+
+
+async def _check_events(conn: sqlite3.Connection) -> None:
+    today = datetime.now().date().isoformat()
+    rows = conn.execute(
+        "SELECT date, time, end_time, title, location FROM events "
+        "WHERE date = ? AND time != '' AND time NOT IN ('00:00', '0:00')",
+        (today,),
+    ).fetchall()
+    for r in rows:
+        lead = _minutes_until(r["time"], today)
+        if lead is None or lead <= 0 or lead > NOTIFY_LEAD_MIN:
+            continue
+        key = f"event:{r['date']}:{r['time']}:{r['title']}"
+        if key in _notified:
+            continue
+        _notified.add(key)
+        loc = f" @ {r['location']}" if r["location"] else ""
+        end = f"–{r['end_time']}" if r["end_time"] else ""
+        await _send_notification(
+            f"⏰ **{r['title']}** in {int(round(lead))} min — "
+            f"{r['time']}{end}{loc}"
+        )
+    _save_notified(_notified)
+
+
+async def _check_reminders(conn: sqlite3.Connection) -> None:
+    today = datetime.now().date().isoformat()
+    rows = conn.execute(
+        "SELECT text, remind_on, repeat, note_path FROM reminders "
+        "WHERE checked = 0 AND remind_on = ?",
+        (today,),
+    ).fetchall()
+    for r in rows:
+        text = r["text"] or ""
+        m = _HHMM_PREFIX_RE.match(text)
+        if m:
+            hhmm = f"{m.group(1)}:{m.group(2)}"
+            lead = _minutes_until(hhmm, today)
+            if lead is None or lead <= 0 or lead > NOTIFY_LEAD_MIN:
+                continue
+            clean = _HHMM_PREFIX_RE.sub("", text).strip() or "(reminder)"
+            key = f"rem:{r['remind_on']}:{hhmm}:{clean}"
+            if key in _notified:
+                continue
+            _notified.add(key)
+            await _send_notification(
+                f"🔔 **Reminder** in {int(round(lead))} min — {clean}"
+            )
+        else:
+            # No time embedded — single all-day ping at first check of the day
+            key = f"rem-allday:{r['remind_on']}:{text}"
+            if key in _notified:
+                continue
+            _notified.add(key)
+            await _send_notification(f"🔔 **Reminder today** — {text}")
+    _save_notified(_notified)
+
+
+async def _send_notification(content: str) -> None:
+    channel = client.get_channel(NOTIFY_CHANNEL)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(NOTIFY_CHANNEL)
+        except discord.HTTPException as e:
+            log.warning("could not fetch notify channel %s: %s",
+                        NOTIFY_CHANNEL, e)
+            return
+    try:
+        await channel.send(content)  # type: ignore[union-attr]
+        log.info("notification → #%s: %s",
+                 getattr(channel, "name", NOTIFY_CHANNEL), content[:80])
+    except discord.HTTPException as e:
+        log.warning("notification send failed: %s", e)
 
 
 def _is_reply_to_bot(message: discord.Message) -> bool:
