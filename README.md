@@ -85,13 +85,43 @@ In Claude:
 > embedding_status()          # health check
 ```
 
-Switch backends by setting env vars before launching Iris (defaults in parens):
+## Configuration
 
-| Variable             | Default                                     |
-|----------------------|---------------------------------------------|
-| `IRIS_EMBED_URL`     | `http://localhost:11434/v1/embeddings`      |
-| `IRIS_EMBED_MODEL`   | `nomic-embed-text`                          |
-| `IRIS_EMBED_API_KEY` | _(unset; set for OpenAI or hosted models)_  |
+All Iris config — vault path, Apple list names, focus mappings, embedding/LLM endpoints — lives in [`iris_config.py`](iris_config.py). Precedence: **env var > `~/.config/iris/config.toml` > built-in default**.
+
+Per-device overrides go in `~/.config/iris/config.toml`. Keep this file *outside* your synced vault folder so each device can point at its own paths:
+
+```toml
+[vault]
+root = "~/obsidian-vaults/AI_Memory"
+
+[apple]
+reminders_list = "Vault"
+calendar_name  = "Vault"
+
+[embed]
+url   = "http://localhost:11434/v1/embeddings"
+model = "nomic-embed-text"
+
+[llm]
+url   = "http://localhost:11434/v1/chat/completions"
+model = "gemma3:4b"   # unset = LLM-using features (prose summaries, etc.) are disabled
+```
+
+Or as env vars:
+
+| Variable                  | Default                                          |
+|---------------------------|--------------------------------------------------|
+| `IRIS_VAULT_ROOT`         | `~/obsidian-vaults/AI_Memory`                    |
+| `IRIS_EMBED_URL`          | `http://localhost:11434/v1/embeddings`           |
+| `IRIS_EMBED_MODEL`        | `nomic-embed-text`                               |
+| `IRIS_EMBED_API_KEY`      | _(unset; set for OpenAI)_                        |
+| `IRIS_LLM_URL`            | `http://localhost:11434/v1/chat/completions`     |
+| `IRIS_LLM_MODEL`          | _(unset — LLM features disabled until set)_      |
+| `IRIS_LLM_API_KEY`        | _(unset)_                                        |
+| `IRIS_CONFIG`             | `~/.config/iris/config.toml` _(TOML file path)_  |
+
+Legacy env vars `OBSIDIAN_VAULT_PATH` and `VAULT_ROOT` still work as fallbacks.
 
 ## Architecture
 

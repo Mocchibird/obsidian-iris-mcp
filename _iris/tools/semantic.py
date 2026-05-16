@@ -23,13 +23,108 @@ from .. import embeddings as emb
 
 
 def _note_text_for_embedding(path: Path) -> str:
-    """Build the text fed to the embedding model: title + body (no frontmatter)."""
+    """Build the text fed to the embedding model: title + body (no frontmatter).
+
+    Skips Excalidraw files (.excalidraw.md) since their content is raw JSON
+    that produces useless embeddings and explodes chunk counts. Use the
+    ``extract_excalidraw_text`` tool to pull their labels if you want them
+    searchable later.
+    """
+    # Skip Excalidraw files — both the .excalidraw.md double-extension form and
+    # the single-extension form Obsidian uses (frontmatter has
+    # ``excalidraw-plugin: parsed``; in practice these always live in an
+    # /Excalidraw/ folder).
+    if path.name.endswith(".excalidraw.md") or "/Excalidraw/" in str(path):
+        return ""
     raw = read_text(path)
     if not raw:
         return ""
-    _, body = split_frontmatter(raw)
+    fm, body = split_frontmatter(raw)
+    if fm.get("excalidraw-plugin"):
+        return ""
     title = title_from_text(body, fallback=path.stem)
     return f"{title}\n\n{body}".strip()
+
+
+# Chunking target: ~2000 chars ≈ 500–700 tokens, comfortably under nomic-embed's
+# 2048-token context window. Overlap preserves a bit of cross-chunk context so
+# paragraphs near a chunk boundary don't lose their neighbours.
+_CHUNK_TARGET = 2000
+_CHUNK_OVERLAP = 200
+
+
+def _chunk_text(text: str, target: int = _CHUNK_TARGET,
+                overlap: int = _CHUNK_OVERLAP) -> list[tuple[int, int, str]]:
+    """Split text into (start, end, chunk) tuples, paragraph-aware.
+
+    Greedy fill up to ``target`` chars by paragraph (``\\n\\n``). Single
+    oversized paragraphs are hard-split by char count. Each subsequent chunk
+    starts with the trailing ``overlap`` chars of the previous chunk so
+    boundary content isn't lost.
+    """
+    if not text:
+        return []
+    if len(text) <= target:
+        return [(0, len(text), text)]
+
+    # Walk char by char tracking paragraph boundaries.
+    paragraphs: list[tuple[int, str]] = []  # (start_offset, paragraph_text)
+    i = 0
+    while i < len(text):
+        # Find end of this paragraph (next \n\n+)
+        end = text.find("\n\n", i)
+        if end == -1:
+            paragraphs.append((i, text[i:]))
+            break
+        # Include the trailing blank lines so offsets line up cleanly
+        sep_end = end
+        while sep_end < len(text) and text[sep_end] == "\n":
+            sep_end += 1
+        paragraphs.append((i, text[i:sep_end]))
+        i = sep_end
+
+    chunks: list[tuple[int, int, str]] = []
+    buf_start: int | None = None
+    buf_parts: list[str] = []
+    buf_len = 0
+
+    def flush() -> None:
+        nonlocal buf_start, buf_parts, buf_len
+        if buf_start is not None and buf_parts:
+            chunk_text = "".join(buf_parts)
+            chunks.append((buf_start, buf_start + len(chunk_text), chunk_text))
+        buf_start, buf_parts, buf_len = None, [], 0
+
+    for start, para in paragraphs:
+        # Oversized single paragraph — hard-split by char count
+        if len(para) > target:
+            flush()
+            pos = 0
+            while pos < len(para):
+                sub = para[pos : pos + target]
+                chunks.append((start + pos, start + pos + len(sub), sub))
+                pos += target - overlap
+            continue
+        if buf_len + len(para) > target and buf_parts:
+            flush()
+        if buf_start is None:
+            buf_start = start
+        buf_parts.append(para)
+        buf_len += len(para)
+    flush()
+
+    # Add overlap from the tail of each previous chunk to the head of the next.
+    if overlap > 0 and len(chunks) > 1:
+        prefixed: list[tuple[int, int, str]] = [chunks[0]]
+        for prev, cur in zip(chunks, chunks[1:]):
+            prev_text = prev[2]
+            tail = prev_text[-overlap:] if len(prev_text) > overlap else prev_text
+            new_start = max(0, cur[0] - len(tail))
+            new_text = tail + cur[2]
+            prefixed.append((new_start, cur[1], new_text))
+        chunks = prefixed
+
+    return chunks
 
 
 @mcp.tool()
@@ -48,10 +143,11 @@ def embedding_status() -> str:
         "SELECT COUNT(*) FROM files WHERE suffix = '.md'"
     ).fetchone()[0]
     embedded = c.execute(
-        "SELECT COUNT(*) FROM note_embeddings WHERE model = ?", (emb.EMBED_MODEL,)
+        "SELECT COUNT(DISTINCT note_path) FROM note_embeddings WHERE model = ?",
+        (emb.EMBED_MODEL,),
     ).fetchone()[0]
     stale = c.execute(
-        "SELECT COUNT(*) FROM note_embeddings ne "
+        "SELECT COUNT(DISTINCT ne.note_path) FROM note_embeddings ne "
         "JOIN files f ON ne.note_path = f.path "
         "WHERE ne.model = ? AND ne.content_hash != f.content_hash",
         (emb.EMBED_MODEL,),
@@ -109,7 +205,8 @@ def reindex_embeddings(force: bool = False, limit: int = 0) -> str:
         return f"Index up to date for model '{emb.EMBED_MODEL}' (no notes to embed)."
 
     root = get_vault_root()
-    to_embed: list[tuple[str, str, str]] = []  # (path, content_hash, text)
+    # (path, content_hash, [(chunk_id, start, end, text), ...])
+    to_embed: list[tuple[str, str, list[tuple[int, int, int, str]]]] = []
     for r in rows:
         full = root / r["path"]
         if not full.exists() or is_ignored_path(full):
@@ -117,52 +214,97 @@ def reindex_embeddings(force: bool = False, limit: int = 0) -> str:
         text = _note_text_for_embedding(full)
         if not text.strip():
             continue
-        to_embed.append((r["path"], r["content_hash"], text))
+        pieces = _chunk_text(text)
+        chunk_rows = [(i, start, end, body) for i, (start, end, body) in enumerate(pieces)]
+        to_embed.append((r["path"], r["content_hash"], chunk_rows))
 
     if not to_embed:
         return "No embeddable notes found (all empty or ignored)."
 
-    # Embed in batches; commit per-batch so partial progress is durable.
-    batch_size = 16
-    done = 0
+    # Flatten to a single list of (path, content_hash, chunk_id, start, end, text)
+    # so we can batch across notes. We delete-and-replace per-note so chunk
+    # counts can shrink without leaving orphan rows.
+    flat: list[tuple[str, str, int, int, int, str]] = []
+    for path, content_hash, chunks_for_note in to_embed:
+        for chunk_id, start, end, body in chunks_for_note:
+            flat.append((path, content_hash, chunk_id, start, end, body))
+
+    # Wipe existing chunks for all notes we're about to re-embed
+    seen_paths = {p for p, _, _ in to_embed}
+    for path in seen_paths:
+        c.execute(
+            "DELETE FROM note_embeddings WHERE note_path = ? AND model = ?",
+            (path, emb.EMBED_MODEL),
+        )
+    c.commit()
+
+    batch_size = 8
+    done_notes = 0
+    chunks_written = 0
     failed = 0
     now = datetime.now().isoformat(timespec="seconds")
-    for i in range(0, len(to_embed), batch_size):
-        chunk = to_embed[i : i + batch_size]
-        texts = [t for _, _, t in chunk]
+    notes_with_chunks_written: set[str] = set()
+    for i in range(0, len(flat), batch_size):
+        batch = flat[i : i + batch_size]
+        texts = [t for *_, t in batch]
         try:
             vecs = emb.embed_batch(texts, batch_size=batch_size)
         except emb.EmbeddingError as e:
             return (
-                f"Embedding failed after {done} notes: {e}\n\n"
+                f"Embedding failed after {chunks_written} chunks "
+                f"({len(notes_with_chunks_written)} notes): {e}\n\n"
                 f"Config:\n{emb.config_summary()}"
             )
-        if len(vecs) != len(chunk):
-            failed += len(chunk)
+        if len(vecs) != len(batch):
+            failed += len(batch)
             continue
-        for (path, content_hash, _), vec in zip(chunk, vecs):
+        for (path, content_hash, chunk_id, start, end, _body), vec in zip(batch, vecs):
             c.execute(
                 "INSERT OR REPLACE INTO note_embeddings "
-                "(note_path, model, content_hash, dim, embedding, embedded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (path, emb.EMBED_MODEL, content_hash, len(vec), emb.pack(vec), now),
+                "(note_path, chunk_id, model, content_hash, chunk_start, chunk_end, "
+                " dim, embedding, embedded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (path, chunk_id, emb.EMBED_MODEL, content_hash, start, end,
+                 len(vec), emb.pack(vec), now),
             )
+            notes_with_chunks_written.add(path)
+            chunks_written += 1
         c.commit()
-        done += len(chunk)
 
+    done_notes = len(notes_with_chunks_written)
     return (
-        f"Embedded {done} note(s) with model '{emb.EMBED_MODEL}'"
+        f"Embedded {done_notes} note(s) as {chunks_written} chunk(s) "
+        f"with model '{emb.EMBED_MODEL}'"
         + (f" ({failed} failed)" if failed else "")
         + f". Endpoint: {emb.EMBED_URL}"
     )
 
 
+# Note types that aggregate links to other notes rather than carry primary
+# content (hubs, MOCs, dashboards). Excluded from semantic_search by default
+# because they tend to dominate every query — they literally mention everything.
+_HUB_TYPES = ("hub", "index", "dashboard", "moc")
+
+
 @mcp.tool()
-def semantic_search(query: str, top_k: int = 10, filter_folder: str = "") -> str:
+def semantic_search(
+    query: str,
+    top_k: int = 10,
+    filter_folder: str = "",
+    include_hubs: bool = False,
+    show_snippets: bool = False,
+) -> str:
     """Find notes semantically related to ``query`` using cosine similarity.
 
     Embeds the query with the same model used for the index and ranks all
     indexed notes by similarity. Returns the top_k matches with scores.
+
+    Per-note ranking uses the best-matching chunk (notes are split into
+    ~2000-char paragraph-aware chunks at index time).
+
+    By default, aggregator notes (``type: hub``, ``index``, ``dashboard``,
+    ``moc``) are excluded — they're MOCs that link to everything and otherwise
+    drown out primary content. Pass ``include_hubs=True`` to opt them back in.
 
     If the index is empty for the current model, prompts the user to run
     ``reindex_embeddings`` first.
@@ -172,6 +314,9 @@ def semantic_search(query: str, top_k: int = 10, filter_folder: str = "") -> str
         top_k: Number of results to return (1–50).
         filter_folder: Only return notes whose path starts with this folder
                        (e.g. "30_Episodic/" or "20_Projects/").
+        include_hubs: If True, do NOT filter out hub/index/dashboard/moc notes.
+        show_snippets: If True, include a ~200-char preview of the matching
+                       chunk under each result. Helpful for triaging hits.
     """
     query = query.strip()
     if not query:
@@ -186,9 +331,16 @@ def semantic_search(query: str, top_k: int = 10, filter_folder: str = "") -> str
     if filter_folder.strip():
         where += " AND ne.note_path LIKE ?"
         params.append(f"{filter_folder.strip().rstrip('/')}/%")
+    if not include_hubs:
+        placeholders = ",".join("?" * len(_HUB_TYPES))
+        where += (
+            f" AND (n.type IS NULL OR n.type NOT IN ({placeholders}))"
+        )
+        params.extend(_HUB_TYPES)
 
     rows = c.execute(
-        f"SELECT ne.note_path, ne.embedding, n.title "
+        f"SELECT ne.note_path, ne.chunk_id, ne.chunk_start, ne.chunk_end, "
+        f"       ne.embedding, n.title, n.type "
         f"FROM note_embeddings ne "
         f"LEFT JOIN notes n ON n.path = ne.note_path "
         f"{where}",
@@ -206,16 +358,40 @@ def semantic_search(query: str, top_k: int = 10, filter_folder: str = "") -> str
     except emb.EmbeddingError as e:
         return f"Embedding query failed: {e}\n\n{emb.config_summary()}"
 
-    scored: list[tuple[float, str, str]] = []
+    # Score every chunk, keep the best chunk per note.
+    best_per_note: dict[str, tuple[float, str, int, int, int]] = {}
     for r in rows:
         vec = emb.unpack(r["embedding"])
         score = emb.cosine(q_vec, vec)
         title = r["title"] or Path(r["note_path"]).stem
-        scored.append((score, r["note_path"], title))
-    scored.sort(reverse=True)
+        prev = best_per_note.get(r["note_path"])
+        if prev is None or score > prev[0]:
+            best_per_note[r["note_path"]] = (
+                score, title, r["chunk_id"], r["chunk_start"], r["chunk_end"],
+            )
+
+    scored = sorted(
+        ((score, path, title, chunk_id, cs, ce)
+         for path, (score, title, chunk_id, cs, ce) in best_per_note.items()),
+        reverse=True,
+    )
 
     out = [f"Semantic search for: {query!r}   (model: {emb.EMBED_MODEL})"]
-    for score, path, title in scored[:top_k]:
+    root = get_vault_root() if show_snippets else None
+    for score, path, title, _chunk_id, cs, ce in scored[:top_k]:
         link = f"[[{path[:-3]}|{title}]]" if path.endswith(".md") else path
         out.append(f"{score:+.3f}  {link}")
+        if show_snippets and root is not None:
+            try:
+                full = root / path
+                raw = read_text(full)
+                if raw:
+                    _, body = split_frontmatter(raw)
+                    snippet = body[cs:ce] if ce > cs else body[:400]
+                    snippet = snippet.strip().replace("\n", " ")
+                    if len(snippet) > 220:
+                        snippet = snippet[:217] + "…"
+                    out.append(f"        ↳ {snippet}")
+            except OSError:
+                pass
     return "\n".join(out)

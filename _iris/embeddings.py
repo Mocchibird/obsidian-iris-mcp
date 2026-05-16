@@ -1,12 +1,7 @@
 """Embedding client and helpers for semantic search.
 
-Talks to any OpenAI-compatible /v1/embeddings endpoint. Configurable via env:
-
-    IRIS_EMBED_URL       default http://localhost:11434/v1/embeddings  (Ollama)
-    IRIS_EMBED_MODEL     default nomic-embed-text
-    IRIS_EMBED_API_KEY   default ""  (set for OpenAI proper)
-    IRIS_EMBED_MAX_CHARS default 16000   (~4K tokens, well under nomic's 8K limit)
-    IRIS_EMBED_TIMEOUT   default 60      (seconds)
+Talks to any OpenAI-compatible /v1/embeddings endpoint. All config lives in
+``iris_config`` (env vars + optional ~/.config/iris/config.toml).
 
 LM Studio: set IRIS_EMBED_URL=http://localhost:1234/v1/embeddings.
 OpenAI:    set IRIS_EMBED_URL=https://api.openai.com/v1/embeddings + IRIS_EMBED_API_KEY.
@@ -18,16 +13,18 @@ from __future__ import annotations
 
 import array
 import math
-import os
 
 import httpx
 
+import iris_config as cfg
 
-EMBED_URL = os.environ.get("IRIS_EMBED_URL", "http://localhost:11434/v1/embeddings")
-EMBED_MODEL = os.environ.get("IRIS_EMBED_MODEL", "nomic-embed-text")
-EMBED_API_KEY = os.environ.get("IRIS_EMBED_API_KEY", "")
-EMBED_MAX_CHARS = int(os.environ.get("IRIS_EMBED_MAX_CHARS", "16000"))
-EMBED_TIMEOUT = int(os.environ.get("IRIS_EMBED_TIMEOUT", "60"))
+
+# Re-exported for convenience so call sites don't need to import iris_config
+EMBED_URL = cfg.EMBED_URL
+EMBED_MODEL = cfg.EMBED_MODEL
+EMBED_API_KEY = cfg.EMBED_API_KEY
+EMBED_MAX_CHARS = cfg.EMBED_MAX_CHARS
+EMBED_TIMEOUT = cfg.EMBED_TIMEOUT
 
 
 class EmbeddingError(RuntimeError):
@@ -64,16 +61,26 @@ def embed_one(text: str) -> list[float]:
         raise EmbeddingError(f"Unexpected embed response: {data}") from e
 
 
-def embed_batch(texts: list[str], batch_size: int = 16) -> list[list[float]]:
-    """Embed many texts in batches. Returns vectors in input order."""
+def embed_batch(texts: list[str], batch_size: int = 8) -> list[list[float]]:
+    """Embed many texts in batches. Returns vectors in input order.
+
+    If a batch is rejected for length (typical 400 from embed servers when one
+    input exceeds context), retries each input individually with a halved
+    char limit so one oversized note doesn't kill its batch-mates.
+    """
     out: list[list[float]] = []
     for i in range(0, len(texts), batch_size):
         chunk = [t[:EMBED_MAX_CHARS] for t in texts[i : i + batch_size]]
-        data = _post({"model": EMBED_MODEL, "input": chunk})
         try:
+            data = _post({"model": EMBED_MODEL, "input": chunk})
             out.extend(item["embedding"] for item in data["data"])
-        except (KeyError, TypeError) as e:
-            raise EmbeddingError(f"Unexpected batch response: {data}") from e
+        except EmbeddingError:
+            # Fall back to one-at-a-time with aggressive truncation
+            fallback_limit = max(1000, EMBED_MAX_CHARS // 2)
+            for t in chunk:
+                trimmed = t[:fallback_limit]
+                data = _post({"model": EMBED_MODEL, "input": trimmed})
+                out.append(data["data"][0]["embedding"])
     return out
 
 

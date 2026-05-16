@@ -92,14 +92,13 @@ def maybe_reload_db_plugin(notify: bool = False) -> None:
 
 
 def get_vault_root() -> Path:
-    vault = os.environ.get("OBSIDIAN_VAULT_PATH")
-    if not vault:
-        raise RuntimeError("OBSIDIAN_VAULT_PATH is not set")
-
-    root = Path(vault).expanduser().resolve()
+    import iris_config as cfg
+    root = cfg.VAULT_ROOT.resolve()
     if not root.exists() or not root.is_dir():
-        raise RuntimeError(f"Vault path does not exist or is not a directory: {root}")
-
+        raise RuntimeError(
+            f"Vault path does not exist or is not a directory: {root}. "
+            f"Set IRIS_VAULT_ROOT (or [vault].root in {cfg.config_path()})."
+        )
     return root
 
 
@@ -854,7 +853,7 @@ class VaultIndex:
     fts        – FTS5 full-text search over note body text
     """
 
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
 
     def __init__(self, vault_root: Path):
         self._root = vault_root
@@ -1256,16 +1255,25 @@ class VaultIndex:
             ORDER BY warranty_until DESC
         """)
 
-        # -- note_embeddings: semantic search vectors (one row per note per model)
+        # -- note_embeddings: semantic search vectors.
+        # PK is (note_path, chunk_id, model) — v1 uses chunk_id=0 for whole-note
+        # embedding. The schema is ready for paragraph-level chunking later
+        # without a forced reindex; chunk_start/chunk_end carry character offsets
+        # into the source note for showing the matching passage.
+        if current < 9:
+            c.execute("DROP TABLE IF EXISTS note_embeddings")
         c.execute("""
             CREATE TABLE IF NOT EXISTS note_embeddings (
                 note_path     TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+                chunk_id      INTEGER NOT NULL DEFAULT 0,
                 model         TEXT NOT NULL,
                 content_hash  TEXT NOT NULL,
+                chunk_start   INTEGER NOT NULL DEFAULT 0,
+                chunk_end     INTEGER NOT NULL DEFAULT 0,
                 dim           INTEGER NOT NULL,
                 embedding     BLOB NOT NULL,
                 embedded_at   TEXT NOT NULL,
-                PRIMARY KEY (note_path, model)
+                PRIMARY KEY (note_path, chunk_id, model)
             )
         """)
 

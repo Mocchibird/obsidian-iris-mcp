@@ -46,7 +46,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["obsidian_memory_mcp", "vault_cron"]
+py-modules = ["obsidian_memory_mcp", "vault_cron", "iris_config"]
 
 [tool.setuptools.packages.find]
 include = ["_iris*"]

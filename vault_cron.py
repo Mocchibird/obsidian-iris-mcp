@@ -35,34 +35,21 @@ from pathlib import Path
 from typing import Any
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+# All config (vault root, Apple list names, focus mapping, etc.) lives in
+# iris_config.py — sibling module, zero deps. Override via env vars or
+# ~/.config/iris/config.toml.
 
-VAULT_ROOT = Path(os.environ.get(
-    "VAULT_ROOT",
-    os.path.expanduser("~/obsidian-vaults/AI_Memory"),
-))
-DB_PATH = VAULT_ROOT / ".ai_memory_cache" / "vault.db"
-LOG_PATH = VAULT_ROOT / ".ai_memory_cache" / "vault_cron.log"
-SYNC_STATE_PATH = VAULT_ROOT / ".ai_memory_cache" / "sync_state.json"
+import iris_config as cfg
 
-REMINDERS_LIST = "Vault"
-CALENDAR_NAME = "Vault"
+VAULT_ROOT = cfg.VAULT_ROOT
+DB_PATH = cfg.vault_db_path()
+LOG_PATH = cfg.vault_cache_dir() / "vault_cron.log"
+SYNC_STATE_PATH = cfg.vault_cache_dir() / "sync_state.json"
 
-# Calendars to EXCLUDE when pulling events into daily notes
-# (noise calendars that clutter the schedule)
-CALENDAR_EXCLUDE = {
-    "Vault",                      # our own sync calendar
-    "Scheduled Reminders",        # internal Apple
-    "Siri Suggestions",           # auto-generated
-    "Schweizerische Feiertage",   # 140 holiday entries
-    "Birthdays",                  # auto-generated from Contacts
-}
-
-# Focus mode → vault context mapping
-FOCUS_CONTEXT = {
-    "Work":     {"projects": ["PTO Kernels"], "tags": ["huawei", "ascend"]},
-    "Personal": {"projects": ["Homelab", "TrueNAS Migration", "MochiMind"], "tags": ["personal"]},
-    "Study":    {"projects": ["Japanese Study", "Languages"], "tags": ["ethz", "japanese"]},
-}
+REMINDERS_LIST = cfg.REMINDERS_LIST
+CALENDAR_NAME = cfg.CALENDAR_NAME
+CALENDAR_EXCLUDE = cfg.CALENDAR_EXCLUDE
+FOCUS_CONTEXT = cfg.FOCUS_CONTEXT
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 

@@ -4,26 +4,31 @@ Adding a new tool module:
     1. Create _iris/tools/<name>.py
     2. Import the shared mcp instance: ``from .. import mcp``
     3. Define your @mcp.tool() functions
-    4. Add ``from . import <name>`` below
+
+That's it. This file auto-discovers every sibling module via pkgutil and imports
+it, which triggers the @mcp.tool() decorators at import time. No registry edit
+needed when adding tools.
+
+Skipped: names starting with ``_`` (treated as private/internal).
 """
+from __future__ import annotations
 
-# Import order matters only when modules depend on each other at import time.
-# All decorators run on import, so each ``from . import X`` line registers
-# every @mcp.tool() inside X.
+import importlib
+import pkgutil
 
-from . import sqlite        # noqa: F401
-from . import files         # noqa: F401
-from . import notes         # noqa: F401
-from . import search        # noqa: F401
-from . import semantic      # noqa: F401
-from . import tasks         # noqa: F401
-from . import calendar      # noqa: F401
-from . import links         # noqa: F401
-from . import analysis      # noqa: F401
-from . import people        # noqa: F401
-from . import anime         # noqa: F401
-from . import vocab         # noqa: F401
-from . import warranties    # noqa: F401
-from . import import_export # noqa: F401
-from . import routines      # noqa: F401
-from . import web           # noqa: F401
+
+_AUTOLOAD_SKIP = set()  # add names here if a module ever needs to be excluded
+
+
+def _autoload_tools() -> list[str]:
+    loaded: list[str] = []
+    for mod_info in pkgutil.iter_modules(__path__):  # noqa: F821 — pkg __path__
+        name = mod_info.name
+        if name.startswith("_") or name in _AUTOLOAD_SKIP:
+            continue
+        importlib.import_module(f"{__name__}.{name}")
+        loaded.append(name)
+    return loaded
+
+
+_LOADED_TOOL_MODULES = _autoload_tools()
