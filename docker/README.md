@@ -206,10 +206,20 @@ Set `IRIS_DISCORD_PING_CHANNEL` to a channel ID, and Iris will post to it on her
 
 Every `IRIS_NOTIFY_INTERVAL_SECS` (default 5 min) the bot scans the vault for:
 
-- **Calendar events** today whose `time` is within `IRIS_NOTIFY_LEAD_MIN` minutes
+- **Calendar events** today whose `time` is within their lead window (default `IRIS_NOTIFY_LEAD_MIN` minutes, override per event with `lead: <duration>` in the event's `description`)
 - **Reminders** whose `remind_on` is today
-  - `HH:MM —` prefix in the text → same lead-min window
+  - `HH:MM —` prefix in the text → same lead-window rules
   - No time prefix → one all-day ping at first scan
+
+**Per-event lead-time override.** The default is 15 min before the event, fine for most things. For events that need a longer head-start (travel, packing) include a `lead:` hint:
+
+| In the description / reminder text | Meaning |
+|---|---|
+| `lead: 2h` | 2 hours before |
+| `lead: 30m` or `lead 30m` | 30 min before |
+| `lead:90` | 90 min before (bare number = minutes) |
+
+Iris knows this convention from her system prompt — saying *"meeting in Basel at 14:00, ping me 2h before"* in Discord gets her to schedule the event with `description="lead: 2h"`.
 
 ### 2. Morning briefing
 
