@@ -147,9 +147,19 @@ def _check_naming_convention(path: str) -> str | None:
     return None
 
 
-# Folders where auto-link-suggestions on new notes don't add value
-# (inbox = stubs; daily/weekly = chronological, low concept-density).
-_AUTOLINK_SKIP_PREFIXES = ("90_Inbox/", "30_Episodic/")
+# Paths where auto-link-suggestions on new notes don't add value.
+# Skip whole-folder for the inbox (stubs by definition); for 30_Episodic
+# only skip the auto-generated chronological notes — daily notes
+# (YYYY/YYYY-MM-DD.md) and weekly summaries (YYYY/Weekly/YYYY-W##.md).
+# Real content under 30_Episodic/ — Anime, Gaming, Travel, Career,
+# Master_Thesis, etc. — does get suggestions like any other folder.
+_AUTOLINK_SKIP_PREFIXES = ("90_Inbox/",)
+_DAILY_NOTE_RE = re.compile(r"^30_Episodic/\d{4}/\d{4}-\d{2}-\d{2}\.md$")
+_WEEKLY_NOTE_RE = re.compile(r"^30_Episodic/\d{4}/Weekly/\d{4}-W\d{2}\.md$")
+
+
+def _is_chronological_auto_note(rel_path: str) -> bool:
+    return bool(_DAILY_NOTE_RE.match(rel_path) or _WEEKLY_NOTE_RE.match(rel_path))
 
 
 def _auto_link_suggestions(path: str, content: str) -> str:
@@ -161,6 +171,8 @@ def _auto_link_suggestions(path: str, content: str) -> str:
     """
     rel = path.replace("\\", "/")
     if any(rel.startswith(p) for p in _AUTOLINK_SKIP_PREFIXES):
+        return ""
+    if _is_chronological_auto_note(rel):
         return ""
     try:
         _, body = split_frontmatter(content)
@@ -207,10 +219,14 @@ def write_note(path: str, content: str, overwrite: bool = False) -> str:
     - Never include ``.md`` extension: ``[[User Profile]]`` not ``[[User Profile.md]]``.
     - Use display text: ``[[10_Profile/User Profile|Your Name]]``.
 
-    On creation of a substantive new note (≥500 chars body, not under
-    ``90_Inbox/`` or ``30_Episodic/``), Iris also suggests up to 4 semantic
-    wikilinks she'd recommend adding. The write itself never fails because
-    of suggestion errors — they're best-effort.
+    On creation of a substantive new content note (≥500 chars body), Iris
+    also suggests up to 4 semantic wikilinks she'd recommend adding.
+    Skipped for paths under ``90_Inbox/`` (stubs) and for auto-generated
+    chronological notes — daily notes (``30_Episodic/YYYY/YYYY-MM-DD.md``)
+    and weekly summaries (``30_Episodic/YYYY/Weekly/YYYY-W##.md``). Real
+    content under 30_Episodic/ — Anime, Gaming, Travel, Career,
+    Master_Thesis etc. — does get suggestions. The write itself never
+    fails because of suggestion errors — they're best-effort.
     """
     content = _fix_inline_tags(content)
     note = safe_path(path)
