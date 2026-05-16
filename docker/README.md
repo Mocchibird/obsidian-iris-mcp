@@ -190,22 +190,51 @@ In Discord: `@Iris what notes did I touch last week?`
 | `IRIS_DISCORD_SYSTEM_PROMPT_PATH` | _(unset)_ | Path to markdown file inside container (e.g. `/vault/00_Index/iris_system_prompt.md`) |
 | `IRIS_VAULT_ROOT` | `/vault` | Should match the docker-compose volume target |
 | `CLAUDE_CONFIG_DIR` | `/claude-auth` | Where `claude login` stores its token |
-| `IRIS_DISCORD_NOTIFY_CHANNEL` | _(unset)_ | Channel ID for proactive event/reminder pings. Leave blank to disable. |
+| `IRIS_DISCORD_PING_CHANNEL` | _(unset)_ | Channel ID for proactive pings. Blank = all proactive output disabled. Legacy alias `IRIS_DISCORD_NOTIFY_CHANNEL` still works. |
 | `IRIS_NOTIFY_INTERVAL_SECS` | `300` | How often the notification loop scans the vault |
-| `IRIS_NOTIFY_LEAD_MIN` | `15` | How many minutes before an event/reminder to ping |
+| `IRIS_NOTIFY_LEAD_MIN` | `15` | Lead time before an event/reminder for the ping |
+| `IRIS_NOTIFY_MORNING_AT` | `08:00` | Daily morning briefing time (HH:MM, 24 h). `off` to skip. |
+| `IRIS_NOTIFY_EVENING_AT` | `22:00` | Daily evening wrap-up time. `off` to skip. |
 
 ## Proactive notifications
 
-If you set `IRIS_DISCORD_NOTIFY_CHANNEL` to a channel ID, a background loop scans the vault every `IRIS_NOTIFY_INTERVAL_SECS` and posts pings for:
+Set `IRIS_DISCORD_PING_CHANNEL` to a channel ID, and Iris will post to it on her own in four flavours:
 
-- **Calendar events** starting in ≤ `IRIS_NOTIFY_LEAD_MIN` minutes
+### 1. Upcoming event / reminder pings
+
+Every `IRIS_NOTIFY_INTERVAL_SECS` (default 5 min) the bot scans the vault for:
+
+- **Calendar events** today whose `time` is within `IRIS_NOTIFY_LEAD_MIN` minutes
 - **Reminders** whose `remind_on` is today
-  - If the reminder text starts with `HH:MM —` (your convention), Iris uses that time and the same lead-min window
-  - Otherwise it's treated as an all-day ping (one message at the first scan of the day)
+  - `HH:MM —` prefix in the text → same lead-min window
+  - No time prefix → one all-day ping at first scan
 
-Sent messages are deduped in `/claude-auth/discord-notified.json` so restarts don't re-ping the same item.
+### 2. Morning briefing
 
-Pick a channel like `#iris-alerts` (or just reuse `#general`). Disable any time by clearing the env var and restarting the stack.
+Once a day at `IRIS_NOTIFY_MORNING_AT` (default 08:00), Iris posts the same content as the `morning_briefing` MCP tool — schedule, overdue tasks, today's tasks, unfinished from recent days, inbox count, active projects.
+
+### 3. Evening wrap-up
+
+Once a day at `IRIS_NOTIFY_EVENING_AT` (default 22:00), Iris posts the same content as the `evening_wrapup` MCP tool — events attended, tasks completed, reminders done, notes modified.
+
+### 4. Snooze reactions
+
+React to any of Iris's pings with:
+
+| Emoji | Snooze |
+|---|---|
+| ⏰ | +5 min |
+| 🛏️ | +15 min |
+| 💤 | +1 hr |
+
+Iris will mark the message with ✅ to confirm and resend the same content after the delay (prefixed with 💤). Snoozes persist across bot restarts (stored at `/claude-auth/discord-snoozed.json`).
+
+### Persistence
+
+- Sent pings dedupe via `/claude-auth/discord-notified.json` (last 1000 keys)
+- Snoozes via `/claude-auth/discord-snoozed.json`
+
+Pick any channel — `#iris-alerts`, `#general`, or one of your dedicated iris channels. Clear the env var and restart to disable everything.
 
 ## Updating
 
