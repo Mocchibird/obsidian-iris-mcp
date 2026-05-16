@@ -287,7 +287,41 @@ def _load_system_prompt() -> str | None:
         "checking the vault for it doesn't help — call the "
         "`fetch_discord_history(hours_back=N)` tool to pull the relevant "
         "older messages from the bot's stored log. Don't pre-fetch on every "
-        "turn; only when a reference clearly points past your current window."
+        "turn; only when a reference clearly points past your current window.\n\n"
+        "File uploads via Discord: when Hyun-Min attaches a file, the bot "
+        "automatically saves it under `90_Inbox/inbox/<timestamp>_<name>` "
+        "and surfaces the saved path(s) in your prompt under a "
+        "`[Files just saved to the vault inbox: ...]` block. Treat that as "
+        "a task: figure out what each file is and route it. Quick playbook:\n"
+        " - Photo of a whiteboard / screenshot → `import_drop_zone` files "
+        "   it under `40_Attachments/Images/` and creates an inbox note "
+        "   that embeds it; you then decide if it belongs to an existing "
+        "   project page and `move_files` accordingly.\n"
+        " - PDF (receipt, document) → `extract_pdf_text` to read it, then "
+        "   route. Receipts/invoices often belong with warranties.\n"
+        " - Image you can see directly → use the Read tool to view the "
+        "   image and infer what it is, then file appropriately.\n"
+        " - When unsure where it goes, ask in chat rather than guessing.\n\n"
+        "When to write to the vault on your own initiative:\n"
+        " - **Concrete facts with a time/place** — calendar invites, "
+        "   appointments, meetings, travel bookings — write them IMMEDIATELY "
+        "   via `schedule_event` / `add_reminder` / etc. without asking. "
+        "   These aren't speculative; they belong in the vault by definition. "
+        "   Don't bury the calendar event under brainstorming about side "
+        "   activities (dinner after the ceremony, etc.). Anchor first, "
+        "   then chat.\n"
+        " - **Decisions** — when Hyun-Min commits to a choice ('let's go "
+        "   with Sonnenberg', 'I'll fly KLM'), write that decision down "
+        "   via `add_decision` on the relevant project / daily note, or "
+        "   append to its `## Notes`.\n"
+        " - **Explicit requests** — 'save this', 'add to my project notes', "
+        "   etc. Always honour these.\n"
+        "What NOT to auto-save:\n"
+        " - **Speculative options** — restaurant shortlists, brainstorms, "
+        "   'what if' scenarios. Present in chat, let him pick, then save "
+        "   the selection. Bombarding the vault with 4 unselected restaurants "
+        "   creates noise.\n"
+        " - **Pure chitchat** — small talk, jokes, status pings."
     )
 
 
@@ -326,6 +360,49 @@ def _build_options(
         # baked in; this is a personal-use bot in a private Discord.
         permission_mode="bypassPermissions",
     )
+
+
+_INBOX_REL = "90_Inbox/inbox"
+# Sanitize attachment filenames — strip anything outside a safe character set
+# so a hostile or weird name can't escape the inbox directory.
+_SAFE_FILENAME_RE = re.compile(r"[^\w\-. ]+")
+
+
+async def _save_attachments_to_inbox(message: discord.Message) -> list[str]:
+    """Download any Discord attachments on the message into the vault's
+    90_Inbox/inbox/ folder. Returns a list of vault-relative paths saved.
+
+    Filenames are sanitized + timestamped to avoid collisions. The vault
+    is mounted at /vault inside the container, but we use the host-side
+    IRIS_VAULT_ROOT path so the paths Iris sees match what the iris MCP
+    tools (run inside the same container) operate on.
+    """
+    if not message.attachments:
+        return []
+    inbox = Path(VAULT_ROOT) / _INBOX_REL
+    try:
+        inbox.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("could not create inbox dir %s: %s", inbox, e)
+        return []
+    saved: list[str] = []
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for att in message.attachments:
+        safe = _SAFE_FILENAME_RE.sub("_", att.filename).strip("._ ") or "file"
+        target = inbox / f"{ts}_{safe}"
+        counter = 1
+        while target.exists():
+            target = inbox / f"{ts}_{counter}_{safe}"
+            counter += 1
+        try:
+            await att.save(target)
+        except (discord.HTTPException, OSError) as e:
+            log.warning("attachment save failed for %s: %s", att.filename, e)
+            continue
+        rel = f"{_INBOX_REL}/{target.name}"
+        saved.append(rel)
+        log.info("attachment → %s (%d bytes)", rel, att.size)
+    return saved
 
 
 async def _log_channel_message(message: discord.Message) -> None:
@@ -1015,6 +1092,21 @@ async def on_message(message: discord.Message) -> None:
     if client.user:
         content = content.replace(f"<@{client.user.id}>", "").replace(
             f"<@!{client.user.id}>", "").strip()
+
+    # Save any attached files to the vault's inbox before invoking Iris.
+    # She'll see the saved paths in her prompt and can read / route them
+    # via the iris MCP tools (extract_pdf_text, extract_excalidraw_text,
+    # import_drop_zone, move_files, etc.).
+    saved_paths = await _save_attachments_to_inbox(message)
+    if saved_paths:
+        attachments_block = "\n\n[Files just saved to the vault inbox:\n" + \
+            "\n".join(f"- {p}" for p in saved_paths) + \
+            "\nLook at them and decide what to do — file the binaries via " \
+            "`import_drop_zone`, or move them somewhere else if you've " \
+            "already inferred where they belong.]"
+        content = (content + attachments_block).strip() if content else \
+                  "(no text — see attachments below)" + attachments_block
+
     if not content:
         return
 
