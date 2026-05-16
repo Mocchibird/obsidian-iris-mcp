@@ -510,6 +510,101 @@ def set_note_summary(path: str, summary: str) -> str:
     return f"ok {rel}|manual|{summary[:80]}"
 
 
+@mcp.tool()
+def summarize_note_with_llm(
+    path: str,
+    save: bool = True,
+    max_tokens: int = 300,
+    force: bool = False,
+) -> str:
+    """Generate an LLM-written summary of a note and (optionally) persist it.
+
+    Reads the note's body (frontmatter stripped) and asks the configured LLM
+    (``IRIS_LLM_MODEL``) for a concise 2–4 sentence summary capturing the
+    main ideas. Useful for context-priming on long notes, or for backfilling
+    summaries during reindex.
+
+    Persistence: when ``save=True`` (default), the summary is stored in
+    SQLite with ``summary_source='llm'``. Existing ``manual`` summaries are
+    preserved unless ``force=True``.
+
+    Requires an LLM endpoint to be configured (Ollama/LM Studio/OpenAI).
+    Returns an error string if not.
+
+    Args:
+        path: Vault-relative path to a Markdown note.
+        save: Store the result in SQLite (overwrites existing llm/auto summary).
+        max_tokens: Upper bound on LLM output length.
+        force: Overwrite even a manual summary.
+    """
+    try:
+        from .. import llm
+    except ImportError:
+        return "err: LLM module not available"
+    if not llm.is_configured():
+        return ("err: no LLM model configured. Set IRIS_LLM_MODEL or "
+                "[llm].model in ~/.config/iris/config.toml to enable.")
+
+    note = safe_path(path)
+    if not note.exists():
+        return f"err: note not found: {path}"
+    if vault_suffix(note) not in {".md", ".excalidraw.md"}:
+        return "err: only Markdown notes can be summarized"
+
+    raw = read_text(note)
+    if not raw or not raw.strip():
+        return f"err: note is empty: {path}"
+    _, body = split_frontmatter(raw)
+    if len(body.strip()) < 80:
+        return f"note too short to summarize: {path} ({len(body.strip())} chars)"
+
+    idx = get_vault_index()
+    rel = relative_to_vault(note)
+
+    if save and not force:
+        existing = idx.conn.execute(
+            "SELECT summary_source FROM notes WHERE path = ?", (rel,)
+        ).fetchone()
+        if existing and existing["summary_source"] == "manual":
+            return ("skipped: manual summary exists. Pass force=True to "
+                    "overwrite, or use get_note_summary to view it.")
+
+    title = idx.conn.execute(
+        "SELECT title FROM notes WHERE path = ?", (rel,)
+    ).fetchone()
+    title_hint = (title["title"] if title else rel) or rel
+
+    system = (
+        "You are summarizing an Obsidian note for later context-priming. "
+        "Output 2–4 sentences capturing the main ideas, decisions, and any "
+        "open questions. No bullet points, no preamble like 'This note is "
+        "about'. Write in third person, present tense."
+    )
+    user = f"Note title: {title_hint}\n\n---\n\n{body[:8000]}"
+    try:
+        summary = llm.chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            temperature=0.4,
+        ).strip()
+    except llm.LLMError as e:
+        return f"err: LLM call failed: {e}"
+
+    if not summary:
+        return "err: LLM returned empty summary"
+
+    if save:
+        row = idx.conn.execute("SELECT path FROM notes WHERE path = ?", (rel,)).fetchone()
+        if row:
+            idx.conn.execute(
+                "UPDATE notes SET summary = ?, summary_source = ? WHERE path = ?",
+                (summary[:500], "llm", rel),
+            )
+            idx.conn.commit()
+
+    return summary
+
 
 # ─── from original L7230-7332: Quick capture / inbox ───
 # =============================================================================
