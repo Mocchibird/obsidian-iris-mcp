@@ -401,6 +401,75 @@ def semantic_search(
     return "\n".join(out)
 
 
+def rank_link_candidates_from_text(
+    body_text: str,
+    self_path: str,
+    top_k: int = 10,
+    min_score: float = 0.45,
+    include_hubs: bool = False,
+) -> list[tuple[float, str, str]] | None:
+    """Core ranking used by both the MCP tool and the write_note auto-trigger.
+
+    Takes raw body text + the note's vault-relative path, embeds the text,
+    cosine-ranks against the existing note_embeddings rows (excluding self,
+    excluding wikilinks already in the body, excluding hub-type notes by
+    default), and returns ``[(score, path, title), ...]`` sorted desc.
+
+    Returns ``None`` if the embedding endpoint isn't reachable — callers
+    should treat that as "skip silently, no suggestions today".
+    """
+    if not body_text or not body_text.strip():
+        return []
+    # Parse existing wikilinks from the body so we don't re-suggest them
+    existing: set[str] = set()
+    for link in extract_wikilinks(body_text):
+        target_md = note_target_to_relative_md(link.get("target", ""))
+        if target_md:
+            existing.add(target_md)
+
+    idx = get_vault_index()
+    c = idx.conn
+    where = "WHERE ne.model = ? AND ne.note_path != ?"
+    params: list = [emb.EMBED_MODEL, self_path]
+    if not include_hubs:
+        placeholders = ",".join("?" * len(_HUB_TYPES))
+        where += f" AND (n.type IS NULL OR n.type NOT IN ({placeholders}))"
+        params.extend(_HUB_TYPES)
+    rows = c.execute(
+        f"SELECT ne.note_path, ne.chunk_id, ne.embedding, n.title, n.type "
+        f"FROM note_embeddings ne "
+        f"LEFT JOIN notes n ON n.path = ne.note_path "
+        f"{where}",
+        params,
+    ).fetchall()
+    if not rows:
+        return []
+
+    try:
+        q_vec = emb.embed_one(body_text)
+    except emb.EmbeddingError:
+        return None  # endpoint unreachable; caller should skip silently
+
+    best: dict[str, tuple[float, str]] = {}
+    for r in rows:
+        vec = emb.unpack(r["embedding"])
+        score = emb.cosine(q_vec, vec)
+        title = r["title"] or Path(r["note_path"]).stem
+        prev = best.get(r["note_path"])
+        if prev is None or score > prev[0]:
+            best[r["note_path"]] = (score, title)
+
+    out: list[tuple[float, str, str]] = []
+    for p, (score, title) in best.items():
+        if score < min_score:
+            continue
+        if p in existing:
+            continue
+        out.append((score, p, title))
+    out.sort(reverse=True)
+    return out[:top_k]
+
+
 @mcp.tool()
 def suggest_links_for(
     path: str,

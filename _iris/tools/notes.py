@@ -147,6 +147,48 @@ def _check_naming_convention(path: str) -> str | None:
     return None
 
 
+# Folders where auto-link-suggestions on new notes don't add value
+# (inbox = stubs; daily/weekly = chronological, low concept-density).
+_AUTOLINK_SKIP_PREFIXES = ("90_Inbox/", "30_Episodic/")
+
+
+def _auto_link_suggestions(path: str, content: str) -> str:
+    """Best-effort link suggestions for a freshly created note.
+
+    Returns a markdown fragment to append to write_note's result, or ""
+    when there's nothing worth surfacing or embeddings aren't reachable.
+    Always silent on failure — never breaks the write itself.
+    """
+    rel = path.replace("\\", "/")
+    if any(rel.startswith(p) for p in _AUTOLINK_SKIP_PREFIXES):
+        return ""
+    try:
+        _, body = split_frontmatter(content)
+    except Exception:
+        body = content
+    # Only run for substantive notes — short stubs aren't connectable yet
+    if len(body.strip()) < 500:
+        return ""
+    try:
+        from .semantic import rank_link_candidates_from_text
+        suggestions = rank_link_candidates_from_text(
+            body_text=body,
+            self_path=rel,
+            top_k=4,
+            min_score=0.5,
+        )
+    except Exception:
+        return ""
+    if not suggestions:
+        return ""
+    lines = ["", "Possible links to add (semantic match):"]
+    for score, p, title in suggestions:
+        link = f"[[{p[:-3]}|{title}]]" if p.endswith(".md") else p
+        lines.append(f"  {score:+.2f}  {link}")
+    lines.append("(use add_wikilink to insert any you like)")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def write_note(path: str, content: str, overwrite: bool = False) -> str:
     """
@@ -164,16 +206,22 @@ def write_note(path: str, content: str, overwrite: bool = False) -> str:
     WIKILINKS inside content:
     - Never include ``.md`` extension: ``[[User Profile]]`` not ``[[User Profile.md]]``.
     - Use display text: ``[[10_Profile/User Profile|Your Name]]``.
+
+    On creation of a substantive new note (≥500 chars body, not under
+    ``90_Inbox/`` or ``30_Episodic/``), Iris also suggests up to 4 semantic
+    wikilinks she'd recommend adding. The write itself never fails because
+    of suggestion errors — they're best-effort.
     """
     content = _fix_inline_tags(content)
     note = safe_path(path)
     if vault_suffix(note) not in {".md", ".excalidraw.md"}:
         return "Refusing to write non-Markdown note. Use write_vault_text_file instead."
-    if note.exists() and not overwrite:
+    was_new = not note.exists()
+    if not was_new and not overwrite:
         return f"Note already exists, and overwrite=false: {path}"
 
     # Save revision of existing content before overwrite
-    if note.exists() and overwrite:
+    if not was_new and overwrite:
         try:
             old_text = read_text(note)
             rel = relative_to_vault(note)
@@ -185,10 +233,16 @@ def write_note(path: str, content: str, overwrite: bool = False) -> str:
     note.parent.mkdir(parents=True, exist_ok=True)
     note.write_text(content, encoding="utf-8")
     _notify_index_of_write(note, text=content)
-    result = f"ok {relative_to_vault(note)}"
+    rel_path = relative_to_vault(note)
+    result = f"ok {rel_path}"
     warning = _check_naming_convention(path)
     if warning:
         result += f"\n{warning}"
+    # Auto-link suggestions on creation of a substantive note
+    if was_new:
+        suggestions = _auto_link_suggestions(rel_path, content)
+        if suggestions:
+            result += suggestions
     return result
 
 
