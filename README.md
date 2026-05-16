@@ -7,91 +7,160 @@
 - An acronym — **I**ntelligent **R**ecall & **I**ndexing **S**ystem.
 - A reference to Greek mythology — Iris (Ἶρις) is the messenger goddess and the personification of the rainbow, the bridge that lets gods and humans speak to each other. This project plays the same role: the bridge between you and your vault, carrying messages, looking things up, and tying the world above (Claude, your conversations) to the world below (your notes on disk).
 
-Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidian vault into SQLite and exposes ~130 tools for searching, editing, linking, and analysing it. It can:
+## What Iris does
 
-- Full-text search notes (FTS5), backlinks, tag co-occurrence, semantic search
-- Add and complete tasks and reminders inside `.md` notes
-- Schedule calendar events (including cross-day and all-day) in daily notes
-- Generate morning briefings, evening wrap-ups, and weekly summaries
+Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidian vault into SQLite and exposes ~140 tools for searching, editing, linking, and analysing it. Highlights:
+
+- Full-text search, semantic search, backlinks, tag co-occurrence
+- Add and complete tasks and reminders inside your `.md` notes
+- Schedule calendar events (including cross-day, all-day, per-event ping lead-times) in daily notes
+- Generate morning briefings, evening wrap-ups, weekly summaries
 - Find broken links, duplicate notes, orphan attachments, merge candidates
 - Render live SQL queries inside Obsidian via the SQLite DB plugin
-- Run as a Discord bot through Docker — chat with Iris from anywhere using your Claude subscription
+- Run as a **Discord bot** through Docker — chat with Iris from anywhere using your Claude subscription
 - _(macOS only)_ Sync tasks, reminders, and calendar events with Apple Reminders & Calendar
 - _(optional)_ Track anime watch lists with MyAnimeList sync
 
+---
+
 ## Quick start
 
-### 1. Clone and install
+The minimum to talk to Iris through any MCP client (Claude Desktop, Claude Code, LM Studio, …).
+
+### Step 1 — Clone and install
 
 ```bash
 git clone https://github.com/Mocchibird/obsidian-iris-mcp.git
 cd obsidian-iris-mcp
 python3.11 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-### 2. Point Claude Desktop at it
+This installs Iris into a local virtualenv. Note the **absolute paths** to:
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+- the venv's Python: usually `<your-clone>/.venv/bin/python` (Windows: `…\.venv\Scripts\python.exe`)
+- the entry-point script: `<your-clone>/obsidian_memory_mcp.py`
+- your Obsidian vault: wherever it lives on disk
+
+You'll plug these into your MCP client in step 2.
+
+### Step 2 — Add Iris to your MCP client
+
+Every MCP client speaks the same JSON config shape. The fragment you'll add is:
 
 ```json
 {
-  "mcpServers": {
-    "iris": {
-      "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["/absolute/path/to/obsidian_memory_mcp.py"],
-      "env": {
-        "IRIS_VAULT_ROOT": "/absolute/path/to/your/Obsidian/vault"
-      }
-    }
+  "command": "/absolute/path/to/.venv/bin/python",
+  "args": ["/absolute/path/to/obsidian_memory_mcp.py"],
+  "env": {
+    "IRIS_VAULT_ROOT": "/absolute/path/to/your/Obsidian/vault"
   }
 }
 ```
 
-Restart Claude Desktop. Iris will index the vault on first launch and write a SQLite cache to `<vault>/.ai_memory_cache/vault.db`.
+Where to put that fragment depends on the client:
 
-### 3. (Optional) Install the Obsidian companion plugin
+<details>
+<summary><strong>Claude Desktop</strong></summary>
 
-The companion plugin adds two things inside Obsidian:
+Open Settings → Developer → Edit Config, or edit the file directly. Wrap the fragment in the `mcpServers` block:
 
-- A `Reload SQLite DB` command (assignable to a hotkey) — used by Iris to refresh live SQL views after writes.
-- Clickable wikilinks inside SQL table cells.
+```json
+{
+  "mcpServers": {
+    "iris": { /* fragment from above */ }
+  }
+}
+```
+
+Config file location (managed for you by the Settings UI):
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- Linux: `~/.config/Claude/claude_desktop_config.json`
+
+Restart Claude Desktop after saving.
+</details>
+
+<details>
+<summary><strong>Claude Code (CLI)</strong></summary>
+
+```bash
+claude mcp add iris \
+  --command /absolute/path/to/.venv/bin/python \
+  --args /absolute/path/to/obsidian_memory_mcp.py \
+  --env IRIS_VAULT_ROOT=/absolute/path/to/your/Obsidian/vault
+```
+
+Or edit `~/.claude/settings.json` directly.
+</details>
+
+<details>
+<summary><strong>LM Studio</strong></summary>
+
+Settings → Developer → MCP Servers → Add. Paste the same JSON fragment. The "name" field becomes the server's key (`iris`).
+</details>
+
+<details>
+<summary><strong>Other MCP clients</strong></summary>
+
+Iris is a standard MCP stdio server. Any MCP-compatible client can launch it via the `command` + `args` + `env` fragment. Check your client's MCP documentation for where to put it.
+</details>
+
+### Step 3 — Verify
+
+Restart your MCP client. Iris should show up in the tool list. On the first request that touches the vault, she'll build a SQLite cache at `<vault>/.ai_memory_cache/vault.db`. Subsequent requests are fast.
+
+A good "is it working?" first prompt:
+
+```
+Use Iris to list the top 5 most-recently-modified notes in my vault.
+```
+
+### Step 4 *(optional)* — Install the Obsidian companion plugin
+
+Adds a `Reload SQLite DB` hotkey and clickable wikilinks inside the SQLite DB plugin's rendered tables.
 
 ```bash
 cp -r plugins/sqlite-db-reload <your-vault>/.obsidian/plugins/
 ```
 
-Then in Obsidian: **Settings → Community Plugins → Installed Plugins**, enable **SQLite DB Companion**. Requires the upstream [SQLite DB plugin](https://github.com/stfrigerio/sqliteDB) for the SQL rendering itself.
+In Obsidian: **Settings → Community Plugins → Installed Plugins** → enable **SQLite DB Companion**. Needs the upstream [SQLite DB plugin](https://github.com/stfrigerio/sqliteDB) for the SQL rendering itself.
 
-### 4. (Optional) Semantic search
+### Step 5 *(optional)* — Semantic search
 
-Iris can rank notes by meaning, not just keyword. She calls any OpenAI-compatible `/v1/embeddings` endpoint, so the same code works against [Ollama](https://ollama.com/), LM Studio, or the OpenAI API.
+Iris can rank notes by meaning, not just keyword. She talks to any OpenAI-compatible `/v1/embeddings` endpoint — works against [Ollama](https://ollama.com/), LM Studio, OpenAI, etc.
 
 ```bash
-# one-time setup with Ollama (free, fully local)
+# Free, fully local with Ollama
 brew install ollama
 ollama serve &
 ollama pull nomic-embed-text
 ```
 
-In Claude:
+Then in your MCP client:
 
 ```
-> reindex_embeddings()        # one-time bulk index (~1–5 min for ~600 notes)
-> semantic_search("stressed about deadlines", top_k=5)
-> embedding_status()          # health check
+reindex_embeddings()            # one-time bulk index, ~1–5 min for ~600 notes
+semantic_search("what notes touch on stress and deadlines?", top_k=5)
+embedding_status()              # health check
 ```
 
-### 5. (Optional) Run Iris as a Discord bot via Docker
+Default endpoint is `http://localhost:11434/v1/embeddings`; override with `IRIS_EMBED_URL`.
 
-You can run Iris in a Docker container that connects to Discord and uses **your Claude subscription** (no Anthropic API key needed). The bot supports proactive features: morning briefings, evening wrap-ups, event/reminder pings, snooze reactions, and per-day timezone overrides for travel. See [`docker/README.md`](docker/README.md) for full setup.
+### Step 6 *(optional)* — Run as a Discord bot via Docker
+
+Talk to Iris from anywhere using your **Claude subscription** (no Anthropic API key needed). Proactive features: morning briefings, evening wrap-ups, event/reminder pings with per-event lead times, snooze reactions, per-day timezone overrides for travel, auto Google Maps links.
+
+See [`docker/README.md`](docker/README.md) for the full deployment guide.
+
+---
 
 ## Configuration
 
-All Iris config — vault path, embedding/LLM endpoints, etc. — lives in [`iris_config.py`](iris_config.py). Precedence: **env var > `~/.config/iris/config.toml` > built-in default**.
+All Iris config lives in [`iris_config.py`](iris_config.py). Precedence: **env var > `~/.config/iris/config.toml` > built-in default**.
 
-Per-device overrides go in `~/.config/iris/config.toml`. Keep this file *outside* your synced vault folder so each device can point at its own paths:
+Per-device overrides go in `~/.config/iris/config.toml` — keep this file *outside* your synced vault so each device can have its own paths:
 
 ```toml
 [vault]
@@ -103,28 +172,28 @@ model = "nomic-embed-text"
 
 [llm]
 url   = "http://localhost:11434/v1/chat/completions"
-model = "gemma3:4b"   # unset = LLM-using features (prose summaries, etc.) disabled
+model = "gemma3:4b"     # unset = LLM-using features (prose summaries, etc.) disabled
 ```
 
 Or as env vars:
 
-| Variable                  | Default                                          |
-|---------------------------|--------------------------------------------------|
-| `IRIS_VAULT_ROOT`         | `~/obsidian-vaults/AI_Memory`                    |
-| `IRIS_EMBED_URL`          | `http://localhost:11434/v1/embeddings`           |
-| `IRIS_EMBED_MODEL`        | `nomic-embed-text`                               |
-| `IRIS_EMBED_API_KEY`      | _(unset; set for OpenAI)_                        |
-| `IRIS_LLM_URL`            | `http://localhost:11434/v1/chat/completions`     |
-| `IRIS_LLM_MODEL`          | _(unset — LLM features disabled until set)_      |
-| `IRIS_LLM_API_KEY`        | _(unset)_                                        |
-| `IRIS_CONFIG`             | `~/.config/iris/config.toml` _(TOML file path)_  |
+| Variable | Default | Purpose |
+|---|---|---|
+| `IRIS_VAULT_ROOT` | `~/obsidian-vaults/AI_Memory` | Path to the vault |
+| `IRIS_EMBED_URL` | `http://localhost:11434/v1/embeddings` | OpenAI-compatible embedding endpoint |
+| `IRIS_EMBED_MODEL` | `nomic-embed-text` | |
+| `IRIS_EMBED_API_KEY` | _(unset)_ | Set for OpenAI / hosted providers |
+| `IRIS_LLM_URL` | `http://localhost:11434/v1/chat/completions` | Optional chat endpoint for prose features |
+| `IRIS_LLM_MODEL` | _(unset → disabled)_ | |
+| `IRIS_LLM_API_KEY` | _(unset)_ | |
+| `IRIS_CONFIG` | `~/.config/iris/config.toml` | TOML file path override |
 
 Legacy env vars `OBSIDIAN_VAULT_PATH` and `VAULT_ROOT` still work as fallbacks.
 
 ## Architecture
 
 ```
-obsidian_memory_mcp.py          # entry-point shim (Claude Desktop launches this)
+obsidian_memory_mcp.py          # MCP entry-point — the script your MCP client launches
 _iris/
 ├── __init__.py                 # FastMCP instance
 ├── core.py                     # helpers + VaultIndex (SQLite schema/sync/queries)
@@ -138,13 +207,14 @@ _iris/
     ├── semantic.py             # semantic_search, suggest_links_for, reindex_embeddings
     ├── tasks.py                # tasks + reminders, carry-forward
     ├── calendar.py             # schedule_event, daily_agenda
+    ├── discord.py              # fetch_discord_history (used when launched by the bot)
     ├── links.py                # find_issues, link_candidates, duplicates
     ├── analysis.py             # vault_overview, note_context, merge_candidates
     ├── import_export.py        # import_file, mass_import, triage_inbox, summarize_note_with_llm
     ├── routines.py             # morning_briefing, evening_wrapup, weekly_review
     └── web.py                  # web_search, fetch_url, search_reddit
 vault_cron.py                   # standalone CLI: capture, weekly-summary, (macOS) Apple sync
-docker/                         # Discord bot deployment
+docker/                         # Discord bot deployment (compose + Dockerfile)
 plugins/sqlite-db-reload/       # Obsidian companion plugin (copy into your vault)
 ```
 
@@ -152,7 +222,7 @@ The MCP server keeps **`.md` files as the source of truth**. SQLite is a disposa
 
 ## Tool overview
 
-Iris exposes ~130 tools. Some highlights:
+Iris exposes ~140 tools. Some highlights:
 
 | Tool | Purpose |
 |---|---|
@@ -161,8 +231,8 @@ Iris exposes ~130 tools. Some highlights:
 | `read_note(path)` | Read a note; tracks access for "hotness" ranking |
 | `write_note(path, content)` | Write a note; snapshots prior content as a revision |
 | `vault_overview()` | Structural map: folders, tags, recent, hot, stale |
-| `note_context(path)` | Full neighborhood for a note: backlinks, tag siblings, revisions |
-| `suggest_links_for(path)` | Semantic-ranked wikilink suggestions for a note |
+| `note_context(path)` | Backlinks, tag siblings, revisions for a note |
+| `suggest_links_for(path)` | Semantic-ranked wikilink suggestions |
 | `find_issues(checks=…)` | Broken links, duplicates, orphan attachments, link mismatches |
 | `find_merge_candidates(folder)` | Vault-wide similarity scoring for potential duplicate notes |
 | `sqlite_query(sql)` | Read-only SELECT against any table/view |
@@ -182,40 +252,40 @@ Iris exposes ~130 tools. Some highlights:
 
 ## Privacy
 
-- Everything runs locally — vault data never leaves your machine unless you point an external API (e.g. OpenAI embeddings) at it.
+Everything runs locally — vault data never leaves your machine unless you point an external API (e.g. OpenAI embeddings) at it.
 
 ## Platform support
 
-- **macOS 13+**: full feature set including the optional Apple integrations.
+- **macOS**: full feature set including the optional Apple integrations.
 - **Linux / Docker**: core MCP and the Discord bot work; Apple integrations are macOS-only.
-- **Windows**: core MCP works; OS-specific helpers are untested.
+- **Windows**: core MCP works; some OS-specific helpers (notifications, Shortcuts) are untested.
 
 ---
 
 ## Optional integrations
 
-### Apple Reminders / Calendar / Health (macOS only)
+### Apple Reminders / Calendar / Health *(macOS only)*
 
-`vault_cron.py` syncs tasks/reminders bidirectionally with Apple Reminders, pulls Calendar events into daily notes' `## Schedule`, and (with a user-defined Apple Shortcut) writes a daily Health snapshot into each daily note. macOS only — uses `osascript` under the hood.
+`vault_cron.py` syncs tasks/reminders bidirectionally with Apple Reminders, pulls Calendar events into daily notes' `## Schedule`, and (with a user-defined Apple Shortcut) writes a daily Health snapshot into each daily note. Uses `osascript` under the hood.
 
 ```bash
-./vault_cron.py sync                     # bidirectional with Apple Reminders/Calendar
-./vault_cron.py pull-calendar            # Apple Calendar → daily note
-./vault_cron.py health                   # run the user-defined "Iris Health" Shortcut
-./vault_cron.py morning                  # full morning routine
+./vault_cron.py sync             # bidirectional with Apple Reminders/Calendar
+./vault_cron.py pull-calendar    # Apple Calendar → daily note
+./vault_cron.py health           # run the user-defined "Iris Health" Shortcut
+./vault_cron.py morning          # full morning routine
 ```
 
-Schedule via launchd if you want it to run automatically (e.g. 09:30 every day).
+Schedule via launchd if you want it to run automatically.
 
 ### MyAnimeList sync
 
-Iris can mirror your MAL watch list into the vault and sync changes back. One-time OAuth setup:
+Mirror your MAL watch list into the vault, sync changes back. One-time OAuth setup:
 
-1. Register an app at https://myanimelist.net/apiconfig (type Other, redirect `http://localhost:8765/callback`).
-2. Save `{"client_id": "...", "client_secret": "..."}` to `<vault>/.ai_memory_cache/mal_auth.json`.
-3. Call the `mal_auth_start` MCP tool from Claude to complete the OAuth flow.
+1. Register an app at <https://myanimelist.net/apiconfig> (type Other, redirect `http://localhost:8765/callback`).
+2. Save credentials JSON to the vault's `.ai_memory_cache/mal_auth.json`.
+3. Call the `mal_auth_start` MCP tool from your client to complete OAuth.
 
-After that, `anime_pull_from_mal`, `anime_push_to_mal`, `mal_search`, `mal_seasonal`, etc. are all available.
+After that, `anime_pull_from_mal`, `anime_push_to_mal`, `mal_search`, `mal_seasonal` are all available.
 
 ## License
 

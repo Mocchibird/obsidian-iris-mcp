@@ -16,11 +16,22 @@
 #   IRIS_LLM_MODEL=gemma4
 # (Or use a shared docker network and reference the container by name.)
 
+# Shared docker network with the iris-discord stack so iris can reach Ollama
+# at `http://ollama:11434` without going through the host IP. The iris stack
+# joins the same `ai-models` network; whichever stack starts first creates it.
+networks:
+  ai:
+    name: ai-models
+    external: false
+
 services:
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
     restart: unless-stopped
+    networks:
+      - ai
+      - default
     ports:
       # Bind on the LAN so Iris-container and any other host on the network
       # can reach the API. If you only want it exposed to other containers,
