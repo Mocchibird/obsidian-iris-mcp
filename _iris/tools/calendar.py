@@ -27,7 +27,7 @@ from ..core import *  # noqa: F401, F403  — all helpers, VaultIndex accessor,
                        # parse_iso_date, parse_schedule_section, …)
 # Underscore-prefixed names are excluded by `import *`, so we import them
 # explicitly.
-from ..core import _notify_index_of_write, _notify_index_of_delete
+from ..core import _notify_index_of_write, _notify_index_of_delete, _resolve_date_range
 from .tasks import _daily_note_path, format_event_bullet, _ensure_daily_note
 
 
