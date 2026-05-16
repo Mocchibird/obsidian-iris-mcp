@@ -1,18 +1,30 @@
 # docker-compose.yml — Iris Discord brain on TrueNAS (or any Docker host).
 #
-# Usage:
-#   1. Copy .env.example to .env and fill in DISCORD_BOT_TOKEN at minimum.
-#   2. Make sure the vault path on the left side of the `volumes` mount points
-#      at your synced vault (syncthing replica or NFS mount from the Mac).
-#   3. Authenticate Claude once before first run:
-#        docker compose run --rm iris claude login
-#      The token lands in ./claude-auth/ and persists across container restarts.
-#   4. `docker compose up -d` to start the bot.
+# Two host paths are configurable via .env so this same file works whether
+# you run it from inside the repo (cd obsidian-iris-mcp/docker && docker compose up)
+# OR from a Dockge stack directory (/opt/stacks/iris-discord/compose.yaml,
+# pointing at the syncthing-replicated repo somewhere else on disk):
+#
+#   IRIS_REPO_DIR   absolute path to the obsidian-iris-mcp/ repo on the host.
+#                   Default: ..   (works from inside the repo's docker/ folder)
+#   IRIS_VAULT_DIR  absolute path to the AI_Memory vault on the host.
+#                   No default — must be set.
+#   IRIS_AUTH_DIR   absolute path for persisted Claude CLI auth.
+#                   Default: ./claude-auth (next to the compose file)
+#
+# Quick start (Dockge stack):
+#   1. In Dockge, create a new stack "iris-discord".
+#   2. Paste this compose file into Dockge's editor.
+#   3. In the stack's .env (Dockge UI → Environment), set:
+#        IRIS_REPO_DIR=/mnt/<pool>/<dataset>/obsidian-vaults/obsidian-iris-mcp
+#        IRIS_VAULT_DIR=/mnt/<pool>/<dataset>/obsidian-vaults/AI_Memory
+#        DISCORD_BOT_TOKEN=...
+#   4. Deploy. First run: open a shell on the container and run `claude login`.
 
 services:
   iris:
     build:
-      context: ..
+      context: ${IRIS_REPO_DIR:-..}
       dockerfile: docker/Dockerfile
     image: iris-discord:latest
     container_name: iris-discord
@@ -43,12 +55,10 @@ services:
 
     volumes:
       # ── Vault (THE source of truth — read+write) ─────────────────────────
-      # Adjust the left side to wherever the synced vault lives on the host.
-      # On TrueNAS SCALE this is typically /mnt/<pool>/<dataset>/AI_Memory.
-      - /mnt/tank/vaults/AI_Memory:/vault
+      - ${IRIS_VAULT_DIR}:/vault
 
       # ── Claude CLI auth (persisted across container restarts) ────────────
-      - ./claude-auth:/claude-auth
+      - ${IRIS_AUTH_DIR:-./claude-auth}:/claude-auth
 
       # ── Optional: shared MCP config so claude knows about Iris ───────────
       # Already baked into the image via iris_mcp.example.json — only mount

@@ -23,7 +23,79 @@ Designed for TrueNAS SCALE but works on any Docker host.
 
 Apple-integration tools (`sync_apple`, `pull_health_snapshot`, `get_focus_context`, etc.) are present but no-op on Linux — keep running `vault_cron.py` on your Mac for those, and the data lands in the vault for Iris-in-Discord to read.
 
-## Setup (one-time)
+## Setup with Dockge (recommended for TrueNAS)
+
+This is the path that works cleanest if the repo + vault are both syncthing-replicated to TrueNAS (so the Mac and TrueNAS share the same source tree).
+
+### 1. Make sure syncthing carries the repo but excludes per-device files
+
+In `<sync-root>/.stignore` (i.e. `~/obsidian-vaults/.stignore` on the Mac):
+
+```
+// Vault — only the SQLite cache is per-device
+AI_Memory/.obsidian/plugins/sqlite-db/data.json
+AI_Memory/.ai_memory_cache
+
+// Repo — code syncs, build artifacts and secrets do not
+obsidian-iris-mcp/.venv
+obsidian-iris-mcp/**/__pycache__
+obsidian-iris-mcp/*.egg-info
+obsidian-iris-mcp/build
+obsidian-iris-mcp/dist
+obsidian-iris-mcp/docker/.env
+obsidian-iris-mcp/docker/claude-auth
+```
+
+### 2. Create the Dockge stack
+
+In Dockge → **+ Compose** → name it `iris-discord`. Paste in the contents of [`docker-compose.yml`](docker-compose.yml). Don't deploy yet.
+
+### 3. Fill in the stack's `.env`
+
+In the Dockge stack editor, switch to the **Environment** tab (or `.env` tab depending on Dockge version) and paste:
+
+```dotenv
+# Where syncthing replicates the repo on TrueNAS — adjust to your dataset path
+IRIS_REPO_DIR=/mnt/<pool>/<dataset>/obsidian-vaults/obsidian-iris-mcp
+IRIS_VAULT_DIR=/mnt/<pool>/<dataset>/obsidian-vaults/AI_Memory
+
+# Keep Claude auth OUT of the synced repo so it doesn't replicate to the Mac.
+# Pick any TrueNAS-only path; Dockge will create it on first deploy.
+IRIS_AUTH_DIR=/mnt/<pool>/iris-discord/claude-auth
+
+# From the Discord Developer Portal
+DISCORD_BOT_TOKEN=your-token-here
+```
+
+> **Tip:** to find the real `IRIS_REPO_DIR`/`IRIS_VAULT_DIR`, SSH into TrueNAS and run `find /mnt -maxdepth 5 -name AI_Memory -type d 2>/dev/null`.
+
+### 4. Deploy the stack
+
+Dockge will build the image from `${IRIS_REPO_DIR}` and start the container. First build takes ~3–5 min (Node + claude CLI + pip installs).
+
+### 5. Authenticate Claude (once)
+
+In Dockge → stack → **Terminal** (or `docker exec -it iris-discord bash`):
+
+```bash
+claude login
+```
+
+Open the URL it prints, log into your Claude subscription, paste the code back. Token persists in `IRIS_AUTH_DIR`.
+
+### 6. Set up the Discord bot
+
+See [step 5 below](#5-create-a-discord-bot-application) — same as the manual setup.
+
+### 7. Restart the stack
+
+In Dockge → stack → **Restart**. The bot should now connect.
+
+To follow logs: Dockge → stack → **Logs** (or `docker logs -f iris-discord`).
+
+---
+
+## Setup (one-time, manual / non-Dockge)
 
 ### 1. Mount your vault into TrueNAS
 
