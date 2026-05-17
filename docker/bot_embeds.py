@@ -233,11 +233,24 @@ def dict_to_embed(payload: dict) -> discord.Embed:
     # code path constructed the payload.
     raw_title = payload.get("title")
     raw_desc = payload.get("description")
+    # Discord rejects the WHOLE embed if `url` has a non-http(s) scheme —
+    # e.g. obsidian:// returns 400 Bad Request with:
+    #   "In embeds.0.url: Scheme 'obsidian' is not supported.
+    #    Scheme must be one of ('http', 'https')."
+    # Defense-in-depth: silently drop non-http URLs here so a bad payload
+    # from a future caller doesn't break the message. Obsidian deep-links
+    # should be exposed as masked links inside fields/description instead
+    # — those API paths accept any URI scheme.
+    raw_url = payload.get("url")
+    safe_url = raw_url if (
+        isinstance(raw_url, str)
+        and raw_url.lower().startswith(("http://", "https://"))
+    ) else None
     e = discord.Embed(
         title=(strip_wikilinks(str(raw_title))[:256] if raw_title else None),
         description=(strip_wikilinks(str(raw_desc))[:4096] if raw_desc else None),
         color=int(payload.get("color") or COLOR_GRAY),
-        url=payload.get("url"),
+        url=safe_url,
     )
     ts = payload.get("timestamp")
     if ts:
