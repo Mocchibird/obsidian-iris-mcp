@@ -93,10 +93,13 @@ def unescape_literal_escapes(s: str) -> str:
 def strip_wikilinks(text: str) -> str:
     """Rewrite ``[[path|alias]]`` / ``[[path]]`` into either:
 
-      * a Discord markdown link to ``obsidian://open?vault=...&file=...`` —
-        when ``IRIS_OBSIDIAN_VAULT_NAME`` is set; the link is clickable and
-        opens the note in Obsidian on devices where the app is installed; OR
-      * plain display text — when the vault name env var is unset.
+      * a Discord markdown link to ``<IRIS_OBSIDIAN_URL_PREFIX>/path`` —
+        when that env var is set (the prefix points at a user-hosted
+        https redirector that 302s to obsidian://); Discord renders these
+        as clickable links; OR
+      * plain display text — when no URL prefix is configured. Bare
+        ``obsidian://`` URLs are deliberately NOT emitted because Discord
+        renders them as literal text (not clickable).
 
     Skips spans inside fenced code blocks (``` or ~~~) so literal wikilink
     syntax in code samples isn't mangled. Pure function. Idempotent on text

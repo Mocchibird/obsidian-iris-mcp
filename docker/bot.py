@@ -42,6 +42,7 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -172,6 +173,13 @@ ICAL_SYNC_INTERVAL_MIN = int(os.environ.get("IRIS_ICAL_SYNC_INTERVAL_MIN", "60")
 # Obsidian SQLite-DB plugin on the read-only devices at vault-snapshot.db
 # instead of vault.db. 0 = disabled (no snapshot file produced).
 VAULT_SNAPSHOT_INTERVAL_MIN = int(os.environ.get("IRIS_VAULT_SNAPSHOT_INTERVAL_MIN", "10"))
+# How often (in minutes) to re-render ```sqlite code blocks in vault notes
+# into plain markdown tables. The Obsidian SQLite-DB plugin doesn't work
+# on iOS/iPadOS — pre-rendering server-side makes the same data readable
+# on every device. The injected markdown is wrapped in HTML comments so
+# refreshes replace the previous output instead of duplicating it.
+# Default 15 min. 0 = disabled (only refreshed when explicitly asked).
+SQL_VIEW_REFRESH_MIN = int(os.environ.get("IRIS_SQL_VIEW_REFRESH_MIN", "15"))
 NOTIFIED_PATH = Path("/claude-auth/discord-notified.json")
 SNOOZE_PATH = Path("/claude-auth/discord-snoozed.json")
 _HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
@@ -487,6 +495,17 @@ def _load_system_prompt() -> str | None:
         "and move on. Speed is the whole point. If Hyun-Min disagrees with "
         "your grade he'll say so and you can re-call `vocab_review` with a "
         "different grade.\n\n"
+        "SQL views in notes: notes can contain ```sqlite (or ```sql) code "
+        "blocks with queries like `SELECT title FROM notes WHERE type='project'`. "
+        "Desktop Obsidian renders these via the SQLite-DB plugin, but iOS "
+        "and iPadOS can't run that plugin. The bot auto-refreshes these "
+        "every 15 min: `refresh_sql_views(all_notes=True)` walks the vault, "
+        "runs each query, and injects a plain markdown table beneath the "
+        "code block wrapped in `<!-- iris-sql-result ... -->` comments so "
+        "mobile devices see the same data. If Hyun-Min asks you to refresh "
+        "a specific note's SQL views NOW, call `refresh_sql_views(path=...)`. "
+        "If he asks 'refresh all views', call it with `all_notes=True`. "
+        "Result blocks are SELECT-only, capped at 50 rows + 200 chars/cell.\n\n"
         "Calendar sync from external feeds: when Hyun-Min says 'sync my "
         "calendar', 'pull events from iCloud', 'import my work calendar':\n"
         " - If `IRIS_DEFAULT_ICAL_URLS` is set (multi-feed config in .env), "
@@ -1118,6 +1137,7 @@ async def on_ready() -> None:
         client.loop.create_task(_embed_queue_loop())
         client.loop.create_task(_ical_sync_loop())
         client.loop.create_task(_vault_snapshot_loop())
+        client.loop.create_task(_sql_view_refresh_loop())
 
 
 # ── Proactive notification loop ─────────────────────────────────────────────
@@ -1756,34 +1776,75 @@ def _take_vault_snapshot() -> None:
     result into vault-snapshot.db. Same directory as the live DB so the
     SQLite-DB plugin can find it via a sibling-path reference.
 
-    Cleans up a stale .tmp file from a previous crashed run before starting.
+    Tmp file uses a per-PID + uuid suffix so a previous-run crash leaving
+    behind a stale .tmp can never starve subsequent runs (which is what
+    happens if you used a fixed `.tmp` name and the unlink ever failed).
+    Old strays are best-effort cleaned at the start of each run.
     """
     db_path = Path(VAULT_ROOT) / ".ai_memory_cache" / "vault.db"
     if not db_path.exists():
         return  # No index yet — VaultIndex will create it on next access.
     snap_path = db_path.with_name("vault-snapshot.db")
-    tmp_path = db_path.with_name("vault-snapshot.db.tmp")
-    if tmp_path.exists():
+
+    # Clean up stale tmp files from previous crashed runs (don't error if
+    # they refuse to delete — we'll just write to a fresh unique tmp anyway).
+    for stale in db_path.parent.glob("vault-snapshot.*.tmp"):
         try:
-            tmp_path.unlink()
-        except OSError:
-            pass  # Will be overwritten or fail below.
+            stale.unlink()
+        except OSError as e:
+            log.warning("vault snapshot: could not remove stale %s: %s", stale.name, e)
+
+    # Unique tmp name per attempt — guarantees VACUUM INTO never hits a
+    # "target file already exists" error from leftover state.
+    tmp_path = db_path.with_name(f"vault-snapshot.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     # VACUUM INTO doesn't accept SQL parameters — the filename must be a
     # literal string. Escape single quotes by doubling them (SQLite's
-    # standard string-literal escape).
+    # standard string-literal escape). VAULT_ROOT is operator-controlled,
+    # so this is hardening rather than untrusted-input defense.
     escaped_target = str(tmp_path).replace("'", "''")
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
-        # Target file must not exist — we already removed .tmp above.
         conn.execute(f"VACUUM INTO '{escaped_target}'")
     finally:
         conn.close()
-    tmp_path.replace(snap_path)
+    # os.replace is atomic on POSIX — old snapshot stays valid for readers
+    # until this returns; after, new snapshot is in place.
+    os.replace(tmp_path, snap_path)
     try:
         size_kb = snap_path.stat().st_size // 1024
         log.info("vault snapshot updated: vault-snapshot.db (%d KB)", size_kb)
     except OSError:
         pass
+
+
+async def _sql_view_refresh_loop() -> None:
+    """Periodic re-rendering of ```sqlite code blocks across the vault.
+
+    Lets iOS / iPadOS Obsidian (which can't run the SQLite-DB plugin)
+    still read the same SQL views — Iris renders them server-side into
+    plain markdown tables wrapped in HTML comments. Re-runs are
+    idempotent thanks to the wrapper.
+
+    First pass runs ~3 min after startup so we don't compete with the
+    vault snapshot loop and other cold-start work. Set
+    IRIS_SQL_VIEW_REFRESH_MIN=0 to disable; defaults to 15 min.
+    """
+    if SQL_VIEW_REFRESH_MIN <= 0:
+        log.info("SQL view refresh disabled (IRIS_SQL_VIEW_REFRESH_MIN=0)")
+        return
+    log.info("SQL view refresh: every %d min", SQL_VIEW_REFRESH_MIN)
+    await asyncio.sleep(180)
+    while not client.is_closed():
+        try:
+            from _iris.tools.sqlite import refresh_sql_views
+            result = await asyncio.to_thread(
+                refresh_sql_views, path="", all_notes=True,
+            )
+            head = result.splitlines()[0] if result else ""
+            log.info("sql-view-refresh: %s", head)
+        except Exception as e:
+            log.warning("background SQL view refresh failed: %s", e)
+        await asyncio.sleep(SQL_VIEW_REFRESH_MIN * 60)
 
 
 async def _process_pingback_queue() -> None:

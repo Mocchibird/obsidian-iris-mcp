@@ -1105,8 +1105,12 @@ def embed_query(
     # Cap unbounded queries hard. A SELECT without LIMIT against a big table
     # would materialise every row into memory; in embed-output context only
     # the top handful are visible anyway. 10 matches typical "top N" use
-    # cases — pass an explicit LIMIT if you need more.
-    if not _re.search(r"\blimit\s+\d+\b", s, _re.IGNORECASE):
+    # cases — pass an explicit LIMIT if you need more. We strip SQL string
+    # literals + comments before testing so `WHERE x = 'rate limit 10'`
+    # isn't false-matched.
+    from .sqlite import _strip_sql_strings_and_comments
+    s_for_check = _strip_sql_strings_and_comments(s)
+    if not _re.search(r"\blimit\s+\d+\b", s_for_check, _re.IGNORECASE):
         s = s + " LIMIT 10"
 
     from .. import core as _core
