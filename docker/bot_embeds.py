@@ -224,11 +224,18 @@ def dict_to_embed(payload: dict) -> discord.Embed:
     # any limit is exceeded, so we clamp here too. ``str()`` coerces any
     # weird non-string value (int, list, whatever a malformed queue entry
     # held) so the slicing can't blow up.
+    # Also: wikilink-rewrite every text-bearing attribute. The MCP-side
+    # _build_embed_dict already runs the same transform, but proactive
+    # in-process payloads (event pings, reminder pings) hand us raw vault
+    # content that hasn't been through that builder. Applying the transform
+    # here makes it idempotent (it's a no-op on text without `[[`) and
+    # ensures EVERY embed gets clickable Obsidian links regardless of which
+    # code path constructed the payload.
     raw_title = payload.get("title")
     raw_desc = payload.get("description")
     e = discord.Embed(
-        title=(str(raw_title)[:256] if raw_title else None),
-        description=(str(raw_desc)[:4096] if raw_desc else None),
+        title=(strip_wikilinks(str(raw_title))[:256] if raw_title else None),
+        description=(strip_wikilinks(str(raw_desc))[:4096] if raw_desc else None),
         color=int(payload.get("color") or COLOR_GRAY),
         url=payload.get("url"),
     )
@@ -240,13 +247,13 @@ def dict_to_embed(payload: dict) -> discord.Embed:
             pass
     for field in (payload.get("fields") or [])[:25]:
         e.add_field(
-            name=str(field.get("name") or "—")[:256],
-            value=str(field.get("value") or "—")[:1024],
+            name=strip_wikilinks(str(field.get("name") or "—"))[:256],
+            value=strip_wikilinks(str(field.get("value") or "—"))[:1024],
             inline=bool(field.get("inline", False)),
         )
     footer = payload.get("footer")
     if footer:
-        e.set_footer(text=str(footer)[:2048])
+        e.set_footer(text=strip_wikilinks(str(footer))[:2048])
     return e
 
 
