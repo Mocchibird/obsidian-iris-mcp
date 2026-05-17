@@ -1,25 +1,12 @@
-"""Calendar/scheduling; Apple integration
+"""Calendar/scheduling
 
 @mcp.tool() definitions live here. The shared FastMCP instance is imported
 from the package __init__.
 """
 from __future__ import annotations
 
-import calendar
-import hashlib
-import json
-import os
 import re
-import shutil
-import sqlite3
-import subprocess
-import sys
-import unicodedata
-import uuid
 from datetime import datetime, timedelta
-from fnmatch import fnmatch
-from pathlib import Path
-from typing import Any, Optional
 
 from .. import mcp
 from ..core import *  # noqa: F401, F403  — all helpers, VaultIndex accessor,
@@ -27,7 +14,7 @@ from ..core import *  # noqa: F401, F403  — all helpers, VaultIndex accessor,
                        # parse_iso_date, parse_schedule_section, …)
 # Underscore-prefixed names are excluded by `import *`, so we import them
 # explicitly.
-from ..core import _notify_index_of_write, _notify_index_of_delete, _resolve_date_range
+from ..core import _notify_index_of_write, _resolve_date_range
 from .tasks import _daily_note_path, format_event_bullet, _ensure_daily_note
 
 
@@ -280,10 +267,15 @@ def daily_agenda(date: str = "today", days: int = 1) -> str:
 
 
 
-# ─── from original L8405-8533: Apple integration ───
+# ─── from original L8405-8533: vault_cron delegation ───
 # =============================================================================
-# Apple Integration (delegates to vault_cron.py)
+# vault_cron.py delegation (evening wrapup, weekly summary, morning routine)
 # =============================================================================
+
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 _VAULT_CRON = str(Path(__file__).resolve().parent.parent.parent / "vault_cron.py")
 
@@ -306,48 +298,11 @@ def _run_vault_cron(*args: str, timeout: int = 30) -> str:
 
 
 @mcp.tool()
-def sync_apple(dry_run: bool = False) -> str:
-    """Trigger bidirectional sync between Obsidian and Apple Reminders/Calendar.
-
-    - Pushes due tasks and reminders to the Apple Reminders "Vault" list
-    - Pulls completions from Apple (e.g. checked off on iPhone) back into Obsidian
-    - Syncs vault events to the Apple "Vault" calendar
-    - Creates today's daily note if missing
-
-    This is the same sync that runs automatically at 09:30 via launchd.
-    Call it anytime to force an immediate sync.
-    """
-    args = ["sync"]
-    if dry_run:
-        args.append("--dry-run")
-    return _run_vault_cron(*args)
-
-
-@mcp.tool()
-def pull_apple_calendar(date: str = "today") -> str:
-    """Pull events from ALL Apple Calendars into the daily note's ## Schedule.
-
-    Reads events from Home, Work, Proton Calendar, ETHZ, Gmail, Church, etc.
-    and inserts them as schedule bullets in the daily note.
-    Deduplicates — safe to call multiple times.
-
-    Args:
-        date: Target date — "today", "tomorrow", or YYYY-MM-DD.
-    """
-    resolved = resolve_natural_date(date)
-    if resolved is None:
-        return f"Cannot parse date: {date}"
-    return _run_vault_cron("pull-calendar", "--date", resolved)
-
-
-@mcp.tool()
 def evening_wrapup(date: str = "today") -> str:
     """Generate an end-of-day summary and append to the daily note.
 
     Summarizes: calendar events attended, tasks completed, reminders done,
     and notes modified today.  Appends a ### Daily Summary block to ## Notes.
-
-    This runs automatically at 22:00 via launchd, but can be triggered manually.
 
     Args:
         date: Target date — "today" or YYYY-MM-DD.
@@ -356,34 +311,6 @@ def evening_wrapup(date: str = "today") -> str:
     if resolved is None:
         return f"Cannot parse date: {date}"
     return _run_vault_cron("wrapup", "--date", resolved)
-
-
-@mcp.tool()
-def pull_health_snapshot(date: str = "today", dry_run: bool = False) -> str:
-    """Pull an Apple Health snapshot and write it into the daily note.
-
-    Runs a user-defined Apple Shortcut (default name: ``Iris Health``,
-    configurable via ``IRIS_HEALTH_SHORTCUT`` env or ``[apple].health_shortcut``
-    in ``~/.config/iris/config.toml``). The shortcut can return any text —
-    newline-delimited metrics, JSON, prose — and Iris drops the output verbatim
-    into today's daily note's ``## Health`` section. Re-running replaces the
-    existing section (idempotent).
-
-    To set up: in macOS Shortcuts.app create a shortcut named ``Iris Health``
-    that fetches Health Samples (sleep, steps, HRV, weight, workouts, etc.) and
-    returns them as text. macOS only.
-
-    Args:
-        date: Target date — "today" or YYYY-MM-DD.
-        dry_run: Show what would be written without modifying the note.
-    """
-    resolved = resolve_natural_date(date)
-    if resolved is None:
-        return f"Cannot parse date: {date}"
-    args = ["health", "--date", resolved]
-    if dry_run:
-        args.append("--dry-run")
-    return _run_vault_cron(*args, timeout=60)
 
 
 @mcp.tool()
@@ -399,7 +326,7 @@ def weekly_summary(date: str = "today", force: bool = False, dry_run: bool = Fal
     Args:
         date: Any day in the target ISO week — "today" or YYYY-MM-DD.
         force: Overwrite the file if it already exists.
-        dry_run: Build the summary but do not write or notify.
+        dry_run: Build the summary but do not write.
     """
     resolved = resolve_natural_date(date)
     if resolved is None:
@@ -413,50 +340,11 @@ def weekly_summary(date: str = "today", force: bool = False, dry_run: bool = Fal
 
 
 @mcp.tool()
-def get_focus_context(mode: str = "") -> str:
-    """Get the current macOS Focus mode and show relevant vault context.
-
-    Maps Focus modes to projects and tasks:
-      - Work → PTO Kernels, Ascend-related tasks
-      - Personal → Homelab, TrueNAS, MochiMind
-      - Study → Japanese Study, Languages, ETHZ
-
-    Args:
-        mode: Override Focus mode instead of auto-detecting.
-              Use "Work", "Personal", or "Study". Leave empty to auto-detect.
-    """
-    args = ["focus"]
-    if mode.strip():
-        args.extend(["--mode", mode.strip()])
-    return _run_vault_cron(*args)
-
-
-@mcp.tool()
-def run_apple_shortcut(name: str) -> str:
-    """Run an Apple Shortcut by name and return its output.
-
-    Use this to trigger automations the user has set up in the Shortcuts app.
-    Pass name="" or use list=True to see all available shortcuts.
-
-    Args:
-        name: The shortcut name. Pass empty string to list all shortcuts.
-    """
-    if not name.strip():
-        return _run_vault_cron("shortcut", "--list")
-    return _run_vault_cron("shortcut", name.strip(), timeout=60)
-
-
-@mcp.tool()
 def morning_routine(dry_run: bool = False) -> str:
-    """Run the full morning routine: daily note + calendar pull + Apple sync.
+    """Run the morning routine: daily note + drop-zone import.
 
-    Equivalent to what runs automatically at 09:30 via launchd:
       1. Creates today's daily note
-      2. Pulls ALL Apple Calendar events into ## Schedule
-      3. Syncs tasks/reminders bidirectionally with Apple Reminders
-      4. Sends a macOS notification summary
-
-    Call this if you missed the 09:30 run or want a fresh sync.
+      2. Imports any files dropped into 90_Inbox/inbox/
     """
     args = ["morning"]
     if dry_run:
