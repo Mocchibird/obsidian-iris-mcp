@@ -21,11 +21,24 @@ from urllib.parse import quote
 import discord
 
 
-# Obsidian vault display name — used to build clickable ``obsidian://open?...``
-# URLs in embeds. If unset, wikilinks degrade to plain text. The value must
-# match what Obsidian sees as the vault name (usually the folder basename of
-# the host-side vault path).
+# Obsidian vault display name — used to build deep-links in embeds. The
+# value must match what Obsidian sees as the vault name (typically the
+# folder basename of the host-side vault path).
 OBSIDIAN_VAULT_NAME = os.environ.get("IRIS_OBSIDIAN_VAULT_NAME", "").strip()
+
+# Discord doesn't render `obsidian://...` URLs as clickable — neither as
+# bare auto-detected URLs nor as `[label](obsidian://...)` masked links.
+# Its scheme allowlist is http/https/ftp/discord/skype + a handful.
+# To get truly clickable note links, set IRIS_OBSIDIAN_URL_PREFIX to a
+# user-owned https URL prefix that 302-redirects to obsidian://, e.g.
+#   IRIS_OBSIDIAN_URL_PREFIX=https://o.example.com/
+# Then the bot generates `<prefix>10_Profile/People/Foo` URLs which Discord
+# WILL render as clickable, and your server redirects them. Caddy config:
+#   o.example.com {
+#       redir "obsidian://open?vault=AI_Memory&file={path}" 302
+#   }
+# (Trailing slash on the prefix is optional — the bot normalises.)
+OBSIDIAN_URL_PREFIX = os.environ.get("IRIS_OBSIDIAN_URL_PREFIX", "").strip().rstrip("/")
 
 
 # Wikilink → plain text. Obsidian's `[[20_Projects/Foo|Foo]]` renders as a
@@ -37,8 +50,12 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]|]+?)(?:\|([^\]]+?))?\]\]")
 
 
 def _wikilink_to_text(match: re.Match) -> str:
-    """Render a wikilink as either a clickable Obsidian deep-link (if a
-    vault name is configured) or plain display text (fallback)."""
+    """Render a wikilink as either a clickable masked link (when an https
+    redirector prefix is configured) or plain display text (fallback).
+
+    Discord blocks ``obsidian://`` in masked links — only http(s) schemes
+    are clickable — so we only emit a real link when the user has set up an
+    https redirector via ``IRIS_OBSIDIAN_URL_PREFIX``."""
     target, display = match.group(1), match.group(2)
     raw_target = target.strip()
     # Drop .md so the display label looks natural.
@@ -46,18 +63,14 @@ def _wikilink_to_text(match: re.Match) -> str:
     if label_target.endswith(".md"):
         label_target = label_target[:-3]
     label = display.strip() if display else label_target
-    if not OBSIDIAN_VAULT_NAME:
+    if not OBSIDIAN_URL_PREFIX:
+        # No redirector configured → no point emitting an obsidian:// URL
+        # that won't render as clickable. Fall back to plain display name.
         return label
-    # Build an obsidian://open URL. Drop .md from the file path so Obsidian's
-    # URI handler doesn't double-resolve. Encode vault name + path; keep '/'
-    # readable inside the file param for debuggability.
     file_path = raw_target
     if file_path.endswith(".md"):
         file_path = file_path[:-3]
-    url = (
-        "obsidian://open?vault=" + quote(OBSIDIAN_VAULT_NAME, safe="")
-        + "&file=" + quote(file_path, safe="/")
-    )
+    url = OBSIDIAN_URL_PREFIX + "/" + quote(file_path, safe="/")
     return f"[{label}]({url})"
 
 
