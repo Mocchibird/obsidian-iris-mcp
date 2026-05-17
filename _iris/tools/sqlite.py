@@ -192,17 +192,67 @@ def reload_sqlite_db_plugin(notify: bool = True) -> str:
 # desktop sees both (or hides our static one via CSS — see plugin settings).
 
 _SQL_BLOCK_RE = re.compile(
-    # Capture the fenced code block (sqlite or sql tag), then optionally
-    # consume an existing iris-sql-result block right after so we can
-    # replace it in place. Whitespace between blocks is preserved by the
-    # explicit \n* in the replacement.
-    r"```(?:sqlite|sql)\n(.*?)\n```"                                 # 1: query
-    r"(?:\s*<!--\s*iris-sql-result.*?<!--\s*/iris-sql-result\s*-->)?",
-    re.DOTALL | re.IGNORECASE,
+    # Fenced code block with `sqlite` or `sql` language tag. Inner body
+    # excludes literal backticks so we can't accidentally swallow the next
+    # fence's content. The lang tag is captured so we preserve whatever
+    # the author wrote (don't rename ```sql → ```sqlite silently).
+    r"```(?P<lang>sqlite|sql)\r?\n"
+    r"(?P<query>(?:[^`]|`(?!``))+?)\r?\n"
+    r"```"
+    # Optional existing result wrapper. MUST immediately follow the closing
+    # fence (only whitespace + a single blank line between). Body uses
+    # [^`] to refuse to cross into the next fence — defensive against a
+    # half-broken wrapper consuming the next query block.
+    r"(?:[ \t]*\r?\n[ \t]*\r?\n"
+    r"<!--\s*iris-sql-result[^\n]*-->\r?\n"
+    r"(?P<oldresult>(?:[^`]|`(?!``))*?)"
+    r"<!--\s*/iris-sql-result\s*-->)?",
+    re.IGNORECASE,  # NOTE: not DOTALL — relies on explicit \r?\n
 )
 
 _SQL_VIEW_DEFAULT_LIMIT = 50
 _SQL_CELL_MAX_CHARS = 200
+
+
+def _strip_sql_strings_and_comments(sql: str) -> str:
+    """Best-effort removal of SQL string literals and comments.
+
+    Used so a keyword check (e.g. ``\\bLIMIT\\s+\\d+\\b``) doesn't get
+    false-matched against text inside a quoted value or a comment. Not a
+    full parser — handles single-quoted strings (with doubled-quote
+    escapes), ``--`` line comments, and ``/* ... */`` block comments.
+    Good enough for "is there a real LIMIT keyword" checks.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        # Line comment
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            nl = sql.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        # Block comment
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        # Single-quoted string (with '' escape)
+        if ch == "'":
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2  # escaped quote
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _render_sql_to_md_table(sql: str, limit: int = _SQL_VIEW_DEFAULT_LIMIT) -> str:
@@ -227,12 +277,22 @@ def _render_sql_to_md_table(sql: str, limit: int = _SQL_VIEW_DEFAULT_LIMIT) -> s
         body = "❌ only SELECT / WITH queries allowed"
         return _wrap_result(body, now_iso, rows=0)
 
-    # Auto-cap unbounded queries.
-    if not re.search(r"\blimit\s+\d+\b", s, re.IGNORECASE):
-        s = s + f" LIMIT {limit}"
+    # Auto-cap unbounded queries. We also enforce an effective MAX even if
+    # the user wrote `LIMIT 999999` — the per-block refresher runs every
+    # 15 min across the whole vault, so an unbounded query in any one note
+    # would OOM the bot. fetchmany() honours whichever is smaller of the
+    # SQL-side LIMIT and the python-side fetch size.
+    _EFFECTIVE_MAX = 500
+    fetch_n = min(limit, _EFFECTIVE_MAX) + 1
+    # Strip SQL string literals (and line/block comments) before testing
+    # for a LIMIT keyword — `WHERE title = 'rate limit 10'` should NOT be
+    # treated as having a LIMIT clause.
+    s_stripped = _strip_sql_strings_and_comments(s)
+    if not re.search(r"\blimit\s+\d+\b", s_stripped, re.IGNORECASE):
+        s = s + f" LIMIT {fetch_n - 1}"
 
     try:
-        rows = get_vault_index().conn.execute(s).fetchmany(limit + 1)
+        rows = get_vault_index().conn.execute(s).fetchmany(fetch_n)
     except Exception as exc:
         body = f"❌ {exc}"
         return _wrap_result(body, now_iso, rows=0)
@@ -269,25 +329,37 @@ def _wrap_result(body: str, timestamp: str, rows: int) -> str:
             f"<!-- /iris-sql-result -->")
 
 
-def _replace_sql_blocks(text: str) -> tuple[str, int, int]:
+def _replace_sql_blocks(text: str, newline: str = "\n") -> tuple[str, int, int]:
     """Walk a note's text, render every ```sqlite block.
 
     Returns (new_text, blocks_processed, errors). Blocks are processed in
     order. An existing iris-sql-result immediately following each query
     block (with only whitespace between) is replaced; otherwise a fresh
-    result block is inserted.
+    result block is inserted. Newline style (``\\n`` vs ``\\r\\n``) is
+    preserved per-note via the ``newline`` argument so we never silently
+    flip line endings on Windows-edited notes.
     """
     block_count = [0]
     error_count = [0]
 
     def _replace(m: re.Match) -> str:
         block_count[0] += 1
-        query = m.group(1)
+        query = m.group("query")
+        lang = m.group("lang")  # preserve `sql` vs `sqlite` — don't rename
         rendered = _render_sql_to_md_table(query)
         if "❌" in rendered:
             error_count[0] += 1
-        # Two newlines between code block and result for clean rendering.
-        return f"```sqlite\n{query}\n```\n\n{rendered}"
+        # Build with the note's native newline style so writing back is
+        # a no-op on identical content (and doesn't trigger spurious
+        # mtime updates or re-sync churn).
+        parts = [
+            f"```{lang}",
+            query,
+            "```",
+            "",
+            rendered,
+        ]
+        return newline.join(parts)
 
     new_text = _SQL_BLOCK_RE.sub(_replace, text)
     return new_text, block_count[0], error_count[0]
@@ -361,17 +433,29 @@ def refresh_sql_views(path: str = "", all_notes: bool = False) -> str:
 
     for note in targets:
         try:
-            old_text = note.read_text(encoding="utf-8")
+            # Read raw bytes first so we can detect newline style WITHOUT
+            # Python normalising CRLF→LF on us (which would happen with the
+            # default universal-newlines mode).
+            raw_bytes = note.read_bytes()
         except OSError as exc:
             sample_errors.append(f"{note.name}: read failed: {exc}")
             errors_total += 1
             continue
-        new_text, n_blocks, n_errors = _replace_sql_blocks(old_text)
+        try:
+            old_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            sample_errors.append(f"{note.name}: not valid UTF-8: {exc}")
+            errors_total += 1
+            continue
+        newline = "\r\n" if b"\r\n" in raw_bytes else "\n"
+        new_text, n_blocks, n_errors = _replace_sql_blocks(old_text, newline=newline)
         blocks_total += n_blocks
         errors_total += n_errors
         if new_text != old_text:
             try:
-                note.write_text(new_text, encoding="utf-8")
+                # Write bytes directly so the newline style we built is the
+                # newline style on disk — Python won't second-guess us.
+                note.write_bytes(new_text.encode("utf-8"))
                 _notify_index_of_write(note, text=new_text)
                 notes_changed += 1
             except OSError as exc:

@@ -360,6 +360,25 @@ def morning_routine(dry_run: bool = False) -> str:
 # Outlook public link, etc.) without needing OS-level integration.
 
 
+def _resolve_home_tz_for_ical():
+    """Best-effort home timezone for iCal datetime normalisation.
+
+    Read from IRIS_TIMEZONE / TZ env (same precedence as the bot). Returns
+    None on any failure so the caller can fall back to leaving the raw
+    iCal datetime untouched (rather than crashing the import)."""
+    import os as _os
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    name = (_os.environ.get("IRIS_TIMEZONE")
+            or _os.environ.get("TZ")
+            or "").strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return None
+
+
 @mcp.tool()
 def pull_ical_subscription(
     url: str,
@@ -522,13 +541,31 @@ def pull_ical_subscription(
             location = str(ev.get("LOCATION") or "").strip()
             ical_desc = str(ev.get("DESCRIPTION") or "").strip()
             uid = str(ev.get("UID") or "").strip()
+            # Some feeds (or hand-rolled .ics files) ship events with empty
+            # UIDs. Without a UID, the second sync can't dedupe by ID and
+            # would re-add the event. Synthesise a stable hash UID from the
+            # event's identifying fields so cross-sync dedupe still works.
+            if not uid:
+                import hashlib as _hashlib
+                key = f"{dtstart}|{summary}|{location}".encode("utf-8")
+                uid = "synth-" + _hashlib.sha1(key).hexdigest()[:16]
 
             # Distinguish all-day (datetime.date) vs timed (datetime.datetime)
             is_timed = hasattr(dtstart, "hour")
             if is_timed:
+                # Convert TZ-aware datetimes to the user's home TZ before
+                # extracting HH:MM. Without this, a Google Calendar event
+                # published in UTC for "14:00 UTC" lands in the vault as
+                # "14:00" and the event ping fires at 14:00 LOCAL — which
+                # could be 16:00 UTC, i.e. 2 hours after the actual event.
+                _home_tz = _resolve_home_tz_for_ical()
+                if dtstart.tzinfo is not None and _home_tz is not None:
+                    dtstart = dtstart.astimezone(_home_tz)
                 date_iso = dtstart.date().isoformat()
                 time_str = dtstart.strftime("%H:%M")
                 if dtend and hasattr(dtend, "hour"):
+                    if dtend.tzinfo is not None and _home_tz is not None:
+                        dtend = dtend.astimezone(_home_tz)
                     end_time_str = dtend.strftime("%H:%M")
                     end_date_str = (dtend.date().isoformat()
                                     if dtend.date() != dtstart.date() else "")
