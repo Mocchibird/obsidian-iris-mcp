@@ -172,6 +172,13 @@ ICAL_SYNC_INTERVAL_MIN = int(os.environ.get("IRIS_ICAL_SYNC_INTERVAL_MIN", "60")
 # Obsidian SQLite-DB plugin on the read-only devices at vault-snapshot.db
 # instead of vault.db. 0 = disabled (no snapshot file produced).
 VAULT_SNAPSHOT_INTERVAL_MIN = int(os.environ.get("IRIS_VAULT_SNAPSHOT_INTERVAL_MIN", "10"))
+# How often (in minutes) to re-render ```sqlite code blocks in vault notes
+# into plain markdown tables. The Obsidian SQLite-DB plugin doesn't work
+# on iOS/iPadOS — pre-rendering server-side makes the same data readable
+# on every device. The injected markdown is wrapped in HTML comments so
+# refreshes replace the previous output instead of duplicating it.
+# Default 15 min. 0 = disabled (only refreshed when explicitly asked).
+SQL_VIEW_REFRESH_MIN = int(os.environ.get("IRIS_SQL_VIEW_REFRESH_MIN", "15"))
 NOTIFIED_PATH = Path("/claude-auth/discord-notified.json")
 SNOOZE_PATH = Path("/claude-auth/discord-snoozed.json")
 _HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
@@ -1118,6 +1125,7 @@ async def on_ready() -> None:
         client.loop.create_task(_embed_queue_loop())
         client.loop.create_task(_ical_sync_loop())
         client.loop.create_task(_vault_snapshot_loop())
+        client.loop.create_task(_sql_view_refresh_loop())
 
 
 # ── Proactive notification loop ─────────────────────────────────────────────
@@ -1784,6 +1792,36 @@ def _take_vault_snapshot() -> None:
         log.info("vault snapshot updated: vault-snapshot.db (%d KB)", size_kb)
     except OSError:
         pass
+
+
+async def _sql_view_refresh_loop() -> None:
+    """Periodic re-rendering of ```sqlite code blocks across the vault.
+
+    Lets iOS / iPadOS Obsidian (which can't run the SQLite-DB plugin)
+    still read the same SQL views — Iris renders them server-side into
+    plain markdown tables wrapped in HTML comments. Re-runs are
+    idempotent thanks to the wrapper.
+
+    First pass runs ~3 min after startup so we don't compete with the
+    vault snapshot loop and other cold-start work. Set
+    IRIS_SQL_VIEW_REFRESH_MIN=0 to disable; defaults to 15 min.
+    """
+    if SQL_VIEW_REFRESH_MIN <= 0:
+        log.info("SQL view refresh disabled (IRIS_SQL_VIEW_REFRESH_MIN=0)")
+        return
+    log.info("SQL view refresh: every %d min", SQL_VIEW_REFRESH_MIN)
+    await asyncio.sleep(180)
+    while not client.is_closed():
+        try:
+            from _iris.tools.sqlite import refresh_sql_views
+            result = await asyncio.to_thread(
+                refresh_sql_views, path="", all_notes=True,
+            )
+            head = result.splitlines()[0] if result else ""
+            log.info("sql-view-refresh: %s", head)
+        except Exception as e:
+            log.warning("background SQL view refresh failed: %s", e)
+        await asyncio.sleep(SQL_VIEW_REFRESH_MIN * 60)
 
 
 async def _process_pingback_queue() -> None:
