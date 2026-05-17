@@ -159,7 +159,7 @@ def _ensure_daily_note(date: str) -> Path:
             "",
         ]
         note.parent.mkdir(parents=True, exist_ok=True)
-        new_text = dump_frontmatter(data, NL.join(body_lines))
+        new_text = dump_frontmatter(data, "\n".join(body_lines))
         note.write_text(new_text, encoding="utf-8")
         _notify_index_of_write(note, text=new_text)
     return note
