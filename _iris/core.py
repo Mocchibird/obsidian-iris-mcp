@@ -880,6 +880,17 @@ class VaultIndex:
     def conn(self) -> sqlite3.Connection:
         return self._connect()
 
+    @property
+    def db_path(self) -> Path:
+        """Public read-only accessor for the on-disk SQLite path.
+
+        Used by tools that want to open a separate connection (e.g.
+        ``embed_query`` opens its own short-lived connection so it doesn't
+        share state with the long-lived index connection). Also used by the
+        bot's snapshot loop to compute the snapshot filename next to the
+        live DB."""
+        return self._db_path
+
     def close(self):
         if self._conn:
             self._conn.close()
