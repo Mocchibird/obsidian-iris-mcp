@@ -177,6 +177,25 @@ In Discord: `@Iris what notes did I touch last week?`
 
 - **Extended on-demand recall** via `fetch_discord_history(hours_back=N)`. The bot logs every message it sees to a per-channel JSONL log at `IRIS_DISCORD_HISTORY_DIR`. If Iris needs to reach further back than the cold-start window — e.g. the user says "what did I tell you yesterday about the appointment?" — she can call this MCP tool to pull older messages on demand. By default it filters out her own proactive pings (event reminders, briefings) since those aren't conversational.
 
+- **Precise-time pingbacks** via `schedule_pingback(when, message)`. For "ping me at 00:30", "remind me in 15 minutes", "message me at 14:00 tomorrow". Unlike `add_reminder` (which is date-granular and fires within a 15-minute lead window), pingbacks fire at the exact wall-clock minute via a 30-second poll loop in the bot. Pending entries persist across restarts in `/claude-auth/pending_pings.jsonl`. Accepts `HH:MM` (today, or tomorrow if past), `+15m` / `+2h` relative offsets, or full ISO 8601. Inspect or cancel via `list_pingbacks` / `cancel_pingback(id)`.
+
+- **Wall-clock context per turn.** Every user message gets a `[Now: 2026-05-17 00:30 Europe/Zurich (Sunday)]` line prepended invisibly to Iris's input, using the active timezone (which respects today's daily-note `timezone:` frontmatter override). Without this, Claude only sees a UTC date from its system context and can be a day behind in the evening local time.
+
+- **Rich Discord embeds**, not walls of markdown. Proactive pings (morning brief, evening wrap-up, event reminders, time-based reminders) and many of Iris's chat replies render as native Discord cards with a colored sidebar, title, fields, and footer. Iris reaches for these via a family of `embed_*` MCP tools:
+  - `embed_morning_brief / embed_evening_wrapup / embed_daily_agenda(date)` — daily routine cards (blue / indigo / blue).
+  - `embed_event(date, title_match)` — single event card; yellow normally, red if imminent.
+  - `embed_project_status(path)` — project dashboard, violet.
+  - `embed_note(path)` — show a vault note as a card (title, excerpt, type/tags/mtime).
+  - `embed_callout(kind, title, body)` — semantic info box. `kind` ∈ info/success/warning/error/tip/question; color + icon chosen for you.
+  - `embed_query(sql, title, mode)` — SELECT against vault DB, render as `"table"` (monospace) or `"fields"` (one row per field). Auto-`LIMIT 10`.
+  - `embed_custom(title, description, fields, color)` — fully custom escape hatch.
+  
+  These tools queue an embed-request JSON line to `/claude-auth/pending_embeds.jsonl`. The bot polls every ~1 s and renders to a real `discord.Embed`. Embeds produced during a chat reply are flushed AT THE END of the reply, between the streamed text and the completion ping, so the order in chat is text → embed card → ✓. Snoozed pings preserve the original embed when replayed (`💤` prefix added to the title).
+
+- **Message queue with FIFO order.** When you send Iris a new message while she's still streaming a reply, the new one isn't dropped — it gets a 📥 reaction (queued ack), and `asyncio.Lock`'s FIFO waiter ordering processes them in arrival order. The reaction is removed when Iris picks it up. Cap: `IRIS_DISCORD_MAX_QUEUE_DEPTH=5` (configurable); beyond that, you get a clear "queue full" reply rather than silent loss.
+
+- **Catch-up grace windows** for scheduled briefings. If the bot restarts at 08:30 after a power blip, the 08:00 morning brief still fires (within the 3-hour `IRIS_NOTIFY_MORNING_GRACE_MIN` window). Restart at 11:30 and it suppresses — you don't want yesterday's brief at lunch. Evening default: 60 min grace.
+
 - **File uploads** to any channel Iris listens in get auto-saved to `<vault>/90_Inbox/inbox/<timestamp>_<sanitized-name>`. Iris sees the saved paths in her prompt and decides how to route them — she might call `import_drop_zone` (binaries → `40_Attachments/<type>/` + auto-created inbox notes), `extract_pdf_text` to read a PDF, or just move the file into a specific project page. Filenames are sanitized (`[^\w\-. ]+` → `_`) and de-duplicated so two attachments named `screenshot.png` don't collide. Works for PDFs, images, audio, etc. — anything Discord lets you attach.
 - **Long sessions auto-compact.** Claude Code (which powers the SDK) summarizes earlier turns when the context window fills up, replacing them with a recap. You don't manage this; it just happens.
 - Iris responds when **any** of these is true:
@@ -207,11 +226,14 @@ In Discord: `@Iris what notes did I touch last week?`
 | `IRIS_VAULT_ROOT` | `/vault` | Should match the docker-compose volume target |
 | `CLAUDE_CONFIG_DIR` | `/claude-auth` | Where `claude login` stores its token |
 | `IRIS_DISCORD_PING_CHANNEL` | _(unset)_ | Channel ID for proactive pings. Blank = all proactive output disabled. Legacy alias `IRIS_DISCORD_NOTIFY_CHANNEL` still works. |
-| `IRIS_NOTIFY_INTERVAL_SECS` | `300` | How often the notification loop scans the vault |
-| `IRIS_NOTIFY_LEAD_MIN` | `15` | Lead time before an event/reminder for the ping |
+| `IRIS_NOTIFY_INTERVAL_SECS` | `60` | How often the notification loop scans the vault (≈ minute precision for event/reminder pings) |
+| `IRIS_NOTIFY_LEAD_MIN` | `15` | Lead time before an event/reminder for the ping (override per event with `lead: 2h` in the description) |
 | `IRIS_NOTIFY_MORNING_AT` | `08:00` | Daily morning briefing time (HH:MM, 24 h, in *active* TZ). `off` to skip. |
 | `IRIS_NOTIFY_EVENING_AT` | `22:00` | Daily evening wrap-up time (in active TZ). `off` to skip. |
-| `TZ` | `Europe/Zurich` | Container's system timezone — Iris uses this as the home zone |
+| `IRIS_NOTIFY_MORNING_GRACE_MIN` | `180` | If the bot starts AFTER the scheduled time but within this many minutes, still fire today's morning brief. Past it, suppress until tomorrow. |
+| `IRIS_NOTIFY_EVENING_GRACE_MIN` | `60` | Same idea for the evening wrap-up. |
+| `IRIS_DISCORD_MAX_QUEUE_DEPTH` | `5` | Max queued user messages per channel while Iris is still working. Beyond this, new messages are rejected with a "queue full" reply. |
+| `TZ` | `Europe/Zurich` | Container's system timezone — Iris uses this as the home zone. Set in `.env`, NOT in the compose `environment:` block (Dockge's shell `TZ=Etc/UTC` will shadow `${TZ:-...}` substitution there). |
 | `IRIS_TIMEZONE` | _(falls back to `TZ`)_ | Optional override for Iris's home TZ if different from container TZ |
 
 ## Proactive notifications
@@ -220,7 +242,7 @@ Set `IRIS_DISCORD_PING_CHANNEL` to a channel ID, and Iris will post to it on her
 
 ### 1. Upcoming event / reminder pings
 
-Every `IRIS_NOTIFY_INTERVAL_SECS` (default 5 min) the bot scans the vault for:
+Every `IRIS_NOTIFY_INTERVAL_SECS` (default 60 s ≈ minute precision) the bot scans the vault for:
 
 - **Calendar events** today whose `time` is within their lead window (default `IRIS_NOTIFY_LEAD_MIN` minutes, override per event with `lead: <duration>` in the event's `description`)
 - **Reminders** whose `remind_on` is today

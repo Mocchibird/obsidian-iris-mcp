@@ -55,6 +55,7 @@ RUN pip install -e . \
 
 # ── Discord bot ──────────────────────────────────────────────────────────────
 COPY docker/bot.py ./docker/bot.py
+COPY docker/bot_embeds.py ./docker/bot_embeds.py
 COPY docker/iris_mcp.example.json ./docker/iris_mcp.example.json
 
 # Conventional volume mount points (docker-compose sets the real source paths)
@@ -66,6 +67,7 @@ VOLUME ["/vault", "/claude-auth"]
 
 ENV IRIS_VAULT_ROOT=/vault \
     CLAUDE_CONFIG_DIR=/claude-auth \
-    IRIS_DISCORD_MODEL=claude-sonnet-4-6
+    IRIS_DISCORD_MODEL=claude-sonnet-4-6 \
+    TZ=Europe/Zurich
 
 CMD ["python", "/opt/iris/docker/bot.py"]

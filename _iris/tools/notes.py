@@ -265,11 +265,25 @@ def write_note(path: str, content: str, overwrite: bool = False) -> str:
 @mcp.tool()
 def append_to_note(path: str, content: str) -> str:
     """
-    Append text to a Markdown note.
+    Append text to the END of a Markdown note.
 
-    IMPORTANT: Before appending, use ``read_note`` to check the existing content.
-    Do NOT create duplicate sections (e.g. two ``## Notes`` in a daily note).
-    Append content under the existing section instead of recreating it.
+    ⚠️  USE SPARINGLY. Append-to-end is only correct for chronological /
+    log-style notes — daily notes under ``30_Episodic/YYYY/``, weekly notes,
+    activity logs, anything where the natural reading order is oldest→newest.
+    For knowledge, reference, and project notes, appending creates a sprawling
+    bottom-heavy mess and duplicate sections like "Updated table" trailing
+    the real one.
+
+    Decision tree:
+      - Adding content to a DAILY / weekly / log note → ``append_to_note``.
+      - Updating data inside a specific section of any other note →
+        ``update_section`` (precise, won't duplicate headings).
+      - Wholesale rewrite of a note → ``write_note`` with ``overwrite=True``.
+      - Replacing a specific verbatim chunk → ``replace_in_vault_text_file``.
+
+    Before appending, ``read_note`` first to confirm no existing section
+    already covers this — duplicate ``## Notes`` headings are a common
+    failure mode.
     """
     note = safe_path(path)
     if vault_suffix(note) not in {".md", ".excalidraw.md"}:
@@ -281,6 +295,148 @@ def append_to_note(path: str, content: str) -> str:
     note.write_text(new_text, encoding="utf-8")
     _notify_index_of_write(note, text=new_text)
     return f"ok {relative_to_vault(note)}"
+
+
+@mcp.tool()
+def update_section(
+    path: str,
+    heading: str,
+    new_body: str,
+    mode: str = "replace",
+    create_if_missing: bool = False,
+) -> str:
+    """Update the body of a specific ``## Heading`` section in a note.
+
+    This is the precise alternative to ``append_to_note`` for non-chronological
+    notes. Finds the heading, then either replaces or extends its body
+    (everything from the heading line up to the next same-or-higher heading,
+    or end of file). The rest of the note is untouched.
+
+    Use this when:
+      * Refining a table: locate the section containing the table, replace
+        body with the refined version.
+      * Updating supporting data under an existing section heading.
+      * Adding a paragraph to an existing section without duplicating its
+        heading at the bottom.
+
+    Args:
+        path: Vault-relative path to the note.
+        heading: The section heading text (without the ``#``s). Matched
+            case-insensitively. Supports ``"# Top"``, ``"## Sub"``, etc.;
+            the leading hashes are stripped and the rest is matched.
+        new_body: The replacement (or appended) body. Do NOT include the
+            heading line itself — that's preserved automatically.
+        mode: ``"replace"`` (default) — overwrite the section body. ``"append"``
+            — keep existing body, append ``new_body`` after a blank line.
+        create_if_missing: If True and the heading isn't found, append a new
+            ``## heading`` + ``new_body`` block at the END of the note.
+            If False (default) returns an error so you can decide what to do.
+    """
+    note = safe_path(path)
+    if vault_suffix(note) not in {".md", ".excalidraw.md"}:
+        return "Refusing to edit a non-Markdown note."
+    if not note.exists():
+        return f"err: note not found: {path}"
+    text = read_text(note)
+
+    heading_clean = heading.lstrip("#").strip()
+    if not heading_clean:
+        return "err: heading is empty."
+
+    # Find every line that starts with `##` (or more) + space + heading text,
+    # IGNORING anything inside a fenced code block (``` or ~~~). Without this,
+    # a tutorial note that shows literal "## Example" inside a markdown code
+    # sample would get a false section boundary.
+    lines = text.split("\n")
+    section_re = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+    fence_re = re.compile(r"^\s*(`{3,}|~{3,})")
+
+    def _iter_real_headings(start: int = 0):
+        """Yield (line_index, regex_match) for headings outside code fences."""
+        in_fence = False
+        fence_char = ""
+        for i in range(start, len(lines)):
+            line = lines[i]
+            fm = fence_re.match(line)
+            if fm:
+                marker = fm.group(1)
+                if not in_fence:
+                    in_fence = True
+                    fence_char = marker[0]
+                elif marker[0] == fence_char:
+                    in_fence = False
+                    fence_char = ""
+                continue
+            if in_fence:
+                continue
+            m = section_re.match(line)
+            if m:
+                yield i, m
+
+    target_idx = -1
+    target_level = 0
+    for i, m in _iter_real_headings():
+        if m.group(2).strip().lower() == heading_clean.lower():
+            target_idx = i
+            target_level = len(m.group(1))
+            break
+
+    if target_idx == -1:
+        if not create_if_missing:
+            return (f"err: heading {heading_clean!r} not found in {path}. "
+                    "Pass create_if_missing=True to append a new section, "
+                    "or check the exact heading text.")
+        # Append new ## section at end.
+        sep = "\n\n" if text and not text.endswith("\n\n") else ""
+        new_text = text + sep + f"## {heading_clean}\n\n" + new_body.rstrip() + "\n"
+        note.write_text(new_text, encoding="utf-8")
+        _notify_index_of_write(note, text=new_text)
+        return f"ok (created) {relative_to_vault(note)} :: ## {heading_clean}"
+
+    # Find the end of the section: next heading at same or shallower level
+    # (outside code fences).
+    end_idx = len(lines)
+    for j, m in _iter_real_headings(start=target_idx + 1):
+        if len(m.group(1)) <= target_level:
+            end_idx = j
+            break
+
+    heading_line = lines[target_idx]
+    existing_body_lines = lines[target_idx + 1:end_idx]
+    # Trim leading/trailing blank lines from existing body for clean replace.
+    while existing_body_lines and existing_body_lines[0].strip() == "":
+        existing_body_lines.pop(0)
+    while existing_body_lines and existing_body_lines[-1].strip() == "":
+        existing_body_lines.pop()
+
+    new_body_clean = new_body.rstrip()
+    if mode == "append":
+        merged = "\n".join(existing_body_lines)
+        if merged:
+            merged = merged + "\n\n" + new_body_clean
+        else:
+            merged = new_body_clean
+    elif mode == "replace":
+        merged = new_body_clean
+    else:
+        return f"err: mode must be 'replace' or 'append' (got {mode!r})"
+
+    # Reassemble: everything up to and including heading_line, then merged
+    # body, then everything from end_idx onwards. Pad with blank lines so
+    # the document still has sensible paragraph breaks.
+    before = lines[:target_idx + 1]
+    after = lines[end_idx:]
+    rebuilt: list[str] = list(before)
+    if merged:
+        rebuilt.append("")
+        rebuilt.extend(merged.split("\n"))
+    if after:
+        rebuilt.append("")
+        rebuilt.extend(after)
+    new_text = "\n".join(rebuilt)
+    note.write_text(new_text, encoding="utf-8")
+    _notify_index_of_write(note, text=new_text)
+    return f"ok {relative_to_vault(note)} :: ## {heading_clean} ({mode})"
 
 
 @mcp.tool()
