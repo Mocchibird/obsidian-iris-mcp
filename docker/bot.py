@@ -164,6 +164,14 @@ NOTIFY_EVENING_GRACE_MIN = int(os.environ.get("IRIS_NOTIFY_EVENING_GRACE_MIN", "
 # last-minute additions; raise (or set 0) if your feeds are slow / you
 # don't care about same-day freshness.
 ICAL_SYNC_INTERVAL_MIN = int(os.environ.get("IRIS_ICAL_SYNC_INTERVAL_MIN", "60"))
+# How often (in minutes) to snapshot the vault SQLite DB to a sync-safe
+# copy. The live vault.db uses WAL mode (multiple files, mid-transaction
+# states) which doesn't play well with syncthing replicating to read-only
+# viewers on Mac/Windows. The snapshot is produced via `VACUUM INTO`
+# (atomic, single file, committed-state-only) — safe to sync. Point your
+# Obsidian SQLite-DB plugin on the read-only devices at vault-snapshot.db
+# instead of vault.db. 0 = disabled (no snapshot file produced).
+VAULT_SNAPSHOT_INTERVAL_MIN = int(os.environ.get("IRIS_VAULT_SNAPSHOT_INTERVAL_MIN", "10"))
 NOTIFIED_PATH = Path("/claude-auth/discord-notified.json")
 SNOOZE_PATH = Path("/claude-auth/discord-snoozed.json")
 _HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
@@ -1109,6 +1117,7 @@ async def on_ready() -> None:
         client.loop.create_task(_pingback_loop())
         client.loop.create_task(_embed_queue_loop())
         client.loop.create_task(_ical_sync_loop())
+        client.loop.create_task(_vault_snapshot_loop())
 
 
 # ── Proactive notification loop ─────────────────────────────────────────────
@@ -1713,6 +1722,68 @@ async def _ical_sync_loop() -> None:
         except Exception as e:
             log.warning("background iCal sync failed: %s", e)
         await asyncio.sleep(ICAL_SYNC_INTERVAL_MIN * 60)
+
+
+async def _vault_snapshot_loop() -> None:
+    """Periodically VACUUM INTO a sync-safe snapshot of the vault SQLite DB.
+
+    The live vault.db uses WAL mode → three coordinated files (.db / .db-wal
+    / .db-shm) that aren't safe to replicate via syncthing as the writer
+    process can be mid-transaction at any moment. `VACUUM INTO` produces an
+    atomic single-file snapshot of the committed state, which IS safe to
+    sync. Read-only viewers (Obsidian SQLite-DB plugin on Mac / Windows)
+    point at vault-snapshot.db instead of vault.db and get consistent reads.
+
+    The snapshot is built in-place via a .tmp file + atomic rename so even
+    a mid-VACUUM crash leaves the previous snapshot intact for readers.
+    """
+    if VAULT_SNAPSHOT_INTERVAL_MIN <= 0:
+        log.info("vault snapshot disabled (IRIS_VAULT_SNAPSHOT_INTERVAL_MIN=0)")
+        return
+    log.info("vault snapshot: every %d min", VAULT_SNAPSHOT_INTERVAL_MIN)
+    # Initial delay so we don't run before VaultIndex's first sync settles.
+    await asyncio.sleep(90)
+    while not client.is_closed():
+        try:
+            await asyncio.to_thread(_take_vault_snapshot)
+        except Exception as e:
+            log.warning("vault snapshot failed: %s", e)
+        await asyncio.sleep(VAULT_SNAPSHOT_INTERVAL_MIN * 60)
+
+
+def _take_vault_snapshot() -> None:
+    """Run `VACUUM INTO` against the live vault.db and atomically swap the
+    result into vault-snapshot.db. Same directory as the live DB so the
+    SQLite-DB plugin can find it via a sibling-path reference.
+
+    Cleans up a stale .tmp file from a previous crashed run before starting.
+    """
+    db_path = Path(VAULT_ROOT) / ".ai_memory_cache" / "vault.db"
+    if not db_path.exists():
+        return  # No index yet — VaultIndex will create it on next access.
+    snap_path = db_path.with_name("vault-snapshot.db")
+    tmp_path = db_path.with_name("vault-snapshot.db.tmp")
+    if tmp_path.exists():
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass  # Will be overwritten or fail below.
+    # VACUUM INTO doesn't accept SQL parameters — the filename must be a
+    # literal string. Escape single quotes by doubling them (SQLite's
+    # standard string-literal escape).
+    escaped_target = str(tmp_path).replace("'", "''")
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        # Target file must not exist — we already removed .tmp above.
+        conn.execute(f"VACUUM INTO '{escaped_target}'")
+    finally:
+        conn.close()
+    tmp_path.replace(snap_path)
+    try:
+        size_kb = snap_path.stat().st_size // 1024
+        log.info("vault snapshot updated: vault-snapshot.db (%d KB)", size_kb)
+    except OSError:
+        pass
 
 
 async def _process_pingback_queue() -> None:
