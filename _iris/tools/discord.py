@@ -920,13 +920,20 @@ def embed_project_status(
         title = f"📋 {Path(project_path).stem}"
     elif not title.startswith(("📋", "Project")):
         title = f"📋 {title}"
+    # NOTE: Discord rejects non-http(s) URLs in the embed `url` parameter, so
+    # we can't put obsidian:// there to make the title clickable. Instead,
+    # expose the deep-link as a masked link inside a top field — those DO
+    # accept arbitrary schemes.
+    obs_url = _obsidian_url_for(project_path)
+    if obs_url:
+        fields = [{"name": "🔗", "value": f"[Open in Obsidian]({obs_url})",
+                   "inline": False}] + fields
     embed = _build_embed_dict(
         title=title,
         description=intro,
         color=_resolve_color(color),
         fields=fields,
         footer=project_path,
-        url=_obsidian_url_for(project_path),  # title clickable → opens the note
     )
     return _enqueue_embed(channel_id, embed)
 
@@ -986,12 +993,13 @@ def embed_event(
         url = _obsidian_url_for(note_path)
         value = f"[{Path(note_path).stem}]({url})" if url else f"`{note_path}`"
         fields.append({"name": "🔗 Source", "value": value, "inline": False})
+    # No `url=` — Discord rejects non-http schemes there. The 🔗 Source
+    # field above already exposes the deep-link as a clickable masked link.
     embed = _build_embed_dict(
         title=f"📅 {ev.get('title', '(no title)')}",
         color=_resolve_color(color),
         fields=fields,
         footer="event" + (f" · {note_path}" if note_path else ""),
-        url=_obsidian_url_for(note_path) if note_path else None,
     )
     return _enqueue_embed(channel_id, embed)
 
@@ -1244,13 +1252,19 @@ def embed_note(
     except OSError:
         pass
 
+    # Expose the deep-link as a top "🔗 Open in Obsidian" field. We can't put
+    # obsidian:// on the embed `url` (Discord rejects non-http schemes there),
+    # so we use a masked link in a field instead — those accept any scheme.
+    obs_url = _obsidian_url_for(rel)
+    if obs_url:
+        fields = [{"name": "🔗", "value": f"[Open in Obsidian]({obs_url})",
+                   "inline": False}] + fields
     embed = _build_embed_dict(
         title=f"📝 {title}",
         description=description,
         color=_resolve_color(color),
         fields=fields,
         footer=rel,
-        url=_obsidian_url_for(rel),  # makes the title clickable in Discord
     )
     return _enqueue_embed(channel_id, embed)
 
