@@ -711,13 +711,31 @@ def embed_morning_brief(
     date: str = "today",
     color: str = "blue",
     channel_id: int | None = None,
+    sync_calendars: bool = True,
 ) -> str:
     """Render ``morning_briefing(date)`` as a Discord embed and post it.
 
     Uses the same data assembly as the plain-text routine but parses each
     ``## Section`` heading into its own embed field with a topical icon. Wide
     sections are truncated to fit Discord's 1024-char-per-field limit.
+
+    Args:
+        date: ``"today"`` / ``"tomorrow"`` / ``YYYY-MM-DD``.
+        color: Embed sidebar color.
+        channel_id: Override Discord channel.
+        sync_calendars: When True (default) AND ``IRIS_DEFAULT_ICAL_URLS``
+            is set in the env, sync all configured iCal feeds BEFORE
+            building the brief, so today's freshly-added external events
+            are included. No-op when no feeds configured. Pass False to
+            skip if you just synced.
     """
+    if sync_calendars and os.environ.get("IRIS_DEFAULT_ICAL_URLS", "").strip():
+        try:
+            # Lazy import to avoid a circular when `calendar` imports from us.
+            from .calendar import sync_all_calendars
+            sync_all_calendars(days_ahead=7, days_back=0, dry_run=False)
+        except Exception:
+            pass  # Don't fail the brief if a feed is unreachable.
     from .routines import morning_briefing
     md = morning_briefing(date)
     title, intro, fields = _parse_markdown_sections(md)

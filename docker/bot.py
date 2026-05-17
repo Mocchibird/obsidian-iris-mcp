@@ -478,6 +478,11 @@ def _load_system_prompt() -> str | None:
         "   use `sync_all_calendars(days_ahead, days_back)` — it walks "
         "   every configured feed and applies the per-feed source tag and "
         "   optional person-link automatically.\n"
+        " - NOTE: `embed_morning_brief` auto-syncs ALL configured feeds "
+        "   before building the card (controlled by `sync_calendars=True`, "
+        "   the default). The proactive 08:00 morning brief does the same. "
+        "   So you don't need to manually call `sync_all_calendars` right "
+        "   before generating a morning brief — it's already covered.\n"
         " - Otherwise (one-off URL the user just gave you), use "
         "   `pull_ical_subscription(url, days_ahead, days_back, "
         "   source_tag, link_to_person, cross_calendar_dedupe)`. "
@@ -1442,6 +1447,22 @@ async def _scheduled_briefings_loop() -> None:
 async def _fire_morning_briefing() -> None:
     if PING_CHANNEL == 0:
         return
+    # Auto-sync external calendars FIRST so today's freshly-added iCloud /
+    # work / shared-with-partner events flow into the brief. Only runs when
+    # IRIS_DEFAULT_ICAL_URLS is configured; otherwise this is a no-op.
+    # We log the result but don't include it in the brief embed — keeps the
+    # card clean. A 7-day window is enough for what's-on-today + upcoming.
+    if os.environ.get("IRIS_DEFAULT_ICAL_URLS", "").strip():
+        try:
+            from _iris.tools.calendar import sync_all_calendars
+            sync_result = await asyncio.to_thread(
+                sync_all_calendars, days_ahead=7, days_back=0, dry_run=False,
+            )
+            # Trim noisy multi-line output to a single info line per feed.
+            head = sync_result.splitlines()[0] if sync_result else ""
+            log.info("pre-brief iCal sync: %s", head)
+        except Exception as e:
+            log.warning("pre-brief iCal sync failed: %s", e)
     try:
         from _iris.tools.routines import morning_briefing
         text = await asyncio.to_thread(morning_briefing, "today")
