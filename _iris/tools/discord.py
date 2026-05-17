@@ -154,6 +154,9 @@ import re as _re_wl  # noqa: E402 — kept close to its only use
 _WIKILINK_RE = _re_wl.compile(r"\[\[([^\]|]+?)(?:\|([^\]]+?))?\]\]")
 
 _OBSIDIAN_VAULT_NAME = os.environ.get("IRIS_OBSIDIAN_VAULT_NAME", "").strip()
+# https redirector prefix — see docker/bot_embeds.py for the full rationale.
+# Discord blocks obsidian:// in clickable contexts; only https URLs render.
+_OBSIDIAN_URL_PREFIX = os.environ.get("IRIS_OBSIDIAN_URL_PREFIX", "").strip().rstrip("/")
 
 
 def _wikilink_to_text(m) -> str:
@@ -163,15 +166,12 @@ def _wikilink_to_text(m) -> str:
     if label_target.endswith(".md"):
         label_target = label_target[:-3]
     label = display.strip() if display else label_target
-    if not _OBSIDIAN_VAULT_NAME:
+    if not _OBSIDIAN_URL_PREFIX:
         return label
     file_path = raw_target
     if file_path.endswith(".md"):
         file_path = file_path[:-3]
-    url = (
-        "obsidian://open?vault=" + quote(_OBSIDIAN_VAULT_NAME, safe="")
-        + "&file=" + quote(file_path, safe="/")
-    )
+    url = _OBSIDIAN_URL_PREFIX + "/" + quote(file_path, safe="/")
     return f"[{label}]({url})"
 
 
@@ -207,22 +207,22 @@ def _strip_wikilinks(text: str) -> str:
 
 
 def _obsidian_url_for(path: str) -> str | None:
-    """Return an ``obsidian://open?vault=...&file=...`` deep-link for a
-    vault-relative path, or None if no vault name is configured. Used as
-    the ``url`` parameter on note-referencing embeds so the TITLE itself
-    becomes the clickable hyperlink (Discord renders Embed.title as a link
-    when an Embed.url is set)."""
-    if not _OBSIDIAN_VAULT_NAME:
+    """Return a CLICKABLE-IN-DISCORD URL for a vault-relative path.
+
+    Only emits a URL when ``IRIS_OBSIDIAN_URL_PREFIX`` is set — that's the
+    user's https redirector (e.g. ``https://o.example.com``) which 302s to
+    ``obsidian://open?vault=...&file=<path>``. Discord blocks the bare
+    ``obsidian://`` scheme everywhere clickable, so emitting it would
+    render as plain text and confuse users. Returns None when no prefix is
+    configured."""
+    if not _OBSIDIAN_URL_PREFIX:
         return None
     rel = (path or "").strip().lstrip("/")
     if not rel:
         return None
     if rel.endswith(".md"):
         rel = rel[:-3]
-    return (
-        "obsidian://open?vault=" + quote(_OBSIDIAN_VAULT_NAME, safe="")
-        + "&file=" + quote(rel, safe="/")
-    )
+    return _OBSIDIAN_URL_PREFIX + "/" + quote(rel, safe="/")
 
 
 def _parse_markdown_sections(md: str) -> tuple[str, str, list[dict]]:
@@ -920,20 +920,16 @@ def embed_project_status(
         title = f"📋 {Path(project_path).stem}"
     elif not title.startswith(("📋", "Project")):
         title = f"📋 {title}"
-    # NOTE: Discord rejects non-http(s) URLs in the embed `url` parameter, so
-    # we can't put obsidian:// there to make the title clickable. Instead,
-    # expose the deep-link as a masked link inside a top field — those DO
-    # accept arbitrary schemes.
-    obs_url = _obsidian_url_for(project_path)
-    if obs_url:
-        fields = [{"name": "🔗", "value": f"[Open in Obsidian]({obs_url})",
-                   "inline": False}] + fields
+    # Title is clickable when we have an https redirector configured —
+    # _obsidian_url_for now only returns https URLs (never obsidian://),
+    # which Discord accepts on the embed `url` parameter.
     embed = _build_embed_dict(
         title=title,
         description=intro,
         color=_resolve_color(color),
         fields=fields,
         footer=project_path,
+        url=_obsidian_url_for(project_path),
     )
     return _enqueue_embed(channel_id, embed)
 
@@ -993,13 +989,12 @@ def embed_event(
         url = _obsidian_url_for(note_path)
         value = f"[{Path(note_path).stem}]({url})" if url else f"`{note_path}`"
         fields.append({"name": "🔗 Source", "value": value, "inline": False})
-    # No `url=` — Discord rejects non-http schemes there. The 🔗 Source
-    # field above already exposes the deep-link as a clickable masked link.
     embed = _build_embed_dict(
         title=f"📅 {ev.get('title', '(no title)')}",
         color=_resolve_color(color),
         fields=fields,
         footer="event" + (f" · {note_path}" if note_path else ""),
+        url=_obsidian_url_for(note_path) if note_path else None,
     )
     return _enqueue_embed(channel_id, embed)
 
@@ -1252,19 +1247,14 @@ def embed_note(
     except OSError:
         pass
 
-    # Expose the deep-link as a top "🔗 Open in Obsidian" field. We can't put
-    # obsidian:// on the embed `url` (Discord rejects non-http schemes there),
-    # so we use a masked link in a field instead — those accept any scheme.
-    obs_url = _obsidian_url_for(rel)
-    if obs_url:
-        fields = [{"name": "🔗", "value": f"[Open in Obsidian]({obs_url})",
-                   "inline": False}] + fields
+    # Title is clickable when https redirector configured.
     embed = _build_embed_dict(
         title=f"📝 {title}",
         description=description,
         color=_resolve_color(color),
         fields=fields,
         footer=rel,
+        url=_obsidian_url_for(rel),
     )
     return _enqueue_embed(channel_id, embed)
 
