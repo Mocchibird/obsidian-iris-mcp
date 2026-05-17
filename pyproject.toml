@@ -29,6 +29,8 @@ dependencies = [
     "python-docx>=1.0",
     "openpyxl>=3.1",
     "pypdf>=4.0",
+    "icalendar>=6.0",           # iCal parsing for pull_ical_subscription
+    "recurring-ical-events>=3.0", # expands RRULE/recurring events
 ]
 
 [project.optional-dependencies]

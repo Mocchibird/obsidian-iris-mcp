@@ -352,3 +352,199 @@ def morning_routine(dry_run: bool = False) -> str:
     return _run_vault_cron(*args, timeout=60)
 
 
+
+
+# ── iCal subscription puller ───────────────────────────────────────────────
+# Replacement for the deleted Apple-Calendar AppleScript path. Pulls from any
+# public iCal feed (iCloud shared calendar, Google's "secret iCal URL",
+# Outlook public link, etc.) without needing OS-level integration.
+
+
+@mcp.tool()
+def pull_ical_subscription(
+    url: str,
+    days_ahead: int = 30,
+    days_back: int = 0,
+    dry_run: bool = False,
+    source_tag: str = "ical",
+) -> str:
+    """Sync events from a ``webcal://`` or ``https://`` iCalendar feed.
+
+    Works with any source that exposes a public iCal feed:
+      * **iCloud shared calendars** — Calendar.app → right-click calendar →
+        Share Calendar → Public Calendar. Copy the ``webcal://`` URL.
+      * **Google Calendar** — Settings → Settings for my calendars → pick
+        one → "Secret address in iCal format" (long random URL).
+      * **Outlook / Microsoft 365** — Calendar settings → Shared calendars
+        → Publish → choose "ICS — anyone with the link".
+
+    Each event is written into the appropriate daily note's ``## Schedule``
+    section via ``schedule_event``. Re-running the same URL deduplicates by
+    iCal UID (embedded as ``[ical-uid:...]`` in the event description), so
+    repeated syncs don't create duplicates.
+
+    Recurring events (RRULE) are expanded over the import window — you get
+    one row per occurrence in the date range.
+
+    Args:
+        url: Calendar feed URL. ``webcal://`` is auto-rewritten to ``https://``.
+        days_ahead: Days into the future to import (default 30, max 365).
+        days_back: Days into the past (default 0, max 365). Useful for
+            backfilling.
+        dry_run: List what WOULD be imported without writing.
+        source_tag: Marker for filtering later, e.g. ``icloud-personal``,
+            ``google-work``. Stored in the event description.
+
+    Returns a summary like ``📅 12 added, 3 skipped (already synced), 0 errors``.
+    """
+    try:
+        import httpx
+        import recurring_ical_events
+        from icalendar import Calendar
+    except ImportError as exc:
+        return (f"err: missing dep — {exc}. Add `icalendar` + "
+                "`recurring-ical-events` to pyproject.toml and rebuild.")
+
+    url = (url or "").strip()
+    if url.startswith("webcal://"):
+        url = "https://" + url[len("webcal://"):]
+    if not url.startswith(("http://", "https://")):
+        return f"err: URL must be http(s):// or webcal://, got {url!r}"
+
+    days_ahead = max(0, min(int(days_ahead), 365))
+    days_back = max(0, min(int(days_back), 365))
+
+    # Fetch
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return f"err: could not fetch feed: {exc}"
+
+    # Parse
+    try:
+        cal = Calendar.from_ical(resp.content)
+    except Exception as exc:  # icalendar raises generic exceptions
+        return f"err: invalid iCalendar feed: {exc}"
+
+    today = datetime.now().date()
+    start_dt = datetime.combine(today - timedelta(days=days_back), datetime.min.time())
+    end_dt = datetime.combine(today + timedelta(days=days_ahead), datetime.max.time())
+
+    # Expand recurring events into individual occurrences in the window.
+    try:
+        events_iter = recurring_ical_events.of(cal).between(start_dt, end_dt)
+    except Exception as exc:
+        return f"err: failed to expand recurring events: {exc}"
+
+    # Pre-load existing UIDs from the vault index for O(1) dedupe.
+    from ..core import get_vault_index
+    idx = get_vault_index()
+    existing_uids: set[str] = set()
+    try:
+        rows = idx.conn.execute(
+            "SELECT description FROM events WHERE description LIKE '%[ical-uid:%'"
+        ).fetchall()
+        for r in rows:
+            desc = r["description"] if hasattr(r, "keys") else r[0]
+            for m in re.finditer(r"\[ical-uid:([^\]]+)\]", desc or ""):
+                existing_uids.add(m.group(1))
+    except Exception:
+        pass  # if events table doesn't exist yet, just skip dedupe
+
+    added = 0
+    skipped = 0
+    errors: list[str] = []
+    previews: list[str] = []
+
+    for ev in events_iter:
+        try:
+            dtstart_field = ev.get("DTSTART")
+            if dtstart_field is None:
+                continue
+            dtstart = dtstart_field.dt
+            dtend_field = ev.get("DTEND")
+            dtend = dtend_field.dt if dtend_field is not None else None
+
+            summary = str(ev.get("SUMMARY") or "(no title)").strip()
+            location = str(ev.get("LOCATION") or "").strip()
+            ical_desc = str(ev.get("DESCRIPTION") or "").strip()
+            uid = str(ev.get("UID") or "").strip()
+
+            # Distinguish all-day (datetime.date) vs timed (datetime.datetime)
+            is_timed = hasattr(dtstart, "hour")
+            if is_timed:
+                date_iso = dtstart.date().isoformat()
+                time_str = dtstart.strftime("%H:%M")
+                if dtend and hasattr(dtend, "hour"):
+                    end_time_str = dtend.strftime("%H:%M")
+                    end_date_str = (dtend.date().isoformat()
+                                    if dtend.date() != dtstart.date() else "")
+                else:
+                    end_time_str = ""
+                    end_date_str = ""
+                all_day = False
+            else:
+                # iCal all-day events: DTEND is exclusive (the day AFTER).
+                date_iso = dtstart.isoformat()
+                if dtend:
+                    last_day = dtend - timedelta(days=1)
+                    end_date_str = (last_day.isoformat()
+                                    if last_day != dtstart else "")
+                else:
+                    end_date_str = ""
+                time_str = ""
+                end_time_str = ""
+                all_day = True
+
+            if uid and uid in existing_uids:
+                skipped += 1
+                continue
+
+            marker = f"[ical-uid:{uid}][source:{source_tag}]" if uid else f"[source:{source_tag}]"
+            full_desc = (ical_desc + "\n\n" if ical_desc else "") + marker
+
+            if dry_run:
+                previews.append(f"  {date_iso} {time_str or 'all-day'} — {summary}"
+                                + (f" @ {location}" if location else ""))
+                added += 1
+                continue
+
+            result = schedule_event(
+                date=date_iso,
+                time=time_str,
+                title=summary,
+                end_time=end_time_str,
+                end_date=end_date_str,
+                location=location,
+                description=full_desc,
+                all_day=all_day,
+            )
+            if result.startswith("ok") or result.startswith("✅"):
+                added += 1
+                if uid:
+                    existing_uids.add(uid)
+            else:
+                errors.append(f"{date_iso} {summary[:40]}: {result[:120]}")
+        except Exception as exc:
+            errors.append(f"parse failed: {exc}")
+
+    summary_lines: list[str] = []
+    verb = "would add" if dry_run else "added"
+    summary_lines.append(
+        f"📅 iCal sync ({source_tag}): {added} {verb}, "
+        f"{skipped} skipped (already synced)"
+    )
+    if dry_run and previews:
+        summary_lines.append(f"Preview (first {min(15, len(previews))}):")
+        summary_lines.extend(previews[:15])
+        if len(previews) > 15:
+            summary_lines.append(f"  ... +{len(previews) - 15} more")
+    if errors:
+        summary_lines.append(f"⚠️ {len(errors)} error(s):")
+        for e in errors[:5]:
+            summary_lines.append(f"  - {e}")
+        if len(errors) > 5:
+            summary_lines.append(f"  - ... +{len(errors) - 5} more")
+    return "\n".join(summary_lines)
