@@ -6,21 +6,12 @@ Precedence (highest first):
     3. Built-in default
 
 Zero external deps — importable from both ``_iris/`` (the MCP server) and
-``vault_cron.py`` (the standalone launchd runner) without dragging in mcp/httpx.
+``vault_cron.py`` (the standalone runner) without dragging in mcp/httpx.
 
 Example ~/.config/iris/config.toml:
 
     [vault]
     root = "~/obsidian-vaults/AI_Memory"
-
-    [apple]
-    reminders_list = "Vault"
-    calendar_name  = "Vault"
-    calendar_exclude = ["Vault", "Scheduled Reminders"]
-
-    [focus.Work]
-    projects = ["PTO Kernels"]
-    tags     = ["huawei", "ascend"]
 
     [embed]
     url   = "http://localhost:11434/v1/embeddings"
@@ -110,35 +101,6 @@ def vault_db_path() -> Path:
     return vault_cache_dir() / "vault.db"
 
 
-# ── Apple integration ──────────────────────────────────────────────────────
-REMINDERS_LIST: str = _str("IRIS_REMINDERS_LIST", ("apple", "reminders_list"), "Vault")
-CALENDAR_NAME: str = _str("IRIS_CALENDAR_NAME", ("apple", "calendar_name"), "Vault")
-CALENDAR_EXCLUDE: set[str] = set(_toml_get(
-    ("apple", "calendar_exclude"),
-    ["Vault", "Scheduled Reminders", "Siri Suggestions",
-     "Schweizerische Feiertage", "Birthdays"],
-))
-
-FOCUS_CONTEXT: dict[str, dict[str, list[str]]] = _toml_get("focus", {  # type: ignore[arg-type]
-    "Work":     {"projects": ["PTO Kernels"], "tags": ["huawei", "ascend"]},
-    "Personal": {"projects": ["Homelab", "TrueNAS Migration", "MochiMind"], "tags": ["personal"]},
-    "Study":    {"projects": ["Japanese Study", "Languages"], "tags": ["ethz", "japanese"]},
-}) if isinstance(_toml.get("focus"), dict) else {
-    "Work":     {"projects": ["PTO Kernels"], "tags": ["huawei", "ascend"]},
-    "Personal": {"projects": ["Homelab", "TrueNAS Migration", "MochiMind"], "tags": ["personal"]},
-    "Study":    {"projects": ["Japanese Study", "Languages"], "tags": ["ethz", "japanese"]},
-}
-
-
-# ── Apple Health ───────────────────────────────────────────────────────────
-# A single Apple Shortcut named here is run by `vault_cron.py health` and its
-# output is written verbatim into today's daily note's ## Health section.
-# Define the shortcut in iOS / macOS Shortcuts.app — it can pull whatever
-# metrics you want (sleep, steps, HRV, weight, workouts) and return them as
-# plain text or JSON.
-HEALTH_SHORTCUT: str = _str("IRIS_HEALTH_SHORTCUT", ("apple", "health_shortcut"), "Iris Health")
-
-
 # ── Embeddings ─────────────────────────────────────────────────────────────
 EMBED_URL: str = _str("IRIS_EMBED_URL", ("embed", "url"), "http://localhost:11434/v1/embeddings")
 EMBED_MODEL: str = _str("IRIS_EMBED_MODEL", ("embed", "model"), "nomic-embed-text")
@@ -163,11 +125,6 @@ def config_summary() -> str:
     return (
         f"=== iris_config ({loaded}) ===\n"
         f"vault.root       = {VAULT_ROOT}\n"
-        f"apple.reminders  = {REMINDERS_LIST}\n"
-        f"apple.calendar   = {CALENDAR_NAME}\n"
-        f"apple.exclude    = {sorted(CALENDAR_EXCLUDE)}\n"
-        f"apple.health     = {HEALTH_SHORTCUT}\n"
-        f"focus.modes      = {sorted(FOCUS_CONTEXT.keys())}\n"
         f"embed.url        = {EMBED_URL}\n"
         f"embed.model      = {EMBED_MODEL}\n"
         f"embed.api_key    = {'set' if EMBED_API_KEY else 'unset'}\n"

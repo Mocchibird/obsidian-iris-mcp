@@ -18,7 +18,6 @@ Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidia
 - Find broken links, duplicate notes, orphan attachments, merge candidates
 - Render live SQL queries inside Obsidian via the SQLite DB plugin
 - Run as a **Discord bot** through Docker — chat with Iris from anywhere using your Claude subscription
-- _(macOS only)_ Sync tasks, reminders, and calendar events with Apple Reminders & Calendar
 - _(optional)_ Track anime watch lists with MyAnimeList sync
 
 ---
@@ -206,14 +205,14 @@ _iris/
     ├── search.py               # search_vault, search_vault_text, find_similar
     ├── semantic.py             # semantic_search, suggest_links_for, reindex_embeddings
     ├── tasks.py                # tasks + reminders, carry-forward
-    ├── calendar.py             # schedule_event, daily_agenda
+    ├── calendar.py             # schedule_event, daily_agenda, evening_wrapup, weekly_summary, morning_routine
     ├── discord.py              # fetch_discord_history, schedule_pingback (bot context)
     ├── links.py                # find_issues, link_candidates, duplicates
     ├── analysis.py             # vault_overview, note_context, merge_candidates
     ├── import_export.py        # import_file, mass_import, triage_inbox, summarize_note_with_llm
     ├── routines.py             # morning_briefing, evening_wrapup, weekly_review
     └── web.py                  # web_search, fetch_url, search_reddit
-vault_cron.py                   # standalone CLI: capture, weekly-summary, (macOS) Apple sync
+vault_cron.py                   # standalone CLI: capture, weekly-summary, wrapup, morning, drop-zone import
 docker/                         # Discord bot deployment (compose + Dockerfile)
 plugins/sqlite-db-reload/       # Obsidian companion plugin (copy into your vault)
 ```
@@ -267,26 +266,12 @@ Everything runs locally — vault data never leaves your machine unless you poin
 
 ## Platform support
 
-- **macOS**: full feature set including the optional Apple integrations.
-- **Linux / Docker**: core MCP and the Discord bot work; Apple integrations are macOS-only.
-- **Windows**: core MCP works; some OS-specific helpers (notifications, Shortcuts) are untested.
+- **macOS / Linux / Docker**: full core MCP and the Discord bot.
+- **Windows**: core MCP works; some OS-specific helpers are untested.
 
 ---
 
 ## Optional integrations
-
-### Apple Reminders / Calendar / Health *(macOS only)*
-
-`vault_cron.py` syncs tasks/reminders bidirectionally with Apple Reminders, pulls Calendar events into daily notes' `## Schedule`, and (with a user-defined Apple Shortcut) writes a daily Health snapshot into each daily note. Uses `osascript` under the hood.
-
-```bash
-./vault_cron.py sync             # bidirectional with Apple Reminders/Calendar
-./vault_cron.py pull-calendar    # Apple Calendar → daily note
-./vault_cron.py health           # run the user-defined "Iris Health" Shortcut
-./vault_cron.py morning          # full morning routine
-```
-
-Schedule via launchd if you want it to run automatically.
 
 ### MyAnimeList sync
 

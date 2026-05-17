@@ -21,8 +21,6 @@ Designed for TrueNAS SCALE but works on any Docker host.
                                 └──────────────────┘
 ```
 
-Apple-integration tools (`sync_apple`, `pull_health_snapshot`, `get_focus_context`, etc.) are present but no-op on Linux — keep running `vault_cron.py` on your Mac for those, and the data lands in the vault for Iris-in-Discord to read.
-
 ## Setup with Dockge (recommended for TrueNAS)
 
 This is the path that works cleanest if the repo + vault are both syncthing-replicated to TrueNAS (so the Mac and TrueNAS share the same source tree).
