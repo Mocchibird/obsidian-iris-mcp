@@ -235,6 +235,8 @@ Iris exposes ~140 tools. Some highlights:
 | `find_issues(checks=…)` | Broken links, duplicates, orphan attachments, link mismatches |
 | `find_merge_candidates(folder)` | Vault-wide similarity scoring for potential duplicate notes |
 | `sqlite_query(sql)` | Read-only SELECT against any table/view |
+| `refresh_sql_views(path?, all_notes?)` | Re-render ` ```sqlite ` code blocks in vault notes as markdown tables (for iOS/iPadOS where the SQLite-DB plugin doesn't run) |
+| `vault_snapshot()` | On-demand atomic `VACUUM INTO` of the live vault.db → vault-snapshot.db. Periodic loop runs every 10 min; call this for instant freshness. |
 | `schedule_event(...)` | Add a calendar event to a daily note's `## Schedule` |
 | `daily_agenda(date)` | Tasks + reminders + events for a date, including cross-day events |
 | `pull_ical_subscription(url, link_to_person?)` | Sync events from a `webcal://` or `https://` iCal feed (iCloud, Google, Outlook). RRULE-aware. Dedupes by UID AND by `(date, time, title)` so same-event-in-two-calendars doesn't double-import. Optional `link_to_person` adds `with: [[path]]` backlink to a contact. |
