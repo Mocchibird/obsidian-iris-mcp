@@ -442,8 +442,36 @@ def _render_sql_to_md_table(sql: str, limit: int = _SQL_VIEW_DEFAULT_LIMIT) -> s
 
     def _cell(v) -> str:
         s = "" if v is None else str(v)
-        # Escape pipes + newlines so markdown table doesn't break.
-        s = s.replace("|", "\\|").replace("\n", " ").replace("\r", "")
+        # Drop newlines (would break the row).
+        s = s.replace("\n", " ").replace("\r", "")
+        # Escape pipes — but preserve pipes inside `[[…|…]]` wikilinks
+        # (Obsidian's alias separator must stay literal). Without this,
+        # a query like `'[[' || path || '|' || name || ']]'` would render
+        # as `[[path\|name]]` and Obsidian wouldn't recognise it as a
+        # wikilink at all.
+        out: list[str] = []
+        depth = 0  # tracks open `[[` (could nest, though unusual)
+        i = 0
+        n = len(s)
+        while i < n:
+            two = s[i:i + 2]
+            if two == "[[":
+                depth += 1
+                out.append("[[")
+                i += 2
+                continue
+            if two == "]]" and depth > 0:
+                depth -= 1
+                out.append("]]")
+                i += 2
+                continue
+            ch = s[i]
+            if ch == "|" and depth == 0:
+                out.append("\\|")
+            else:
+                out.append(ch)
+            i += 1
+        s = "".join(out)
         if len(s) > _SQL_CELL_MAX_CHARS:
             s = s[: _SQL_CELL_MAX_CHARS - 1] + "…"
         return s
