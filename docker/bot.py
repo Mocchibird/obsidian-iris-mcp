@@ -157,6 +157,13 @@ NOTIFY_EVENING_AT = os.environ.get("IRIS_NOTIFY_EVENING_AT", "22:00").strip() or
 # IRIS_NOTIFY_EVENING_GRACE_MIN.
 NOTIFY_MORNING_GRACE_MIN = int(os.environ.get("IRIS_NOTIFY_MORNING_GRACE_MIN", "180"))
 NOTIFY_EVENING_GRACE_MIN = int(os.environ.get("IRIS_NOTIFY_EVENING_GRACE_MIN", "60"))
+# How often (in minutes) to pull from IRIS_DEFAULT_ICAL_URLS in the
+# background. 0 = disabled (sync only happens via the morning brief or
+# when explicitly asked). Default 60 = hourly. Lower to 15-30 if your
+# calendars change frequently and you want event pings to catch
+# last-minute additions; raise (or set 0) if your feeds are slow / you
+# don't care about same-day freshness.
+ICAL_SYNC_INTERVAL_MIN = int(os.environ.get("IRIS_ICAL_SYNC_INTERVAL_MIN", "60"))
 NOTIFIED_PATH = Path("/claude-auth/discord-notified.json")
 SNOOZE_PATH = Path("/claude-auth/discord-snoozed.json")
 _HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
@@ -1101,6 +1108,7 @@ async def on_ready() -> None:
         client.loop.create_task(_snooze_replay_loop())
         client.loop.create_task(_pingback_loop())
         client.loop.create_task(_embed_queue_loop())
+        client.loop.create_task(_ical_sync_loop())
 
 
 # ── Proactive notification loop ─────────────────────────────────────────────
@@ -1672,6 +1680,39 @@ async def _pingback_loop() -> None:
         except Exception:
             log.exception("pingback loop")
         await asyncio.sleep(30)
+
+
+async def _ical_sync_loop() -> None:
+    """Periodic background sync of every feed in IRIS_DEFAULT_ICAL_URLS.
+
+    Sleeps ICAL_SYNC_INTERVAL_MIN between passes (default 60 min). Skipped
+    entirely when the interval is 0 OR no feeds are configured. First sync
+    happens ~2 min after startup so we don't pile work onto the cold-start
+    window — the morning brief's pre-sync covers immediate freshness anyway.
+    """
+    if ICAL_SYNC_INTERVAL_MIN <= 0:
+        log.info("iCal background sync disabled (IRIS_ICAL_SYNC_INTERVAL_MIN=0)")
+        return
+    if not os.environ.get("IRIS_DEFAULT_ICAL_URLS", "").strip():
+        log.info("iCal background sync skipped — IRIS_DEFAULT_ICAL_URLS not set")
+        return
+    log.info("iCal background sync: every %d min", ICAL_SYNC_INTERVAL_MIN)
+    # Initial delay so we don't race the bot's other startup work + the
+    # 08:00 brief's pre-sync (which already pulls fresh).
+    await asyncio.sleep(120)
+    while not client.is_closed():
+        try:
+            from _iris.tools.calendar import sync_all_calendars
+            result = await asyncio.to_thread(
+                sync_all_calendars, days_ahead=30, days_back=0, dry_run=False,
+            )
+            # Just log the header line per feed — drop the verbose preview.
+            for line in (result or "").splitlines():
+                if line.startswith("📅") or line.startswith("──"):
+                    log.info("ical-sync: %s", line)
+        except Exception as e:
+            log.warning("background iCal sync failed: %s", e)
+        await asyncio.sleep(ICAL_SYNC_INTERVAL_MIN * 60)
 
 
 async def _process_pingback_queue() -> None:
