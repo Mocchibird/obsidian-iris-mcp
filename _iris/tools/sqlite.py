@@ -469,3 +469,68 @@ def refresh_sql_views(path: str = "", all_notes: bool = False) -> str:
         if len(sample_errors) > 5:
             summary += f"\n  - …+{len(sample_errors) - 5} more"
     return summary
+
+
+@mcp.tool()
+def vault_snapshot() -> str:
+    """Atomically snapshot the live vault.db → vault-snapshot.db.
+
+    On-demand companion to the bot's periodic snapshot loop. Use when:
+      * You just made a bunch of vault changes and want them visible on
+        Mac / Windows / mobile (via syncthing → SQLite-DB plugin pointed
+        at the snapshot) without waiting for the next 10-min tick.
+      * You're about to demo / present and want the readers' DB fresh.
+
+    The snapshot is built via `VACUUM INTO` (committed-state only, single
+    file, DELETE journal mode regardless of source mode), written to a
+    unique tmp filename, then atomically renamed over the existing
+    snapshot. Old snapshot stays readable for any open plugin until the
+    rename completes, so readers never see a half-written DB.
+
+    Returns the snapshot path + size on success, or an error string.
+    """
+    import os as _os
+    import uuid as _uuid
+    from pathlib import Path as _Path
+
+    db_path = _Path(get_vault_root()) / ".ai_memory_cache" / "vault.db"
+    if not db_path.exists():
+        return ("err: live vault.db not found yet — "
+                "VaultIndex hasn't built the index. Run "
+                "`rebuild_vault_index()` first.")
+    snap_path = db_path.with_name("vault-snapshot.db")
+
+    # Best-effort cleanup of any stale .tmp from a previous crashed run.
+    for stale in db_path.parent.glob("vault-snapshot.*.tmp"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+    # Unique tmp name per attempt — VACUUM INTO refuses to overwrite, so
+    # a leftover .tmp would otherwise starve the call.
+    tmp_path = db_path.with_name(
+        f"vault-snapshot.{_os.getpid()}.{_uuid.uuid4().hex[:8]}.tmp"
+    )
+    # SQLite's VACUUM INTO can't bind parameters; escape single-quotes
+    # the standard way. VAULT_ROOT is operator-controlled so this is
+    # hardening rather than untrusted-input defense.
+    escaped_target = str(tmp_path).replace("'", "''")
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=30)
+        try:
+            conn.execute(f"VACUUM INTO '{escaped_target}'")
+        finally:
+            conn.close()
+        _os.replace(str(tmp_path), str(snap_path))
+    except Exception as exc:
+        # Clean up tmp on failure so we don't leak.
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        return f"err: snapshot failed: {exc}"
+
+    size_kb = snap_path.stat().st_size // 1024
+    return f"ok vault-snapshot.db updated ({size_kb} KB)"

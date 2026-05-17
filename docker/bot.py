@@ -42,7 +42,6 @@ import re
 import sqlite3
 import sys
 import time
-import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -506,6 +505,12 @@ def _load_system_prompt() -> str | None:
         "a specific note's SQL views NOW, call `refresh_sql_views(path=...)`. "
         "If he asks 'refresh all views', call it with `all_notes=True`. "
         "Result blocks are SELECT-only, capped at 50 rows + 200 chars/cell.\n\n"
+        "Read-only DB snapshot (companion to the SQL view feature): the "
+        "live vault.db uses WAL mode which can't safely sync via syncthing. "
+        "The bot snapshots it to `vault-snapshot.db` every 10 min for "
+        "Mac/Windows SQLite-DB plugin readers. To take a snapshot NOW (e.g. "
+        "after a bulk import + before the user opens the plugin on the "
+        "Mac), call `vault_snapshot()`. Returns a tiny ok/err line.\n\n"
         "Calendar sync from external feeds: when Hyun-Min says 'sync my "
         "calendar', 'pull events from iCloud', 'import my work calendar':\n"
         " - If `IRIS_DEFAULT_ICAL_URLS` is set (multi-feed config in .env), "
@@ -1772,49 +1777,16 @@ async def _vault_snapshot_loop() -> None:
 
 
 def _take_vault_snapshot() -> None:
-    """Run `VACUUM INTO` against the live vault.db and atomically swap the
-    result into vault-snapshot.db. Same directory as the live DB so the
-    SQLite-DB plugin can find it via a sibling-path reference.
+    """Thin wrapper around the `vault_snapshot` MCP tool's implementation.
 
-    Tmp file uses a per-PID + uuid suffix so a previous-run crash leaving
-    behind a stale .tmp can never starve subsequent runs (which is what
-    happens if you used a fixed `.tmp` name and the unlink ever failed).
-    Old strays are best-effort cleaned at the start of each run.
+    Keeping a single source of truth for the snapshot logic (in
+    ``_iris/tools/sqlite.py``) means the periodic loop and Iris's
+    on-demand calls produce byte-identical output, and any future bug
+    fix only needs one edit.
     """
-    db_path = Path(VAULT_ROOT) / ".ai_memory_cache" / "vault.db"
-    if not db_path.exists():
-        return  # No index yet — VaultIndex will create it on next access.
-    snap_path = db_path.with_name("vault-snapshot.db")
-
-    # Clean up stale tmp files from previous crashed runs (don't error if
-    # they refuse to delete — we'll just write to a fresh unique tmp anyway).
-    for stale in db_path.parent.glob("vault-snapshot.*.tmp"):
-        try:
-            stale.unlink()
-        except OSError as e:
-            log.warning("vault snapshot: could not remove stale %s: %s", stale.name, e)
-
-    # Unique tmp name per attempt — guarantees VACUUM INTO never hits a
-    # "target file already exists" error from leftover state.
-    tmp_path = db_path.with_name(f"vault-snapshot.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-    # VACUUM INTO doesn't accept SQL parameters — the filename must be a
-    # literal string. Escape single quotes by doubling them (SQLite's
-    # standard string-literal escape). VAULT_ROOT is operator-controlled,
-    # so this is hardening rather than untrusted-input defense.
-    escaped_target = str(tmp_path).replace("'", "''")
-    conn = sqlite3.connect(str(db_path), timeout=30)
-    try:
-        conn.execute(f"VACUUM INTO '{escaped_target}'")
-    finally:
-        conn.close()
-    # os.replace is atomic on POSIX — old snapshot stays valid for readers
-    # until this returns; after, new snapshot is in place.
-    os.replace(tmp_path, snap_path)
-    try:
-        size_kb = snap_path.stat().st_size // 1024
-        log.info("vault snapshot updated: vault-snapshot.db (%d KB)", size_kb)
-    except OSError:
-        pass
+    from _iris.tools.sqlite import vault_snapshot as _vault_snapshot_impl
+    result = _vault_snapshot_impl()
+    log.info("vault snapshot: %s", result)
 
 
 async def _sql_view_refresh_loop() -> None:
