@@ -260,6 +260,114 @@ def _strip_sql_strings_and_comments(sql: str) -> str:
     return "".join(out)
 
 
+def _is_sqlitedb_config(text: str) -> bool:
+    """Detect the SQLite-DB plugin's YAML-style config syntax.
+
+    The plugin parses blocks like::
+
+        table: people
+        columns: name, category
+        filterColumn: category
+        filterValue: vendors
+        orderBy: name
+
+    instead of raw SQL. We detect by the presence of a leading ``table:``
+    declaration on its own line (with optional leading whitespace).
+    """
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("--") or s.startswith("#"):
+            continue
+        # First non-comment line: is it `table:` ?
+        return bool(re.match(r"^table\s*:\s*\S", s, re.IGNORECASE))
+    return False
+
+
+def _sqlitedb_config_to_sql(config: str) -> str:
+    """Translate the SQLite-DB plugin's YAML-ish config into a SELECT.
+
+    Recognises ``table``, ``columns``, ``filterColumn`` / ``filterValue``,
+    ``orderBy`` (supports multi-column ``a, b DESC, c`` — unlike the
+    plugin's own implementation), ``limit``. Ignores ``displayFormat``
+    and any unknown keys silently. Returns the SQL string; the caller
+    runs it through the normal safety + execution pipeline.
+
+    Multi-line values are not supported (single-line key: value only).
+    Identifier quoting: wraps each in double-quotes so dashes /
+    SQL-reserved column names round-trip safely.
+    """
+    parsed: dict[str, str] = {}
+    multi_filters: list[tuple[str, str]] = []
+    for line in config.splitlines():
+        s = line.strip()
+        if not s or s.startswith("--") or s.startswith("#"):
+            continue
+        if ":" not in s:
+            continue
+        key, _, value = s.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        # Strip trailing inline comments.
+        for marker in ("--", "#"):
+            idx = value.find(marker)
+            if idx > 0 and not value[:idx].count("'") % 2:
+                # outside a quoted string
+                value = value[:idx].rstrip()
+        if key == "filtercolumn" or key == "filterkey":
+            multi_filters.append((value, ""))
+        elif key == "filtervalue":
+            if multi_filters and not multi_filters[-1][1]:
+                multi_filters[-1] = (multi_filters[-1][0], value)
+            else:
+                multi_filters.append(("__pending__", value))
+        else:
+            parsed[key] = value
+
+    table = parsed.get("table") or ""
+    if not table:
+        raise ValueError("config has no `table:` line")
+
+    cols_raw = parsed.get("columns", "*")
+    if cols_raw == "*":
+        select_clause = "*"
+    else:
+        cols = [c.strip() for c in cols_raw.split(",") if c.strip()]
+        select_clause = ", ".join(f'"{c}"' for c in cols)
+
+    where_parts: list[str] = []
+    for col, val in multi_filters:
+        if not col or col == "__pending__" or not val:
+            continue
+        # Wrap value in single-quotes; escape inner ' by doubling.
+        val_esc = val.replace("'", "''")
+        where_parts.append(f'"{col}" = \'{val_esc}\'')
+    where_clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    order_raw = parsed.get("orderby", "")
+    if order_raw:
+        # Multi-column: "a, b DESC, c" → "a", "b" DESC, "c"
+        pieces: list[str] = []
+        for raw in order_raw.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            # Detect trailing ASC/DESC.
+            m = re.match(r'^(.+?)\s+(ASC|DESC)\s*$', raw, re.IGNORECASE)
+            if m:
+                pieces.append(f'"{m.group(1).strip()}" {m.group(2).upper()}')
+            else:
+                pieces.append(f'"{raw}"')
+        order_clause = " ORDER BY " + ", ".join(pieces) if pieces else ""
+    else:
+        order_clause = ""
+
+    limit_raw = parsed.get("limit", "").strip()
+    limit_clause = f" LIMIT {int(limit_raw)}" if limit_raw.isdigit() else ""
+
+    return (f'SELECT {select_clause} FROM "{table}"'
+            f"{where_clause}{order_clause}{limit_clause}")
+
+
 def _render_sql_to_md_table(sql: str, limit: int = _SQL_VIEW_DEFAULT_LIMIT) -> str:
     """Run ``sql`` against the vault DB and return a markdown table string.
 
@@ -280,6 +388,17 @@ def _render_sql_to_md_table(sql: str, limit: int = _SQL_VIEW_DEFAULT_LIMIT) -> s
     if not s:
         body = "_(empty query)_"
         return _wrap_result(body, now_iso, rows=0)
+    # Translate the SQLite-DB plugin's declarative YAML-ish config into
+    # real SQL. Notes typically use this format inside ```sql blocks
+    # (the plugin parses it; raw SQL is the exception). We handle BOTH
+    # so the same note renders correctly on desktop (via plugin) AND on
+    # mobile (via Iris's pre-rendered markdown).
+    if _is_sqlitedb_config(s):
+        try:
+            s = _sqlitedb_config_to_sql(s)
+        except Exception as exc:
+            body = f"❌ config parse failed: {exc}"
+            return _wrap_result(body, now_iso, rows=0)
     # Strip strings + comments ONCE; both safety checks use the result.
     # Without this, `WHERE title = 'insert into junk'` falsely triggers
     # the write-keyword regex.
