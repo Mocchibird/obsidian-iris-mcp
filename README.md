@@ -205,7 +205,7 @@ _iris/
     ├── search.py               # search_vault, search_vault_text, find_similar
     ├── semantic.py             # semantic_search, suggest_links_for, reindex_embeddings
     ├── tasks.py                # tasks + reminders, carry-forward
-    ├── calendar.py             # schedule_event, daily_agenda, evening_wrapup, weekly_summary, morning_routine
+    ├── calendar.py             # schedule_event, daily_agenda, evening_wrapup, weekly_summary, morning_routine, pull_ical_subscription
     ├── discord.py              # fetch_discord_history, schedule_pingback (bot context)
     ├── links.py                # find_issues, link_candidates, duplicates
     ├── analysis.py             # vault_overview, note_context, merge_candidates
@@ -237,6 +237,7 @@ Iris exposes ~140 tools. Some highlights:
 | `sqlite_query(sql)` | Read-only SELECT against any table/view |
 | `schedule_event(...)` | Add a calendar event to a daily note's `## Schedule` |
 | `daily_agenda(date)` | Tasks + reminders + events for a date, including cross-day events |
+| `pull_ical_subscription(url)` | Sync events from a `webcal://` or `https://` iCal feed (iCloud, Google, Outlook). RRULE-aware, dedupes by UID. |
 | `list_unfinished_tasks()` | What's still open from recent days |
 | `carry_forward_tasks()` | Move missed items to today's daily note |
 | `morning_briefing()` | "What's on today" summary |
