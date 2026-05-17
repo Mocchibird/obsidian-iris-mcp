@@ -33,6 +33,8 @@ Env vars (all optional unless noted):
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -143,10 +145,18 @@ try:
     )
 except ValueError:
     PING_CHANNEL = 0
-NOTIFY_INTERVAL_SECS = int(os.environ.get("IRIS_NOTIFY_INTERVAL_SECS", "300"))
+NOTIFY_INTERVAL_SECS = int(os.environ.get("IRIS_NOTIFY_INTERVAL_SECS", "60"))
 NOTIFY_LEAD_MIN = int(os.environ.get("IRIS_NOTIFY_LEAD_MIN", "15"))
 NOTIFY_MORNING_AT = os.environ.get("IRIS_NOTIFY_MORNING_AT", "08:00").strip() or "off"
 NOTIFY_EVENING_AT = os.environ.get("IRIS_NOTIFY_EVENING_AT", "22:00").strip() or "off"
+# Catch-up grace window: if the bot restarts AFTER the scheduled time but
+# within this many minutes of it, still fire the briefing (once). Past the
+# grace window, suppress entirely — better than getting yesterday's morning
+# brief at 3pm. Defaults: 3h morning (08:00 → fires up to 11:00), 1h evening
+# (22:00 → fires up to 23:00). Tune via IRIS_NOTIFY_MORNING_GRACE_MIN /
+# IRIS_NOTIFY_EVENING_GRACE_MIN.
+NOTIFY_MORNING_GRACE_MIN = int(os.environ.get("IRIS_NOTIFY_MORNING_GRACE_MIN", "180"))
+NOTIFY_EVENING_GRACE_MIN = int(os.environ.get("IRIS_NOTIFY_EVENING_GRACE_MIN", "60"))
 NOTIFIED_PATH = Path("/claude-auth/discord-notified.json")
 SNOOZE_PATH = Path("/claude-auth/discord-snoozed.json")
 _HHMM_PREFIX_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[—\-–]?\s*")
@@ -196,6 +206,28 @@ def _safe_zoneinfo(name: str) -> ZoneInfo | None:
 
 
 HOME_TZ = _safe_zoneinfo(HOME_TZ_NAME) or ZoneInfo("UTC")
+# Loud diagnostic at import time — printed to stdout BEFORE logging is even
+# configured, so it survives any log-level juggling. If you ever see
+# `TZ resolved to UTC` here when you expected Zurich/Seoul/..., zoneinfo
+# can't find your IANA name and that's the root cause of every "Iris thinks
+# it's still yesterday" / "morning brief never fired" bug.
+print(
+    f"[iris.boot] TZ env={os.environ.get('TZ')!r}  "
+    f"IRIS_TIMEZONE={os.environ.get('IRIS_TIMEZONE')!r}  "
+    f"HOME_TZ_NAME={HOME_TZ_NAME!r}  resolved={HOME_TZ.key}",
+    flush=True,
+)
+# Make sure libc / Python's `time.localtime()` (which `logging` uses for log
+# timestamps and which `datetime.now()` without a tz uses) agrees with what
+# we just resolved. Without this, a freshly-set TZ env var won't take effect
+# in an already-running process, and you get log lines stamped in UTC while
+# the bot internally thinks it's on Europe/Zurich — exactly the confusion
+# Iris ran into when asked "what time is it?".
+os.environ["TZ"] = HOME_TZ_NAME
+try:
+    time.tzset()
+except AttributeError:
+    pass  # Windows — no-op
 # Match `timezone: Asia/Seoul` or `timezone: "Asia/Seoul"` in YAML frontmatter
 _TZ_FRONTMATTER_RE = re.compile(
     r'^\s*timezone\s*:\s*[\'"]?([A-Za-z_/+\-0-9]+)[\'"]?\s*$',
@@ -240,6 +272,19 @@ def _now_local() -> datetime:
     return datetime.now(_resolve_active_tz())
 
 
+def _now_context_block() -> str:
+    """A short wall-clock context line to prepend to each user message.
+
+    Claude only sees the system context's date (UTC-based) and has no clock,
+    so when Hyun-Min asks "what time is it" or talks about "now" / "tonight"
+    Claude would otherwise be a day behind in the evening local time. This
+    anchors every turn to the active local timezone (which itself respects
+    today's daily-note `timezone:` frontmatter override)."""
+    now = _now_local()
+    tz_name = now.tzinfo.key if hasattr(now.tzinfo, "key") else str(now.tzinfo)
+    return f"[Now: {now.strftime('%Y-%m-%d %H:%M')} {tz_name} ({now.strftime('%A')})]"
+
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -268,12 +313,175 @@ def _load_system_prompt() -> str | None:
         "look up notes, manage tasks, schedule events, etc. Keep replies "
         "concise enough for chat; long structured output is fine when "
         "asked for it. Use Discord-flavored markdown.\n\n"
+        "Rich Discord embeds: for structured/visual output, PREFER the "
+        "`embed_*` MCP tools over a wall-of-markdown reply. They render as "
+        "Discord cards with a colored sidebar, fields, and footer.\n\n"
+        "  Canned tools (DB-driven, deterministic):\n"
+        "    - `embed_morning_brief(date)` — daily agenda card, blue.\n"
+        "    - `embed_evening_wrapup(date)` — wrap-up card, indigo.\n"
+        "    - `embed_daily_agenda(date, days)` — events+tasks+reminders for "
+        "      a date or range, blue.\n"
+        "    - `embed_event(date, title_match)` — single event with time/"
+        "      location/map, yellow (red if imminent).\n"
+        "    - `embed_project_status(path)` — project dashboard card, violet.\n"
+        "    - `embed_note(path)` — show a vault note as a card (title, "
+        "      excerpt, type/tags/mtime fields, footer = path). Use when "
+        "      referencing a note in conversation rather than pasting its "
+        "      raw markdown.\n"
+        "    - `embed_callout(kind, title, body)` — semantic info box. "
+        "      `kind` ∈ info / success / warning / error / tip / question. "
+        "      Color + icon chosen for you. Great for short confirmations "
+        "      ('✅ saved your ETH ceremony'), warnings ('⚠️ 3 broken links'), "
+        "      tips, error reports.\n"
+        "    - `embed_query(sql, title, color, mode)` — run a SELECT against "
+        "      the vault DB and render the result as a card. `mode=\"table\"` "
+        "      (default) → monospace code-block table; `mode=\"fields\"` → one "
+        "      field per row. For ad-hoc dashboards like 'tasks per project', "
+        "      'anime this season'. Same SQL-safety as `sqlite_query`.\n"
+        "    - `embed_custom(title, description, fields, color)` — last "
+        "      resort when no canned tool fits. `fields` is a list of "
+        "      `{name, value, inline}` dicts (max 25). `color` accepts names "
+        "      (blue/indigo/green/yellow/red/violet/gray/pink) or `#rrggbb`.\n\n"
+        "  When to reach for an embed (non-tabular cases):\n"
+        "    - Confirming a vault write you just did → `embed_callout(\"success\", ...)`.\n"
+        "    - Reporting a warning or list of issues → `embed_callout(\"warning\", ...)`.\n"
+        "    - Reporting an error you can't fix → `embed_callout(\"error\", ...)`.\n"
+        "    - Surfacing or referencing a note → `embed_note(path)`.\n"
+        "    - Presenting a recommendation or decision you'd like Hyun-Min to "
+        "      make → `embed_custom(title=\"Pick one\", fields=[{name:option, "
+        "      value:reasoning} ...])`.\n"
+        "    - Anything that has clear sections / labelled values → "
+        "      `embed_custom` with one field per section.\n"
+        "    - Plain chitchat replies → just text, no embed.\n\n"
+        "  Mechanics:\n"
+        "    Embeds are queued and flushed at the END of your reply (before "
+        "    the completion ping). So: call the tool, then add a short text "
+        "    line like 'Here's today's agenda 👇' or '✅ done'. Don't ALSO "
+        "    paste the same content as markdown — that's duplicate noise.\n\n"
+        "  Clickable note links (IMPORTANT — use these freely):\n"
+        "    Bot messages — INCLUDING your streamed text replies — render "
+        "    masked markdown links `[label](url)`. To save you from "
+        "    constructing `obsidian://open?vault=...&file=...` URLs by hand, "
+        "    the bot has a renderer that auto-converts Obsidian wikilink "
+        "    syntax into the right masked link. So:\n"
+        "      - To reference a note anywhere — chat text, embed bodies, "
+        "        field values — write `[[path/Note]]` or "
+        "        `[[path/Note|Display Name]]`. The bot rewrites those to "
+        "        clickable links automatically.\n"
+        "      - NEVER paste a raw path like `60_Knowledge/Finance/Foo.md` "
+        "        in prose — it'll show as plain text. Wrap it in `[[ ]]`.\n"
+        "      - When you've just CREATED or UPDATED a specific note and "
+        "        want to surface it visually, also call `embed_note(path)` "
+        "        — that gives you a clickable card with title, excerpt, "
+        "        type/tags/mtime fields, on top of the inline link.\n"
+        "      - Tools `embed_note`, `embed_project_status`, and `embed_event` "
+        "        already set the embed's `url` so the card's TITLE itself "
+        "        is the click target.\n"
+        "      - Inside `embed_callout` / `embed_custom` field values, "
+        "        wikilink syntax works identically — go ahead and write "
+        "        `Replaced the framework in [[60_Knowledge/Finance/Foo|Foo]]` "
+        "        and trust the renderer.\n\n"
+        "Discord markdown limits & how to handle them:\n\n"
+        "  TABLES — Discord does NOT render `| col | col |` pipe tables; they "
+        "show as literal pipes and look broken. NEVER use the `| pipe | "
+        "syntax |`. You have two options for tabular data, depending on the "
+        "shape — pick carefully, the wrong choice looks terrible:\n\n"
+        "  → For SHORT, narrow, plain-ASCII tables (≤ 4 columns of short "
+        "cells, ≤ 40 chars per row), use a fenced code block with manually "
+        "aligned columns:\n"
+        "```\n"
+        "Tool             Status\n"
+        "---------------  -----------------------------------------\n"
+        "daily_agenda     wrong arg count\n"
+        "semantic_search  Ollama unreachable\n"
+        "weekly_summary   ok\n"
+        "```\n"
+        "  CRITICAL — do NOT put emoji inside a code-block table. Emoji are "
+        "rendered with variable width and BREAK the monospace alignment, "
+        "ruining the table. Plain ASCII only inside code blocks. Same goes "
+        "for stars (⭐), check-marks (✅❌), arrows, etc. If you want to "
+        "include emoji in tabular data, use the embed path below instead.\n\n"
+        "  → For LONG-CELLED, MULTI-LINE, OPINIONATED, OR EMOJI-CONTAINING "
+        "tables — rankings, comparisons, pros/cons lists, anything where a "
+        "row has more than ~30 chars of free-form prose — DO NOT use a "
+        "code block. Use `embed_custom` with one field per row instead:\n"
+        "    title = 'Honest take: AI semis ranking'\n"
+        "    fields = [\n"
+        "      {name: '⭐⭐⭐⭐⭐  SK Hynix (HY9H)',\n"
+        "       value: '**Why:** 6x fwd P/E + 72% margins + ...\\n"
+        "               **Skip if:** you hate KRX/Frankfurt access'},\n"
+        "      {name: '⭐⭐⭐⭐⭐  TSMC (TSM)',\n"
+        "       value: '**Why:** Best fundamental biz in the stack ...\\n"
+        "               **Skip if:** Taiwan stress keeps you up'},\n"
+        "      ...\n"
+        "    ]\n"
+        "Discord embed fields handle multi-line values, emoji, and bold "
+        "labels gracefully — they render as a proper card with each row in "
+        "its own section. Use this whenever a row has rich content. Up to "
+        "25 fields per embed.\n\n"
+        "  HEADINGS — `#`/`##`/`###` work and render bigger; deeper levels "
+        "fall back to plain bold.\n"
+        "  IMAGES — no `![](url)` syntax; just paste the URL on its own line "
+        "and Discord auto-embeds a preview.\n"
+        "  WHAT WORKS — **bold**, *italic*, ~~strike~~, `inline`, "
+        "```fenced code``` (with language tag for syntax highlighting), "
+        "> blockquote, `- ` bullets (nest with 2-space indent), `1.` numbered "
+        "lists, `[text](url)` links, `||spoiler||`.\n\n"
+        "Wall-clock context: each user message is prefixed with a "
+        "`[Now: YYYY-MM-DD HH:MM <IANA-tz> (<weekday>)]` line — that's the "
+        "real local time on Hyun-Min's end at the moment he sent the message. "
+        "Trust it over any date you might infer from your own system context "
+        "(which is UTC-ish and will be a day behind in his evening). Use it "
+        "when you reason about 'today', 'tonight', 'tomorrow', etc.\n\n"
         "Timezone convention: when Hyun-Min plans a trip to another "
         "timezone (e.g. Korea), set `timezone: <IANA name>` (e.g. "
         "`Asia/Seoul`) in the frontmatter of each daily note for the "
         "travel days, using `set_frontmatter_field`. The Discord bot "
         "reads this and shifts the morning briefing and evening wrap-up "
         "to fire at 08:00 / 22:00 *local* time wherever he is.\n\n"
+        "Vocab quiz flow (fast, self-graded): when Hyun-Min says 'let's do "
+        "vocab' / 'quiz me' / 'review' / similar, run a session like this — "
+        "NOT one-tool-call-per-answer ping-pong:\n"
+        "  1. Call `vocab_due(language, limit=20)` ONCE at the start. The "
+        "     result has each card's word + reading + meaning. Keep that "
+        "     list in your working memory for the whole session.\n"
+        "  2. Pick the next card. Show ONLY the prompt side (e.g. the word "
+        "     in Korean/Japanese script). Hide the reading + meaning.\n"
+        "  3. Wait for Hyun-Min's answer in chat.\n"
+        "  4. Compare his answer to the stored meaning yourself. Decide:\n"
+        "       - **✅ correct** — exact match, valid synonym, or trivial "
+        "         typo. Even partial-but-clearly-right counts.\n"
+        "       - **❓ close** — right idea but missing nuance, wrong "
+        "         particle/form, or one of multiple meanings.\n"
+        "       - **❌ wrong** — no match, blank, or 'idk'.\n"
+        "  5. Call `vocab_review(language, word, grade=\"correct\"|\"close\""
+        "     |\"wrong\")` — the string form is fine, don't bother with the "
+        "     0-5 SM-2 number.\n"
+        "  6. Reply with: the emoji verdict on its own line (✅ / ❓ / ❌), "
+        "     then the correct answer if not perfect, then immediately the "
+        "     next prompt. Example:\n"
+        "       ✅\n"
+        "       Next: **사과**\n"
+        "     or\n"
+        "       ❓ — close, full meaning: *to be tired (verb 피곤하다)*\n"
+        "       Next: **학교**\n"
+        "  7. Continue until the cached list is empty, then call "
+        "     `vocab_due` again or wrap up with a quick `vocab_review_stats` "
+        "     summary.\n"
+        "Don't ask 'should I grade that as correct?' — judge it yourself "
+        "and move on. Speed is the whole point. If Hyun-Min disagrees with "
+        "your grade he'll say so and you can re-call `vocab_review` with a "
+        "different grade.\n\n"
+        "Precise-time pingbacks: when Hyun-Min says 'ping me at 00:30', "
+        "'remind me in 15 minutes', 'message me at 14:00 tomorrow' — use "
+        "the `schedule_pingback(when, message)` tool, NOT `add_reminder`. "
+        "`add_reminder` is date-granular and fires within a lead window; "
+        "`schedule_pingback` fires at the exact minute via a 30-second poll "
+        "loop in the bot. Accepts `HH:MM`, `+15m`, `+2h`, or ISO 8601. "
+        "If you have a `[Now: ...]` line on the message, use it as ground "
+        "truth for resolving relative times — don't guess from your "
+        "internal date sense. Use `list_pingbacks` / `cancel_pingback` to "
+        "inspect or cancel pending ones.\n\n"
         "Per-event ping lead time: the Discord bot pings 15 minutes "
         "before an event by default. For events that need a longer "
         "head-start (travel to another city, packing before a trip, "
@@ -311,6 +519,50 @@ def _load_system_prompt() -> str | None:
         " - Image you can see directly → use the Read tool to view the "
         "   image and infer what it is, then file appropriately.\n"
         " - When unsure where it goes, ask in chat rather than guessing.\n\n"
+        "Updating an existing note — append vs edit-in-place (IMPORTANT):\n"
+        "When Hyun-Min asks you to add information to a note, your default "
+        "should NOT be `append_to_note` — that tool only makes sense for "
+        "chronological / log-style notes. For everything else, find the "
+        "right section and update it in place. Concrete rules:\n\n"
+        "  Append-to-end is correct only for:\n"
+        "    - Daily notes (`30_Episodic/YYYY/YYYY-MM-DD.md`).\n"
+        "    - Weekly notes (`30_Episodic/YYYY/Weekly/...`).\n"
+        "    - Stream-of-consciousness logs / journals where order = time.\n\n"
+        "  For knowledge / reference / project / research notes:\n"
+        "    1. `read_note(path)` first to see the existing structure.\n"
+        "    2. Decide where the new info belongs in that structure:\n"
+        "        - Refining an existing section's data (e.g. updating "
+        "          numbers in a paragraph, adding rows to an existing "
+        "          table, replacing an outdated table with the new one) → "
+        "          `update_section(path, heading, new_body, mode=\"replace\")`.\n"
+        "        - Adding a new paragraph to a section that's already there → "
+        "          `update_section(path, heading, new_body, mode=\"append\")`.\n"
+        "        - Adding a genuinely new top-level section that belongs in "
+        "          the middle (e.g. a new analysis between two existing "
+        "          sections) → `read_note`, edit in memory at the right "
+        "          location, `write_note` with `overwrite=True`.\n"
+        "        - Replacing a specific verbatim string → "
+        "          `replace_in_vault_text_file`.\n"
+        "    3. NEVER produce duplicate sections. If the note already has "
+        "       `## Final Ranking` and Hyun-Min asks for an updated ranking, "
+        "       REPLACE the existing section's body — don't add `## Updated "
+        "       Ranking` further down. Two versions of the same thing is "
+        "       worse than one good version.\n"
+        "    4. Tables specifically: locate the existing table in the note, "
+        "       use `update_section` with `mode=\"replace\"` to swap it for "
+        "       the refined version. Don't write a parallel \"updated\" "
+        "       table elsewhere.\n"
+        "    5. `## Related Notes` is ALWAYS the terminal section. Never "
+        "       add content AFTER it. New facts, tickets, decisions, etc. "
+        "       belong in an existing section higher up (Details, Logistics, "
+        "       Notes, …) or as a new section inserted BEFORE Related Notes "
+        "       — not appended at the very end of the file. Same rule "
+        "       applies to `## Sources` and `## Tasks` if they are the "
+        "       structural footer of a note.\n"
+        "    6. New facts about a person → integrate into the existing "
+        "       `## Details` / `## Notes` / `## Background` section of "
+        "       their profile via `update_section(mode=\"append\")`. Don't "
+        "       create a new `## Facts` block at the bottom.\n\n"
         "When to write to the vault on your own initiative:\n"
         " - **Concrete facts with a time/place** — calendar invites, "
         "   appointments, meetings, travel bookings — write them IMMEDIATELY "
@@ -424,8 +676,24 @@ async def _log_channel_message(message: discord.Message) -> None:
     if client.user is None:
         return
     content = (message.content or "")
+    # If a message has no text content BUT has embeds (e.g. one of Iris's
+    # proactive ping cards), synthesise a content line from the embed so
+    # fetch_discord_history can surface it later. Without this, every
+    # embed-based message is invisible to the history tool.
     if not content.strip():
-        return
+        if not message.embeds:
+            return
+        e0 = message.embeds[0]
+        synth_parts: list[str] = []
+        if e0.title:
+            synth_parts.append(str(e0.title))
+        if e0.description:
+            synth_parts.append(str(e0.description))
+        for f in (e0.fields or [])[:3]:
+            synth_parts.append(f"{f.name}: {f.value}")
+        content = " · ".join(p.strip() for p in synth_parts if p)
+        if not content.strip():
+            return
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     path = HISTORY_DIR / f"{message.channel.id}.jsonl"
     is_iris = message.author.id == client.user.id
@@ -434,7 +702,8 @@ async def _log_channel_message(message: discord.Message) -> None:
         "author_id": message.author.id,
         "author": (message.author.display_name or message.author.name),
         "is_iris": is_iris,
-        "is_proactive": _is_proactive_ping(content.strip(), is_iris),
+        "is_proactive": _is_proactive_ping(content.strip(), is_iris)
+                        or bool(message.embeds and is_iris),
         "content": content,
     }
     try:
@@ -612,7 +881,12 @@ class StreamingReply:
         await self._flush(force=True)
 
     async def _flush(self, force: bool = False) -> None:
-        content = self._buffer
+        # Rewrite Obsidian wikilinks `[[path|alias]]` into clickable masked
+        # links `[alias](obsidian://...)`. Discord renders masked markdown
+        # links in BOT messages (not user messages), so they're clickable
+        # inline. The regex only matches complete `[[…]]` pairs, so partial
+        # links in mid-stream content stay untouched until they're finished.
+        content = strip_wikilinks(self._buffer)
         # Discord caps single-message size at 2000 chars. Split across messages
         # if we've blown past that during the stream.
         if len(content) <= DISCORD_MESSAGE_LIMIT:
@@ -681,6 +955,14 @@ async def _completion_ping(channel: discord.abc.Messageable) -> None:
 
 _sessions: dict[int, ClaudeSDKClient] = {}
 _session_locks: dict[int, asyncio.Lock] = {}
+# Per-channel queue-depth counter (including the one currently being
+# processed). Used so we can show a "queued" reaction on the user's message
+# when their turn isn't right now, and cap runaway spam.
+_session_pending: dict[int, int] = {}
+# Hard cap on how many messages can stack up per channel before we start
+# rejecting new ones. Beyond this Iris would be hopelessly behind and the
+# user is probably mashing the keyboard. Reject loudly, don't silently lose.
+MAX_QUEUE_DEPTH = int(os.environ.get("IRIS_DISCORD_MAX_QUEUE_DEPTH", "5"))
 
 
 def _session_key(message: discord.Message) -> int:
@@ -755,6 +1037,15 @@ def _is_allowed(message: discord.Message) -> bool:
 async def on_ready() -> None:
     log.info("Iris connected as %s (model=%s, vault=%s)",
              client.user, MODEL, VAULT_ROOT)
+    # Visibility: surface the resolved home timezone and what `now` currently
+    # looks like. If HOME_TZ silently fell back to UTC because the IANA name
+    # was unknown, this is the line that'll make it obvious.
+    if HOME_TZ.key != HOME_TZ_NAME:
+        log.warning(
+            "TZ env was %r but resolved to %s — tzdata may be missing or the name is invalid",
+            HOME_TZ_NAME, HOME_TZ.key,
+        )
+    log.info("home TZ: %s — now=%s", HOME_TZ.key, _now_local().isoformat(timespec="seconds"))
     if ALLOWED_CHANNELS:
         log.info("restricted to channels: %s", sorted(ALLOWED_CHANNELS))
     if ALLOWED_USERS:
@@ -775,12 +1066,16 @@ async def on_ready() -> None:
         )
         log.info("home TZ: %s — active TZ now: %s", HOME_TZ_NAME, active_tz)
         if NOTIFY_MORNING_AT != "off":
-            log.info("morning briefing at %s daily (in active TZ)", NOTIFY_MORNING_AT)
+            log.info("morning briefing at %s daily (grace %d min, active TZ)",
+                     NOTIFY_MORNING_AT, NOTIFY_MORNING_GRACE_MIN)
         if NOTIFY_EVENING_AT != "off":
-            log.info("evening wrap-up at %s daily (in active TZ)", NOTIFY_EVENING_AT)
+            log.info("evening wrap-up at %s daily (grace %d min, active TZ)",
+                     NOTIFY_EVENING_AT, NOTIFY_EVENING_GRACE_MIN)
         client.loop.create_task(_notification_loop())
         client.loop.create_task(_scheduled_briefings_loop())
         client.loop.create_task(_snooze_replay_loop())
+        client.loop.create_task(_pingback_loop())
+        client.loop.create_task(_embed_queue_loop())
 
 
 # ── Proactive notification loop ─────────────────────────────────────────────
@@ -792,17 +1087,31 @@ def _load_json(path: Path, default):
         return default
     try:
         return json.loads(path.read_text())
-    except Exception:
+    except (OSError, json.JSONDecodeError) as e:
+        # Don't silently swallow — corruption in _notified.json would cause
+        # every today-event to re-ping on the next scan, and the symptom
+        # ("Iris pinged me 12 times") would be miles from the root cause.
+        log.warning("corrupt JSON at %s (%s) — resetting to default", path, e)
         return default
 
 
-def _load_notified() -> set[str]:
-    return set(_load_json(NOTIFIED_PATH, {}).get("keys", []))
+def _load_notified() -> dict[str, None]:
+    """Load the dedupe set as an order-preserving dict (key→None).
+
+    Backed by dict because Python guarantees insertion order, so FIFO
+    eviction in ``_save_notified`` actually keeps the *most recent* 1000
+    entries — vs the previous ``set`` whose iteration order was unspecified,
+    which could evict a just-added key and re-ping the same event."""
+    keys = _load_json(NOTIFIED_PATH, {}).get("keys", [])
+    return dict.fromkeys(keys)
 
 
-def _save_notified(keys: set[str]) -> None:
+def _save_notified(keys: dict[str, None]) -> None:
+    """Persist the dedupe state. Trims to the most recent 1000 entries by
+    insertion order (since ``keys`` is a dict, not a set)."""
     NOTIFIED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    recent = list(keys)[-1000:]
+    # Order-preserving — last 1000 keys inserted survive.
+    recent = list(keys.keys())[-1000:]
     NOTIFIED_PATH.write_text(json.dumps({
         "keys": recent,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -822,7 +1131,10 @@ def _save_snoozed(items: list[dict]) -> None:
     }))
 
 
-_notified: set[str] = set()
+# Order-preserving dedupe map (key → None). Dict, not set, so trimming to
+# 1000 entries in _save_notified keeps the most-recent insertions and doesn't
+# silently evict a key we just added.
+_notified: dict[str, None] = {}
 # Track last-fire dates for scheduled briefings so they don't repeat on the
 # same day if the bot restarts.
 _last_morning_fired: str = ""
@@ -872,6 +1184,22 @@ def _minutes_until(target_time: str, today_iso: str) -> float | None:
     return (target - now).total_seconds() / 60
 
 
+def _minutes_past_target(target_time: str, now: datetime) -> float | None:
+    """Minutes elapsed since ``HH:MM`` today (negative if still in the future).
+
+    Returns None if ``target_time`` is malformed.
+    """
+    if not target_time or ":" not in target_time:
+        return None
+    try:
+        hh, mm = target_time.split(":")[:2]
+        target = now.replace(hour=int(hh), minute=int(mm),
+                             second=0, microsecond=0)
+    except ValueError:
+        return None
+    return (now - target).total_seconds() / 60
+
+
 async def _check_events(conn: sqlite3.Connection) -> None:
     today = _now_local().date().isoformat()
     rows = conn.execute(
@@ -890,22 +1218,47 @@ async def _check_events(conn: sqlite3.Connection) -> None:
         key = f"event:{r['date']}:{r['time']}:{r['title']}"
         if key in _notified:
             continue
-        _notified.add(key)
-        loc = f" @ {r['location']}" if r["location"] else ""
-        end = f"–{r['end_time']}" if r["end_time"] else ""
-        msg = (
-            f"⏰ **{r['title']}** in {int(round(minutes_to_go))} min — "
-            f"{r['time']}{end}{loc}"
-        )
-        if r["location"] and not _looks_like_url(r["location"]):
+        # Persist the key BEFORE awaiting the fire — at-most-once semantics.
+        # If the fire crashes we accept losing that ping; better than the
+        # alternative where a mid-fire crash leaves the in-memory set holding
+        # a key that never made it to disk, so the next scan re-pings.
+        _notified[key] = None
+        _save_notified(_notified)
+        await _fire_event_embed(r, int(round(minutes_to_go)))
+
+
+async def _fire_event_embed(row, minutes_to_go: int) -> None:
+    """Build + send a rich embed for an upcoming event ping. Color shifts
+    red as the event gets closer, yellow further out."""
+    if PING_CHANNEL == 0:
+        return
+    color = COLOR_RED if minutes_to_go <= 15 else COLOR_YELLOW
+    end = row["end_time"] or ""
+    when_line = f"{row['time']}" + (f"–{end}" if end else "")
+    fields: list[dict] = [
+        {"name": "🕐 In", "value": f"**{minutes_to_go} min** ({when_line})", "inline": True},
+    ]
+    if row["location"]:
+        fields.append({"name": "📍 Where", "value": row["location"], "inline": True})
+        if not _looks_like_url(row["location"]):
             maps_url = (
                 "https://www.google.com/maps/search/?api=1&query="
-                + quote_plus(r["location"])
+                + quote_plus(row["location"])
             )
-            # No angle brackets — let Discord render the embed/preview card.
-            msg += f"\n🗺️ {maps_url}"
-        await _send_ping(msg)
-    _save_notified(_notified)
+            fields.append({"name": "🗺️ Map", "value": maps_url, "inline": False})
+    if row["description"]:
+        desc = row["description"]
+        if len(desc) > 1020:
+            desc = desc[:1017] + "…"
+        fields.append({"name": "📝 Notes", "value": desc, "inline": False})
+    embed = {
+        "title": f"⏰ {row['title']}",
+        "color": color,
+        "fields": fields,
+        "footer": f"event · {row['date']}",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    await _send_embed_payload(PING_CHANNEL, embed)
 
 
 async def _check_reminders(conn: sqlite3.Connection) -> None:
@@ -930,17 +1283,75 @@ async def _check_reminders(conn: sqlite3.Connection) -> None:
             key = f"rem:{r['remind_on']}:{hhmm}:{clean}"
             if key in _notified:
                 continue
-            _notified.add(key)
-            await _send_ping(
-                f"🔔 **Reminder** in {int(round(minutes_to_go))} min — {clean}"
+            _notified[key] = None
+            _save_notified(_notified)
+            await _fire_reminder_embed(
+                clean, int(round(minutes_to_go)),
+                at_time=hhmm, note_path=r["note_path"],
             )
         else:
             key = f"rem-allday:{r['remind_on']}:{text}"
             if key in _notified:
                 continue
-            _notified.add(key)
-            await _send_ping(f"🔔 **Reminder today** — {text}")
-    _save_notified(_notified)
+            _notified[key] = None
+            _save_notified(_notified)
+            await _fire_reminder_embed(
+                text, minutes_to_go=None, at_time=None,
+                note_path=r["note_path"],
+            )
+
+
+async def _replay_snoozed(item: dict) -> None:
+    """Resend a snoozed item. Preserves the original embed (if any) and
+    prefixes the title with 💤 so it's visually marked as a replay."""
+    if PING_CHANNEL == 0:
+        return
+    embed_dict = item.get("embed")
+    content = item.get("content") or ""
+    if embed_dict:
+        # Annotate the title so the user sees this is a snoozed replay.
+        orig_title = embed_dict.get("title") or ""
+        if not orig_title.startswith("💤"):
+            embed_dict = dict(embed_dict)
+            embed_dict["title"] = f"💤 {orig_title}".strip()[:256]
+        await _send_embed_payload(PING_CHANNEL, embed_dict)
+    elif content:
+        await _send_ping(f"💤 (snoozed) {content}")
+    else:
+        await _send_ping("💤 (snoozed reminder)")
+
+
+async def _fire_reminder_embed(
+    text: str,
+    minutes_to_go: int | None,
+    at_time: str | None,
+    note_path: str | None,
+) -> None:
+    if PING_CHANNEL == 0:
+        return
+    if minutes_to_go is not None and at_time:
+        title = f"🔔 Reminder in {minutes_to_go} min"
+        fields = [
+            {"name": "🕐 At", "value": at_time, "inline": True},
+            {"name": "📝 What", "value": text or "(no text)", "inline": False},
+        ]
+        color = COLOR_RED if minutes_to_go <= 15 else COLOR_PINK
+    else:
+        title = "🔔 Reminder today"
+        fields = [
+            {"name": "📝 What", "value": text or "(no text)", "inline": False},
+        ]
+        color = COLOR_PINK
+    if note_path:
+        fields.append({"name": "🔗 Source", "value": f"`{note_path}`", "inline": False})
+    embed = {
+        "title": title,
+        "color": color,
+        "fields": fields,
+        "footer": "reminder",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    await _send_embed_payload(PING_CHANNEL, embed)
 
 
 # ── Scheduled morning briefing + evening wrap-up ────────────────────────────
@@ -953,6 +1364,41 @@ async def _scheduled_briefings_loop() -> None:
     """
     global _last_morning_fired, _last_evening_fired
     await asyncio.sleep(10)
+    # On startup: if a briefing's scheduled time has already passed today AND
+    # we're past the grace window, mark it as "already fired" so we don't
+    # replay the morning brief at 3pm. Within the grace window, leave the
+    # state untouched — the main loop will fire it on the next tick.
+    try:
+        startup_now = _now_local()
+        startup_today = startup_now.date().isoformat()
+        for label, at, grace, last_var in (
+            ("morning", NOTIFY_MORNING_AT, NOTIFY_MORNING_GRACE_MIN, "_last_morning_fired"),
+            ("evening", NOTIFY_EVENING_AT, NOTIFY_EVENING_GRACE_MIN, "_last_evening_fired"),
+        ):
+            if at == "off":
+                continue
+            past_min = _minutes_past_target(at, startup_now)
+            if past_min is None or past_min < 0:
+                # Hasn't happened yet today — normal scheduled flow handles it.
+                continue
+            if past_min <= grace:
+                log.info(
+                    "%s briefing within grace window (%.0f min past %s, grace=%d) "
+                    "— will fire on next tick",
+                    label, past_min, at, grace,
+                )
+                # Don't touch _last_*_fired — main loop will trigger it.
+            else:
+                if last_var == "_last_morning_fired":
+                    _last_morning_fired = startup_today
+                else:
+                    _last_evening_fired = startup_today
+                log.info(
+                    "%s briefing missed (%.0f min past %s > grace %d) — suppressed for today",
+                    label, past_min, at, grace,
+                )
+    except Exception:
+        log.exception("scheduled briefings startup-suppress")
     while not client.is_closed():
         try:
             now = _now_local()
@@ -974,23 +1420,285 @@ async def _scheduled_briefings_loop() -> None:
 
 
 async def _fire_morning_briefing() -> None:
+    if PING_CHANNEL == 0:
+        return
     try:
         from _iris.tools.routines import morning_briefing
         text = await asyncio.to_thread(morning_briefing, "today")
     except Exception as e:
         log.warning("morning_briefing failed: %s", e)
         return
-    await _send_ping(f"🌅 **Good morning!** Here's your day:\n\n{text}")
+    title, intro, fields = _parse_md_sections(text)
+    if not title or not title.startswith(("🌅", "Good", "Briefing")):
+        title = f"🌅 {title or 'Morning brief'}"
+    embed = {
+        "title": title[:256],
+        "description": intro[:4096] if intro else None,
+        "color": COLOR_BLUE,
+        "fields": fields,
+        "footer": "morning_briefing",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    await _send_embed_payload(PING_CHANNEL, embed)
 
 
 async def _fire_evening_wrapup() -> None:
+    if PING_CHANNEL == 0:
+        return
     try:
         from _iris.tools.calendar import evening_wrapup
         text = await asyncio.to_thread(evening_wrapup, "today")
     except Exception as e:
         log.warning("evening_wrapup failed: %s", e)
         return
-    await _send_ping(f"🌙 **Evening wrap-up** — \n\n{text}")
+    title, intro, fields = _parse_md_sections(text)
+    if not title or not title.startswith(("🌙", "Evening", "Wrap")):
+        title = f"🌙 {title or 'Evening wrap-up'}"
+    embed = {
+        "title": title[:256],
+        "description": intro[:4096] if intro else None,
+        "color": COLOR_INDIGO,
+        "fields": fields,
+        "footer": "evening_wrapup",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    await _send_embed_payload(PING_CHANNEL, embed)
+
+
+# ── Embed builders + queue (rich Discord embeds for pings + tool output) ───
+# Two paths feed into _send_embed_payload:
+#   1. Proactive (this process): _fire_morning_briefing etc. build a payload
+#      directly and skip the queue.
+#   2. MCP-tool-driven (Iris's session subprocess): the embed_* MCP tools
+#      write a JSON line to the queue file; this loop polls + sends.
+# Same builder is used by both so the visual stays identical.
+
+
+@contextlib.contextmanager
+def _flocked(path: Path):
+    """Exclusive file lock on ``path`` (creates if missing). Used to
+    serialise the read-then-rewrite of queue files between the bot process
+    and any MCP subprocess that's appending. Without this, an append between
+    our read and our rewrite-with-empty disappears silently — losing the
+    embed/pingback entry. ``fcntl.flock`` is advisory; both sides have to
+    take the lock for it to help. The MCP-side ``_enqueue_embed`` / pingback
+    writer use the same helper (see ``_iris/tools/discord.py``)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+# Pure embed helpers live in bot_embeds.py — colors, section parser, the
+# dict→discord.Embed builder. Anything that needs the live `client` (sending,
+# queue drain, queue loop) stays below in this file.
+from bot_embeds import (
+    COLOR_BLUE,
+    COLOR_INDIGO,
+    COLOR_GREEN,
+    COLOR_YELLOW,
+    COLOR_RED,
+    COLOR_VIOLET,
+    COLOR_GRAY,
+    COLOR_PINK,
+    parse_md_sections as _parse_md_sections,
+    dict_to_embed as _dict_to_embed,
+    embed_queue_path as _embed_queue_path,
+    strip_wikilinks,
+)
+
+
+_EMBED_QUEUE = _embed_queue_path()
+
+
+async def _send_embed_payload(
+    channel_id: int,
+    embed_dict: dict,
+    content: str = "",
+) -> None:
+    """Build a discord.Embed and send it. Used by both proactive + queue paths."""
+    if not channel_id:
+        return
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except discord.HTTPException as e:
+            log.warning("embed: could not fetch channel %s: %s", channel_id, e)
+            return
+    try:
+        embed = _dict_to_embed(embed_dict)
+        await channel.send(content=content or None, embed=embed)  # type: ignore[union-attr]
+    except discord.HTTPException as e:
+        log.warning("embed: send failed: %s", e)
+
+
+async def _embed_queue_loop() -> None:
+    """Poll the embed queue every ~1 s. Faster than pingbacks because users
+    are usually waiting on these (they're triggered mid-conversation)."""
+    await asyncio.sleep(5)
+    while not client.is_closed():
+        try:
+            if _EMBED_QUEUE.exists():
+                await _drain_embed_queue()
+        except Exception:
+            log.exception("embed queue loop")
+        await asyncio.sleep(1)
+
+
+async def _drain_embed_queue() -> int:
+    """Read every entry, send each, rewrite empty. Returns count sent.
+
+    The read-then-rewrite is guarded by an advisory file lock so an MCP
+    subprocess appending mid-drain doesn't get its line silently wiped out
+    when we rewrite-with-empty. The lock is released before we await on
+    Discord HTTP so we don't block tool calls during a slow send.
+    """
+    entries: list[dict] = []
+    try:
+        with _flocked(_EMBED_QUEUE):
+            if not _EMBED_QUEUE.exists():
+                return 0
+            try:
+                raw_lines = _EMBED_QUEUE.read_text(encoding="utf-8").splitlines()
+            except OSError as e:
+                log.warning("embed: queue read failed: %s", e)
+                return 0
+            for line in raw_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            if not entries:
+                return 0
+            # Rewrite empty INSIDE the lock so any subprocess appending after
+            # our read but before the truncate has to wait (its append goes
+            # into a fresh file after we release).
+            try:
+                tmp = _EMBED_QUEUE.with_suffix(".jsonl.tmp")
+                tmp.write_text("", encoding="utf-8")
+                tmp.replace(_EMBED_QUEUE)
+            except OSError as e:
+                log.warning("embed: queue rewrite failed: %s", e)
+                return 0
+    except OSError as e:
+        log.warning("embed: queue lock failed: %s", e)
+        return 0
+    sent = 0
+    for entry in entries:
+        try:
+            await _send_embed_payload(
+                int(entry.get("channel_id") or 0),
+                entry.get("embed") or {},
+                entry.get("content") or "",
+            )
+            sent += 1
+            log.info("embed fired: id=%s → #%s", entry.get("id"), entry.get("channel_id"))
+        except Exception:
+            log.exception("embed: send failed for %s", entry.get("id"))
+    return sent
+
+
+# ── Precise-time pingbacks (queued via the MCP schedule_pingback tool) ─────
+# Iris writes one JSON line per scheduled ping into this file; the loop below
+# fires anything whose `at` is due and rewrites the file without those entries.
+# Lives next to the per-channel history logs so it shares the persistent volume.
+
+_PINGBACK_QUEUE = HISTORY_DIR.parent / "pending_pings.jsonl"
+
+
+async def _pingback_loop() -> None:
+    """Every ~30 s: read pending pingbacks, fire due ones, drop them from the file.
+
+    The queue file is the canonical state — surviving restarts since it's on
+    the /claude-auth volume. We treat I/O failures as transient and retry on
+    the next tick.
+    """
+    await asyncio.sleep(8)
+    while not client.is_closed():
+        try:
+            if _PINGBACK_QUEUE.exists():
+                await _process_pingback_queue()
+        except Exception:
+            log.exception("pingback loop")
+        await asyncio.sleep(30)
+
+
+async def _process_pingback_queue() -> None:
+    # Guarded read-then-rewrite (see _drain_embed_queue rationale).
+    due: list[dict] = []
+    try:
+        with _flocked(_PINGBACK_QUEUE):
+            if not _PINGBACK_QUEUE.exists():
+                return
+            try:
+                raw_lines = _PINGBACK_QUEUE.read_text(encoding="utf-8").splitlines()
+            except OSError as e:
+                log.warning("pingback: queue read failed: %s", e)
+                return
+            now = datetime.now(timezone.utc)
+            keep: list[str] = []
+            for line in raw_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    at = datetime.fromisoformat(entry["at"])
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue  # corrupt line, drop it
+                if at.tzinfo is None:
+                    at = at.replace(tzinfo=timezone.utc)
+                if at <= now:
+                    due.append(entry)
+                else:
+                    keep.append(line)
+            if not due:
+                return
+            try:
+                tmp = _PINGBACK_QUEUE.with_suffix(".jsonl.tmp")
+                tmp.write_text(("\n".join(keep) + "\n") if keep else "", encoding="utf-8")
+                tmp.replace(_PINGBACK_QUEUE)
+            except OSError as e:
+                log.warning("pingback: queue rewrite failed: %s", e)
+                return
+    except OSError as e:
+        log.warning("pingback: queue lock failed: %s", e)
+        return
+    for entry in due:
+        try:
+            await _send_pingback(entry)
+        except Exception:
+            log.exception("pingback: send failed for %s", entry.get("id"))
+
+
+async def _send_pingback(entry: dict) -> None:
+    channel_id = int(entry.get("channel_id") or 0)
+    message = (entry.get("message") or "").strip()
+    if not channel_id or not message:
+        return
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except discord.HTTPException as e:
+            log.warning("pingback: could not fetch channel %s: %s", channel_id, e)
+            return
+    body = f"🔔 {message}"
+    try:
+        await channel.send(body)  # type: ignore[union-attr]
+        log.info("pingback fired: id=%s → #%s", entry.get("id"), channel_id)
+    except discord.HTTPException as e:
+        log.warning("pingback: send failed for %s: %s", entry.get("id"), e)
 
 
 # ── Snooze: reactions on Iris's pings re-send after a delay ────────────────
@@ -1012,9 +1720,7 @@ async def _snooze_replay_loop() -> None:
                 except (KeyError, ValueError):
                     continue
                 if now >= resend_at:
-                    await _send_ping(
-                        f"💤 (snoozed) {item.get('content', '(no content)')}"
-                    )
+                    await _replay_snoozed(item)
                 else:
                     still_pending.append(item)
             if len(still_pending) != len(items):
@@ -1044,10 +1750,20 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         return
     if message.author.id != (client.user.id if client.user else 0):
         return
+    # Capture both content AND the first embed (if any) so the replay
+    # preserves the visual. Embeds-based pings have empty .content; we'd
+    # otherwise replay "💤 (snoozed) (no content)" which is useless.
+    embed_dict: dict | None = None
+    if message.embeds:
+        try:
+            embed_dict = message.embeds[0].to_dict()
+        except Exception:  # noqa: BLE001 — discord.py rarely throws here
+            embed_dict = None
     items = _load_snoozed()
     items.append({
         "resend_at": (_now_local() + timedelta(minutes=minutes)).isoformat(timespec="seconds"),
         "content": message.content,
+        "embed": embed_dict,
         "snoozed_by": payload.user_id,
         "original_message_id": payload.message_id,
     })
@@ -1086,15 +1802,27 @@ async def _send_ping(content: str) -> None:
     if remaining:
         chunks.append(remaining)
 
+    # Don't abandon remaining chunks if one fails — a transient 429 / network
+    # blip on chunk 2 of 5 shouldn't lose chunks 3-5 forever. Track failures
+    # and report at the end so the log reflects what actually happened.
+    sent_ok = 0
+    failed = 0
     for i, chunk in enumerate(chunks):
         try:
             await channel.send(chunk)  # type: ignore[union-attr]
+            sent_ok += 1
         except discord.HTTPException as e:
-            log.warning("ping send failed: %s", e)
-            return
-    log.info("ping → #%s (%s chunks): %s",
-             getattr(channel, "name", PING_CHANNEL), len(chunks),
-             content[:80].replace("\n", " "))
+            failed += 1
+            log.warning("ping chunk %d/%d send failed: %s — continuing",
+                        i + 1, len(chunks), e)
+    if failed:
+        log.warning("ping → #%s: %d sent, %d failed of %d chunks",
+                    getattr(channel, "name", PING_CHANNEL),
+                    sent_ok, failed, len(chunks))
+    else:
+        log.info("ping → #%s (%s chunks): %s",
+                 getattr(channel, "name", PING_CHANNEL), len(chunks),
+                 content[:80].replace("\n", " "))
 
 
 def _is_reply_to_bot(message: discord.Message) -> bool:
@@ -1163,39 +1891,87 @@ async def on_message(message: discord.Message) -> None:
     if not content:
         return
 
+    # Prepend a wall-clock anchor so Claude always knows the actual local
+    # time + day-of-week, not just the UTC date from its system context.
+    # Cheap (~30 tokens) and prevents the "Iris thinks it's still yesterday
+    # late at night" bug.
+    content = f"{_now_context_block()}\n{content}"
+
     key = _session_key(message)
     lock = await _get_lock(key)
-    if lock.locked():
-        # Don't queue parallel queries in the same channel; tell the user.
-        await message.reply("⏳ Still working on the previous message — give me a sec.")
-        return
 
-    async with lock:
-        async with message.channel.typing():
-            placeholder = await message.reply("…")
-            stream = StreamingReply(placeholder)
+    # Per-channel message queue. asyncio.Lock is FIFO since Python 3.7, so we
+    # can rely on the natural waiter ordering to process messages in arrival
+    # order. We just need to (a) cap how deep the queue can get to prevent
+    # abuse, and (b) give the user a visual cue that their message is queued
+    # so they don't think it got dropped.
+    pending = _session_pending.get(key, 0)
+    if pending >= MAX_QUEUE_DEPTH:
+        # Hard reject — the queue is already full enough that processing all
+        # of it would take a long time. Better to drop loudly than silently.
+        await message.reply(
+            f"⏳ Queue is full ({pending} pending) — give me a moment to "
+            "catch up, then try again."
+        )
+        return
+    # Increment INSIDE the try block below so the finally always decrements,
+    # even if add_reaction or the lock await raises a non-HTTPException
+    # (e.g. CancelledError on bot shutdown).
+    queued = lock.locked()
+
+    try:
+        _session_pending[key] = pending + 1
+        if queued:
+            # Visual ack so the user knows the message wasn't lost.
             try:
-                agent = await _get_or_create_client(key, seed_message=message)
-                await agent.query(content)
-                async for msg in agent.receive_response():
-                    if isinstance(msg, AssistantMessage):
-                        for block in msg.content:
-                            if isinstance(block, TextBlock):
-                                await stream.append(block.text)
-                await stream.finalize()
-                # Fire-and-forget completion ping so Discord plays its
-                # normal new-message notification sound. The placeholder
-                # was only edited during streaming, which Discord doesn't
-                # notify on. Auto-deletes after TTL to keep the channel clean.
-                # _fire_and_forget pins the task so it isn't GC'd mid-flight.
-                if COMPLETION_PING_ENABLED:
-                    _fire_and_forget(_completion_ping(message.channel))
-            except Exception as e:
-                log.exception("query failed")
+                await message.add_reaction("📥")
+            except discord.HTTPException:
+                pass
+        async with lock:
+            if queued:
+                # We've reached the front of the queue — replace the
+                # "queued" hourglass with a "now processing" mark.
                 try:
-                    await placeholder.edit(content=f"❌ Error: {e}")
+                    await message.remove_reaction("📥", client.user)
                 except discord.HTTPException:
                     pass
+            async with message.channel.typing():
+                placeholder = await message.reply("…")
+                stream = StreamingReply(placeholder)
+                try:
+                    agent = await _get_or_create_client(key, seed_message=message)
+                    await agent.query(content)
+                    async for msg in agent.receive_response():
+                        if isinstance(msg, AssistantMessage):
+                            for block in msg.content:
+                                if isinstance(block, TextBlock):
+                                    await stream.append(block.text)
+                    await stream.finalize()
+                    # Drain any embed-queue entries Iris produced during this turn
+                    # BEFORE the completion ping fires, so visual order is:
+                    #   [text reply]  →  [embed cards]  →  [✓ completion ping]
+                    try:
+                        if _EMBED_QUEUE.exists():
+                            await _drain_embed_queue()
+                    except Exception:
+                        log.exception("embed drain on reply finalize")
+                    # Fire-and-forget completion ping so Discord plays its
+                    # normal new-message notification sound. The placeholder
+                    # was only edited during streaming, which Discord doesn't
+                    # notify on. Auto-deletes after TTL to keep the channel clean.
+                    # _fire_and_forget pins the task so it isn't GC'd mid-flight.
+                    if COMPLETION_PING_ENABLED:
+                        _fire_and_forget(_completion_ping(message.channel))
+                except Exception as e:
+                    log.exception("query failed")
+                    try:
+                        await placeholder.edit(content=f"❌ Error: {e}")
+                    except discord.HTTPException:
+                        pass
+    finally:
+        # Always decrement, even if processing raised. Otherwise a single bad
+        # turn would leak depth and eventually hit MAX_QUEUE_DEPTH forever.
+        _session_pending[key] = max(0, _session_pending.get(key, 1) - 1)
 
 
 # ── Graceful shutdown ────────────────────────────────────────────────────────

@@ -235,7 +235,7 @@ def vocab_due(language: str = "", limit: int = 20) -> str:
 
 
 @mcp.tool()
-def vocab_review(language: str, word: str, grade: int) -> str:
+def vocab_review(language: str, word: str, grade) -> str:
     """Record a review of a vocabulary card and schedule the next one.
 
     Updates the card's SM-2 state and computes ``due_at = today + interval``.
@@ -243,16 +243,40 @@ def vocab_review(language: str, word: str, grade: int) -> str:
     Args:
         language: ISO-639-1 code (e.g. "ko").
         word: The card's canonical written form (kanji / hangul / etc.).
-        grade: 0–5 self-assessment of recall.
-            5 perfect · 4 correct with hesitation · 3 correct with effort
-            2 wrong but familiar · 1 saw it before · 0 total blank.
+        grade: Recall quality. Accepts either:
+            * **Integer 0–5** (raw SM-2):
+                5 perfect · 4 correct with hesitation · 3 correct with effort
+                2 wrong but familiar · 1 saw it before · 0 total blank.
+            * **Shorthand string** — call this in chat-quiz mode:
+                ``"correct"`` / ``"✅"`` / ``"✓"`` / ``"yes"``      → 5
+                ``"hesitant"`` / ``"hesitation"``                  → 4
+                ``"close"`` / ``"❓"`` / ``"?"`` / ``"almost"``      → 3
+                ``"wrong"`` / ``"❌"`` / ``"✗"`` / ``"no"`` / ``"blank"`` → 1
+                ``"skip"``                                         → 0
             ≥3 advances the card; <3 resets the interval.
     """
+    # Coerce text/emoji grades to int.
+    _GRADE_ALIASES = {
+        "5": 5, "correct": 5, "✅": 5, "✓": 5, "yes": 5, "perfect": 5, "right": 5,
+        "4": 4, "hesitant": 4, "hesitation": 4,
+        "3": 3, "close": 3, "❓": 3, "?": 3, "almost": 3, "near": 3, "effort": 3,
+        "2": 2, "wrong-familiar": 2,
+        "1": 1, "wrong": 1, "❌": 1, "✗": 1, "saw": 1,
+        # "no" → 0 (blank) not 1 (saw-it-before): in a quiz, "no" usually
+        # means "I have no recollection", which is closer to a true blank
+        # than to "I've seen this word once but can't recall it".
+        "0": 0, "blank": 0, "skip": 0, "no": 0, "idk": 0, "dunno": 0,
+    }
     if not isinstance(grade, int):
-        try:
-            grade = int(grade)
-        except (TypeError, ValueError):
-            return "err: grade must be an integer 0–5"
+        key = str(grade or "").strip().lower()
+        if key in _GRADE_ALIASES:
+            grade = _GRADE_ALIASES[key]
+        else:
+            try:
+                grade = int(key)
+            except (TypeError, ValueError):
+                return (f"err: grade must be 0–5 or one of "
+                        f"correct/close/wrong (got {grade!r})")
     if grade < 0 or grade > 5:
         return "err: grade must be 0–5"
     idx = get_vault_index()
@@ -279,10 +303,15 @@ def vocab_review(language: str, word: str, grade: int) -> str:
          row["id"]),
     )
     c.commit()
-    verdict = "passed" if grade >= 3 else "failed (reset)"
+    if grade >= 4:
+        verdict = "✅ correct"
+    elif grade == 3:
+        verdict = "❓ close"
+    else:
+        verdict = "❌ wrong (reset)"
     return (
-        f"ok {language}:{word} — {verdict}. Next due {due} "
-        f"(interval {new_interval}d, ef {new_ease:.2f}, reps {new_reps})."
+        f"{verdict} · {language}:{word} · next {due} "
+        f"(interval {new_interval}d, ef {new_ease:.2f}, reps {new_reps})"
     )
 
 

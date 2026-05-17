@@ -3,3 +3,10 @@
 
 discord.py>=2.4
 claude-agent-sdk>=0.0.18
+# Python tzdata fallback. The system `tzdata` apt package SHOULD make
+# zoneinfo work on Linux, but if its layout differs from what zoneinfo
+# expects, ZoneInfo("Europe/Zurich") silently returns nothing and we fall
+# back to UTC — wrecking morning briefings, event pings, and the [Now:] tag.
+# This PyPI package ships the IANA tz database in zoneinfo's canonical
+# format, so it's always findable regardless of the host distro.
+tzdata>=2025.1

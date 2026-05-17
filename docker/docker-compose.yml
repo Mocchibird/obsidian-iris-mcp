@@ -50,10 +50,16 @@ services:
       # Container's system timezone — affects logs and any naive datetime use.
       # The bot ALSO supports per-day timezone overrides via daily-note
       # frontmatter (`timezone: Asia/Seoul` etc.) — useful when travelling.
-      TZ: ${TZ:-Europe/Zurich}
-      # Optional explicit override for Iris's "home" zone. If unset, falls
-      # back to the TZ above.
-      # IRIS_TIMEZONE: Europe/Zurich
+      #
+      # IMPORTANT: do NOT set TZ here. We deliberately omit it so that the
+      # value comes from `env_file: .env` instead. If you put `TZ: ${TZ:-...}`
+      # here, Docker Compose substitutes ${TZ} from the *shell* environment
+      # where compose runs (Dockge's own env, which is usually Etc/UTC) BEFORE
+      # consulting the local .env file. That value then wins over env_file,
+      # silently overriding the user's intent. So:
+      #   - Set TZ=Europe/Zurich (or whatever) in .env. That's authoritative.
+      #   - Dockerfile's `ENV TZ=Europe/Zurich` is the fallback if .env omits it.
+      # Same goes for IRIS_TIMEZONE — set it in .env if you want it.
 
       # ── Claude Code CLI auth ─────────────────────────────────────────────
       CLAUDE_CONFIG_DIR: /claude-auth

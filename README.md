@@ -207,7 +207,7 @@ _iris/
     ├── semantic.py             # semantic_search, suggest_links_for, reindex_embeddings
     ├── tasks.py                # tasks + reminders, carry-forward
     ├── calendar.py             # schedule_event, daily_agenda
-    ├── discord.py              # fetch_discord_history (used when launched by the bot)
+    ├── discord.py              # fetch_discord_history, schedule_pingback (bot context)
     ├── links.py                # find_issues, link_candidates, duplicates
     ├── analysis.py             # vault_overview, note_context, merge_candidates
     ├── import_export.py        # import_file, mass_import, triage_inbox, summarize_note_with_llm
@@ -243,6 +243,17 @@ Iris exposes ~140 tools. Some highlights:
 | `morning_briefing()` | "What's on today" summary |
 | `evening_wrapup()` | End-of-day capture-and-archive flow |
 | `weekly_review()` / `weekly_summary()` | 7-day overview and persisted weekly note |
+| `schedule_pingback(when, message)` | Precise-time Discord ping (bot context). Accepts `HH:MM`, `+15m`, ISO 8601. |
+| `list_pingbacks()` / `cancel_pingback(id)` | Inspect / cancel pending precise-time pingbacks. |
+| `fetch_discord_history(hours_back)` | On-demand recall of past Discord messages in the active channel. |
+| `embed_morning_brief / embed_evening_wrapup / embed_daily_agenda(date)` | Rich Discord embed cards for the corresponding routines. Blue / indigo / blue sidebars, structured fields. |
+| `embed_event(date, title_match)` | Single calendar event as an embed — yellow normally, red if imminent. |
+| `embed_project_status(path)` | Project dashboard embed — violet sidebar, sections per category. |
+| `embed_note(path)` | Render a vault note as a card — title, excerpt, type/tags/mtime fields. |
+| `embed_callout(kind, title, body)` | Semantic info box: info / success / warning / error / tip / question. Color + icon chosen for you. |
+| `embed_query(sql, title, mode)` | Run a SELECT and render as embed: `mode="table"` (monospace code-block) or `"fields"` (one row → one field). Auto-`LIMIT 10`. |
+| `embed_custom(title, description, fields, color)` | Escape hatch — fully custom embed (8 named colors or `#rrggbb`, max 25 fields). |
+| `vocab_due / vocab_review(grade) / vocab_review_stats` | SM-2 spaced repetition. `vocab_review` accepts `"correct"` / `"close"` / `"wrong"` strings or 0-5 ints. |
 
 ## Why the SQLite-backed approach
 
