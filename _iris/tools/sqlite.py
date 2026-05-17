@@ -60,9 +60,14 @@ def sqlite_query(sql: str, limit: int = 200) -> str:
     sql = sql.strip().rstrip(";")
     if not sql:
         return "err: empty query"
-    if _SQL_WRITE_RE.search(sql):
+    # String-literal-aware safety check so `WHERE title = 'insert into junk'`
+    # isn't falsely blocked. `_strip_sql_strings_and_comments` lives further
+    # down in this module — see _render_sql_to_md_table for the same pattern.
+    sql_clean = _strip_sql_strings_and_comments(sql)
+    if _SQL_WRITE_RE.search(sql_clean):
         return "err: write operations are not allowed — only SELECT queries"
-    if not sql.upper().lstrip().startswith("SELECT") and not sql.upper().lstrip().startswith("WITH"):
+    upper_clean = sql_clean.lstrip().upper()
+    if not (upper_clean.startswith("SELECT") or upper_clean.startswith("WITH")):
         return "err: only SELECT (and WITH … SELECT) queries are allowed"
 
     limit = max(1, min(limit, 2000))
@@ -264,17 +269,29 @@ def _render_sql_to_md_table(sql: str, limit: int = _SQL_VIEW_DEFAULT_LIMIT) -> s
     """
     now_iso = datetime.now().isoformat(timespec="seconds")
 
-    # SQL safety — same rules as sqlite_query.
+    # SQL safety — same write-keyword rules as sqlite_query, but more
+    # lenient about HOW the read is expressed. Allow SELECT / WITH /
+    # EXPLAIN [QUERY PLAN] / read-only PRAGMA (table_info, index_list,
+    # etc. but NOT the assignment form `PRAGMA foo=bar` which is already
+    # blocked by _SQL_WRITE_RE). Leading comments and whitespace are
+    # stripped before keyword check so e.g. `-- doc comment\nSELECT ...`
+    # works.
     s = sql.strip().rstrip(";")
     if not s:
         body = "_(empty query)_"
         return _wrap_result(body, now_iso, rows=0)
-    if _SQL_WRITE_RE.search(s):
+    # Strip strings + comments ONCE; both safety checks use the result.
+    # Without this, `WHERE title = 'insert into junk'` falsely triggers
+    # the write-keyword regex.
+    s_clean = _strip_sql_strings_and_comments(s)
+    if _SQL_WRITE_RE.search(s_clean):
         body = "❌ write operations not allowed — only SELECT / WITH"
         return _wrap_result(body, now_iso, rows=0)
-    upper = s.upper().lstrip()
-    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
-        body = "❌ only SELECT / WITH queries allowed"
+    upper = s_clean.strip().upper()
+    _READ_STARTS = ("SELECT", "WITH", "EXPLAIN", "PRAGMA")
+    if not any(upper.startswith(kw) for kw in _READ_STARTS):
+        body = (f"❌ only read queries allowed (SELECT / WITH / EXPLAIN / "
+                f"PRAGMA). Got: {upper[:40]!r}")
         return _wrap_result(body, now_iso, rows=0)
 
     # Auto-cap unbounded queries. We also enforce an effective MAX even if
