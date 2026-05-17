@@ -590,14 +590,31 @@ def refresh_sql_views(path: str = "", all_notes: bool = False) -> str:
             return f"err: note not found: {path}"
         targets.append(p)
     else:
-        for md in vault_root.rglob("*.md"):
-            # Cheap filter — skip files with no sqlite codefence.
+        # Run an incremental vault-index sync first so the sql_views table
+        # reflects any notes edited externally (e.g. in Obsidian on Mac,
+        # not through an Iris MCP tool). The sync is mtime-based — files
+        # whose mtime hasn't changed since the last index are skipped, so
+        # this is cheap even for a 1000-note vault.
+        idx = get_vault_index()
+        try:
+            idx.sync(force=False)
+        except Exception:
+            pass  # don't let an index hiccup block the refresh
+        # Now query the up-to-date sql_views table for notes containing
+        # SQL blocks. Replaces the previous rglob-walking-the-whole-vault
+        # approach — for a vault with 1000 notes and 10 SQL views, we
+        # visit 10 notes instead of 1000.
+        rows = idx.conn.execute(
+            "SELECT DISTINCT note_path FROM sql_views"
+        ).fetchall()
+        for r in rows:
+            rel = r["note_path"] if hasattr(r, "keys") else r[0]
             try:
-                head = md.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
+                p = safe_path(rel)
+                if p.exists() and p.is_file():
+                    targets.append(p)
+            except (ValueError, FileNotFoundError):
                 continue
-            if "```sqlite" in head or "```sql" in head:
-                targets.append(md)
 
     if not targets:
         return ("ok 0 notes scanned (no ```sqlite / ```sql blocks found)"
@@ -711,3 +728,46 @@ def vault_snapshot() -> str:
 
     size_kb = snap_path.stat().st_size // 1024
     return f"ok vault-snapshot.db updated ({size_kb} KB)"
+
+
+@mcp.tool()
+def list_sql_views(note_path: str = "") -> str:
+    """Inspect the vault's tracked ```sql / ```sqlite code blocks.
+
+    Reads from the `sql_views` index table — populated automatically when
+    notes are indexed. Use to answer "which notes have SQL views?" or to
+    audit specific notes before a refresh.
+
+    Args:
+        note_path: If given, only show entries for that note. Otherwise
+            list every tracked SQL view across the vault.
+
+    Returns pipe-delimited rows: ``note_path | block_index | lang | query``
+    with the query truncated to 100 chars for readability.
+    """
+    idx = get_vault_index()
+    if note_path:
+        rows = idx.conn.execute(
+            "SELECT note_path, block_index, lang, query FROM sql_views "
+            "WHERE note_path = ? ORDER BY block_index",
+            (note_path.strip().lstrip("/"),),
+        ).fetchall()
+    else:
+        rows = idx.conn.execute(
+            "SELECT note_path, block_index, lang, query FROM sql_views "
+            "ORDER BY note_path, block_index"
+        ).fetchall()
+    if not rows:
+        return ("no SQL views tracked yet — has `rebuild_vault_index` run? "
+                f"(filter: note_path={note_path!r})" if note_path
+                else "no SQL views tracked in the vault yet")
+    out: list[str] = [f"{len(rows)} SQL view(s) tracked:"]
+    for r in rows:
+        path = r["note_path"]
+        idx_n = r["block_index"]
+        lang = r["lang"]
+        q = (r["query"] or "").replace("\n", " ").strip()
+        if len(q) > 100:
+            q = q[:97] + "…"
+        out.append(f"{path} | #{idx_n} | {lang} | {q}")
+    return "\n".join(out)

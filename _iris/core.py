@@ -24,6 +24,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+# ```sql / ```sqlite block detector used by the per-note indexer to
+# populate the sql_views table. Same shape as the renderer's regex in
+# `_iris/tools/sqlite.py`, simplified — we only need (lang, query) here.
+_SQL_VIEW_INDEX_RE = re.compile(
+    r"```(sqlite|sql)\r?\n(.*?)\r?\n```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
 # =============================================================================
 # Auto-reload helper for Obsidian's SQLite DB Plugin
 # =============================================================================
@@ -853,7 +862,7 @@ class VaultIndex:
     fts        – FTS5 full-text search over note body text
     """
 
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
 
     def __init__(self, vault_root: Path):
         self._root = vault_root
@@ -1302,6 +1311,23 @@ class VaultIndex:
             )
         """)
 
+        # Tracks ```sql / ```sqlite code blocks across the vault so the
+        # auto-refresh loop only visits notes that actually contain SQL
+        # views (instead of rglob-walking the whole vault every 15 min).
+        # Populated by `_index_note_metadata` on each per-note re-scan;
+        # rows cascade-delete with the parent file row.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS sql_views (
+                note_path        TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+                block_index      INTEGER NOT NULL,
+                query            TEXT NOT NULL,
+                lang             TEXT NOT NULL DEFAULT 'sql',
+                last_rendered_at INTEGER NOT NULL DEFAULT 0,
+                last_data_hash   TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (note_path, block_index)
+            )
+        """)
+
         # -- useful indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_files_suffix ON files(suffix)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_notes_type ON notes(type)")
@@ -1321,6 +1347,7 @@ class VaultIndex:
         c.execute("CREATE INDEX IF NOT EXISTS idx_revisions_saved ON revisions(saved_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_access_count ON note_access(access_count)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_model ON note_embeddings(model)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sql_views_path ON sql_views(note_path)")
 
         c.execute(
             "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)",
@@ -1433,7 +1460,8 @@ class VaultIndex:
         )
 
         # -- clear old derived data for this note
-        for tbl in ("frontmatter", "tags", "aliases", "wikilinks", "tasks", "reminders"):
+        for tbl in ("frontmatter", "tags", "aliases", "wikilinks", "tasks",
+                    "reminders", "sql_views"):
             c.execute(f"DELETE FROM {tbl} WHERE {'note_path' if tbl != 'wikilinks' else 'source_path'} = ?", (rel,))
 
         # Delete old FTS entry
@@ -1560,6 +1588,23 @@ class VaultIndex:
             "INSERT INTO fts (path, title, body) VALUES (?, ?, ?)",
             (rel, title, fts_body),
         )
+
+        # -- ```sql / ```sqlite code blocks → sql_views table.
+        # Indexed-not-rendered: stores the query so the refresh loop knows
+        # which notes/blocks exist without walking the filesystem. The
+        # actual rendering happens in `_iris.tools.sqlite.refresh_sql_views`.
+        sql_view_rows: list[tuple[str, int, str, str]] = []
+        for i, m in enumerate(_SQL_VIEW_INDEX_RE.finditer(text)):
+            lang = m.group(1).lower()
+            query = m.group(2).strip()
+            if query:
+                sql_view_rows.append((rel, i, query, lang))
+        if sql_view_rows:
+            c.executemany(
+                "INSERT INTO sql_views "
+                "(note_path, block_index, query, lang) VALUES (?, ?, ?, ?)",
+                sql_view_rows,
+            )
 
     def _remove_file(self, rel_path: str):
         """Remove a file from the index (cascading deletes handle child rows)."""
