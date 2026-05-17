@@ -77,6 +77,19 @@ def _wikilink_to_text(match: re.Match) -> str:
 _FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})", re.MULTILINE)
 
 
+def unescape_literal_escapes(s: str) -> str:
+    """Convert literal escape sequences ``\\n`` (2-char backslash+n) into the
+    actual control characters they represent. LLMs occasionally over-escape
+    when constructing tool-call JSON, so multi-line strings arrive with
+    visible backslash-n. Idempotent on already-clean strings."""
+    if not s or "\\" not in s:
+        return s
+    return (s
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t"))
+
+
 def strip_wikilinks(text: str) -> str:
     """Rewrite ``[[path|alias]]`` / ``[[path]]`` into either:
 
@@ -244,6 +257,14 @@ def dict_to_embed(payload: dict) -> discord.Embed:
     # here makes it idempotent (it's a no-op on text without `[[`) and
     # ensures EVERY embed gets clickable Obsidian links regardless of which
     # code path constructed the payload.
+    # Combined cleanup pipeline: unescape literal `\n`-style sequences from
+    # over-escaping LLMs, then rewrite wikilinks. Idempotent on payloads
+    # that already went through the MCP-side builder.
+    def _clean(s):
+        if s is None:
+            return None
+        return strip_wikilinks(unescape_literal_escapes(str(s)))
+
     raw_title = payload.get("title")
     raw_desc = payload.get("description")
     # Discord rejects the WHOLE embed if `url` has a non-http(s) scheme —
@@ -260,8 +281,8 @@ def dict_to_embed(payload: dict) -> discord.Embed:
         and raw_url.lower().startswith(("http://", "https://"))
     ) else None
     e = discord.Embed(
-        title=(strip_wikilinks(str(raw_title))[:256] if raw_title else None),
-        description=(strip_wikilinks(str(raw_desc))[:4096] if raw_desc else None),
+        title=(_clean(raw_title)[:256] if raw_title else None),
+        description=(_clean(raw_desc)[:4096] if raw_desc else None),
         color=int(payload.get("color") or COLOR_GRAY),
         url=safe_url,
     )
@@ -273,13 +294,13 @@ def dict_to_embed(payload: dict) -> discord.Embed:
             pass
     for field in (payload.get("fields") or [])[:25]:
         e.add_field(
-            name=strip_wikilinks(str(field.get("name") or "—"))[:256],
-            value=strip_wikilinks(str(field.get("value") or "—"))[:1024],
+            name=_clean(field.get("name") or "—")[:256],
+            value=_clean(field.get("value") or "—")[:1024],
             inline=bool(field.get("inline", False)),
         )
     footer = payload.get("footer")
     if footer:
-        e.set_footer(text=strip_wikilinks(str(footer))[:2048])
+        e.set_footer(text=_clean(footer)[:2048])
     return e
 
 

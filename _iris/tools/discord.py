@@ -282,6 +282,33 @@ def _parse_markdown_sections(md: str) -> tuple[str, str, list[dict]]:
     return title, intro, fields
 
 
+def _unescape_literal_escapes(s: str) -> str:
+    """Convert literal escape sequences like ``"\\n"`` (2 chars: backslash +
+    n) into the actual control characters they represent.
+
+    Why: when an LLM constructs JSON arguments for a tool call, it sometimes
+    over-escapes — emitting the 4-char sequence ``\\\\n`` in the source so
+    the deserialised string contains the 2 chars ``\\n`` instead of a real
+    newline. Discord then renders the backslash and the n verbatim. We
+    normalise on the way in so embeds always show real line breaks.
+    Idempotent on strings that already contain real newlines."""
+    if not s or "\\" not in s:
+        return s
+    return (s
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t"))
+
+
+def _embed_text_clean(s) -> str:
+    """Combined pipeline for any text we send into an embed: unescape
+    over-escaped sequences, then apply wikilink rewriting. Safe on None /
+    non-string (coerces via str())."""
+    if s is None:
+        return ""
+    return _strip_wikilinks(_unescape_literal_escapes(str(s)))
+
+
 def _build_embed_dict(
     *,
     title: str,
@@ -294,32 +321,36 @@ def _build_embed_dict(
 ) -> dict:
     """Generic constructor for the JSON shape the bot expects on the queue.
 
-    Centralised wikilink rewriting: every text-bearing attribute (title,
-    description, field name, field value, footer) runs through
-    ``_strip_wikilinks`` so any ``[[path]]`` Iris (or a canned tool) writes
-    automatically becomes a clickable ``[label](obsidian://...)`` masked
-    link when ``IRIS_OBSIDIAN_VAULT_NAME`` is set, or a plain display name
-    when it isn't. This means callers don't have to remember to rewrite —
-    just emit wikilink syntax and it Just Works in the rendered embed.
+    Centralised cleanup pipeline: every text-bearing attribute (title,
+    description, field name, field value, footer) is run through
+    ``_embed_text_clean`` which:
+
+    1. **Unescapes literal escape sequences** like ``\\n`` → actual newline.
+       LLMs occasionally over-escape when constructing tool-call JSON, so
+       multi-line content arrives with visible backslash-n's. We normalise
+       these so Discord renders real line breaks.
+    2. **Rewrites Obsidian wikilinks** ``[[path]]`` into clickable masked
+       links (when ``IRIS_OBSIDIAN_URL_PREFIX`` is set) or plain display
+       names (when not). Callers don't have to remember to rewrite.
     """
     out: dict = {
-        "title": _strip_wikilinks((title or ""))[:256] if title else None,
+        "title": _embed_text_clean(title)[:256] if title else None,
         "color": int(color),
     }
     if description:
-        out["description"] = _strip_wikilinks(description)[:4096]
+        out["description"] = _embed_text_clean(description)[:4096]
     if fields:
         # Discord caps at 25 fields per embed.
         clean_fields: list[dict] = []
         for f in fields[:25]:
             clean_fields.append({
-                "name": _strip_wikilinks(str(f.get("name") or "—"))[:256],
-                "value": _strip_wikilinks(str(f.get("value") or "—"))[:1024],
+                "name": _embed_text_clean(f.get("name") or "—")[:256],
+                "value": _embed_text_clean(f.get("value") or "—")[:1024],
                 "inline": bool(f.get("inline", False)),
             })
         out["fields"] = clean_fields
     if footer:
-        out["footer"] = _strip_wikilinks(footer)[:2048]
+        out["footer"] = _embed_text_clean(footer)[:2048]
     if timestamp:
         out["timestamp"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     if url:
