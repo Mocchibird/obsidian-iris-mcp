@@ -30,8 +30,34 @@ from ..core import *  # noqa: F401, F403  — all helpers and VaultIndex accesso
 # Web search & fetch tools
 # =============================================================================
 
-_HTTPX_TIMEOUT = 15
-_WEB_UA = "Mozilla/5.0 (compatible; ObsidianMemoryBot/1.0)"
+_HTTPX_TIMEOUT = 30  # 15s wasn't enough for Cloudflare-fronted sites (Digitec etc.)
+
+# Browser-realistic User-Agent. Sites with bot filtering (Cloudflare bot
+# challenge, Akamai, etc.) instantly block the obvious "ObsidianMemoryBot"
+# UA we used to send. Mimicking a recent stable Chrome on macOS gets us
+# past basic UA filters. Pages that require JS rendering still won't work
+# — for those you'd need a headless-browser tool.
+_WEB_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+_WEB_HEADERS = {
+    "User-Agent": _WEB_UA,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "DNT": "1",
+}
 
 # Suppress noisy library loggers for web tools
 import logging as _logging
@@ -39,12 +65,24 @@ for _ln in ("ddgs", "httpx", "httpcore"):
     _logging.getLogger(_ln).setLevel(_logging.WARNING)
 
 
-def _get_httpx_client() -> "httpx.Client":
-    import httpx
+def _get_httpx_client(json_only: bool = False) -> "httpx.Client":
+    """Return a configured httpx.Client.
 
+    json_only=True relaxes the browser headers (just UA + Accept JSON) for
+    talking to APIs (Reddit, etc.). For HTML scraping always use the full
+    set so Cloudflare/Akamai/etc. don't bounce us."""
+    import httpx
+    if json_only:
+        headers = {
+            "User-Agent": _WEB_UA,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    else:
+        headers = dict(_WEB_HEADERS)
     return httpx.Client(
         timeout=_HTTPX_TIMEOUT,
-        headers={"User-Agent": _WEB_UA},
+        headers=headers,
         follow_redirects=True,
     )
 
@@ -113,9 +151,28 @@ def web_search(
     return f"{header}\n" + "\n".join(out)
 
 
+_BOT_BLOCK_MARKERS = (
+    "cf-browser-verification",      # Cloudflare interstitial
+    "Just a moment...",             # CF challenge title
+    "Checking your browser before",  # generic CF text
+    "Please enable JS and disable",  # Akamai bot manager
+    "Access denied | Access denied",  # Akamai 403 page title
+    "Pardon Our Interruption",      # Distil Networks
+    "captcha-delivery.com",         # DataDome
+    "px-captcha",                   # PerimeterX
+)
+
+
 @mcp.tool()
 def fetch_url(url: str, max_chars: int = 8000, raw: bool = False) -> str:
-    """Fetch a URL and extract readable text. raw=True returns raw HTML (truncated). Max 8k chars default."""
+    """Fetch a URL and extract readable text. raw=True returns raw HTML (truncated). Max 8k chars default.
+
+    Sends realistic browser headers so most basic bot filters (Cloudflare's
+    cheaper tiers, Akamai user-agent blocking) let us through. Sites with
+    JS-challenge-only bot detection or strict Cloudflare Turnstile will
+    still bounce us — when that happens we surface a clear error so the
+    caller knows it's a fundamental block, not a transient timeout.
+    """
     max_chars = max(500, min(max_chars, 30000))
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -127,10 +184,23 @@ def fetch_url(url: str, max_chars: int = 8000, raw: bool = False) -> str:
         return f"err: {str(e)[:300]}"
 
     content_type = resp.headers.get("content-type", "")
-    if raw or "text/plain" in content_type or "application/json" in content_type:
-        return resp.text[:max_chars]
+    body = resp.text
+
+    # Detect bot-challenge responses BEFORE the caller wastes time on them.
+    # These typically arrive as 200 OK with a small CF/Akamai/whatever page.
     if "text/html" in content_type or not content_type:
-        return _html_to_text(resp.text, max_chars=max_chars)
+        head = body[:8000].lower()
+        if any(m.lower() in head for m in _BOT_BLOCK_MARKERS):
+            return ("err: bot challenge detected (Cloudflare/Akamai/similar). "
+                    f"The site is blocking automated fetches of {url}. "
+                    "Search results / cached snippets may still be usable; "
+                    "for live pricing or stock you may need to open the URL "
+                    "in a browser manually.")
+
+    if raw or "text/plain" in content_type or "application/json" in content_type:
+        return body[:max_chars]
+    if "text/html" in content_type or not content_type:
+        return _html_to_text(body, max_chars=max_chars)
     return f"err: unsupported content-type {content_type[:80]}"
 
 
@@ -152,7 +222,7 @@ def search_reddit(
         params = {"q": query, "sort": sort, "t": time_filter, "limit": str(limit)}
 
     try:
-        client = _get_httpx_client()
+        client = _get_httpx_client(json_only=True)
         resp = client.get(base, params=params)
         resp.raise_for_status()
         data = resp.json()
