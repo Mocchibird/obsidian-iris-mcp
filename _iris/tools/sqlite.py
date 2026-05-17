@@ -465,15 +465,43 @@ def _wrap_result(body: str, timestamp: str, rows: int) -> str:
             f"<!-- /iris-sql-result -->")
 
 
+def _data_portion(rendered_block: str) -> str:
+    """Strip the iris-sql-result wrapper + the changing `generated:` line,
+    returning just the table body. Used to compare what's already in a note
+    against what we'd write — so we only touch disk when the actual data
+    rows differ, not when only the timestamp changed.
+    """
+    # Drop both opening and closing wrapper comments. The opening line has
+    # the variable `generated:...` timestamp, which we MUST NOT compare on.
+    lines = rendered_block.splitlines()
+    out: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if s.startswith("<!--") and ("iris-sql-result" in s or "/iris-sql-result" in s):
+            continue
+        out.append(line.rstrip())
+    # Collapse trailing blank lines so trailing-newline noise doesn't
+    # cause a false-positive diff.
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out)
+
+
 def _replace_sql_blocks(text: str, newline: str = "\n") -> tuple[str, int, int]:
     """Walk a note's text, render every ```sqlite block.
 
     Returns (new_text, blocks_processed, errors). Blocks are processed in
     order. An existing iris-sql-result immediately following each query
-    block (with only whitespace between) is replaced; otherwise a fresh
-    result block is inserted. Newline style (``\\n`` vs ``\\r\\n``) is
-    preserved per-note via the ``newline`` argument so we never silently
-    flip line endings on Windows-edited notes.
+    block (with only whitespace between) is replaced ONLY if the actual
+    table data differs — the volatile `generated:` timestamp is ignored
+    when comparing. This means static queries (whose data doesn't change)
+    produce zero disk writes across refreshes, even though they still
+    re-execute. Only queries whose displayed data changed actually trigger
+    a write + syncthing replication.
+
+    Newline style (``\\n`` vs ``\\r\\n``) is preserved per-note via the
+    ``newline`` argument so we never silently flip line endings on
+    Windows-edited notes.
     """
     block_count = [0]
     error_count = [0]
@@ -485,6 +513,19 @@ def _replace_sql_blocks(text: str, newline: str = "\n") -> tuple[str, int, int]:
         rendered = _render_sql_to_md_table(query)
         if "❌" in rendered:
             error_count[0] += 1
+
+        # If the existing wrapper's data is identical to what we'd write,
+        # keep the existing block verbatim (preserves its old timestamp).
+        # This is the data-aware diff: lets us run queries every 15 min
+        # without writing notes — which would otherwise burn syncthing
+        # traffic + churn mtimes for zero data benefit on static queries.
+        old_match_text = m.group(0)
+        if "iris-sql-result" in old_match_text:
+            existing_data = _data_portion(old_match_text)
+            new_data = _data_portion(rendered)
+            if existing_data == new_data and existing_data:
+                return old_match_text  # unchanged — no write needed
+
         # Build with the note's native newline style so writing back is
         # a no-op on identical content (and doesn't trigger spurious
         # mtime updates or re-sync churn).
