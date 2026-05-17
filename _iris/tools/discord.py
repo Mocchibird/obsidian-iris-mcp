@@ -294,19 +294,32 @@ def _build_embed_dict(
 ) -> dict:
     """Generic constructor for the JSON shape the bot expects on the queue.
 
-    Mirrors discord.Embed fields. Bot-side ``_dict_to_embed`` is the inverse.
+    Centralised wikilink rewriting: every text-bearing attribute (title,
+    description, field name, field value, footer) runs through
+    ``_strip_wikilinks`` so any ``[[path]]`` Iris (or a canned tool) writes
+    automatically becomes a clickable ``[label](obsidian://...)`` masked
+    link when ``IRIS_OBSIDIAN_VAULT_NAME`` is set, or a plain display name
+    when it isn't. This means callers don't have to remember to rewrite —
+    just emit wikilink syntax and it Just Works in the rendered embed.
     """
     out: dict = {
-        "title": (title or "")[:256] if title else None,
+        "title": _strip_wikilinks((title or ""))[:256] if title else None,
         "color": int(color),
     }
     if description:
-        out["description"] = description[:4096]
+        out["description"] = _strip_wikilinks(description)[:4096]
     if fields:
         # Discord caps at 25 fields per embed.
-        out["fields"] = fields[:25]
+        clean_fields: list[dict] = []
+        for f in fields[:25]:
+            clean_fields.append({
+                "name": _strip_wikilinks(str(f.get("name") or "—"))[:256],
+                "value": _strip_wikilinks(str(f.get("value") or "—"))[:1024],
+                "inline": bool(f.get("inline", False)),
+            })
+        out["fields"] = clean_fields
     if footer:
-        out["footer"] = footer[:2048]
+        out["footer"] = _strip_wikilinks(footer)[:2048]
     if timestamp:
         out["timestamp"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     if url:
@@ -726,24 +739,164 @@ def embed_daily_agenda(
     color: str = "blue",
     channel_id: int | None = None,
 ) -> str:
-    """Render ``daily_agenda(date, days)`` as a Discord embed and post it.
+    """Render events + tasks + reminders for a date (or range) as a Discord
+    embed card with one field per category.
 
-    Combines events, tasks-due, and reminders for the date into a single
-    embed with one field per category. Set ``days > 1`` to widen the window.
+    Queries the vault DB directly (NOT the ``daily_agenda`` text output,
+    which uses a pipe-delimited internal format that doesn't parse cleanly).
+
+    Args:
+        date: ``"today"``, ``"tomorrow"``, ``"this week"``, ``"next 3 days"``,
+            an ISO date, etc.
+        days: Number of days to include. Auto-derived for range expressions.
+        color: ``blue`` (default), ``yellow`` if anything is overdue.
+        channel_id: Override Discord channel.
     """
-    from .calendar import daily_agenda
-    md = daily_agenda(date, days)
-    title, intro, fields = _parse_markdown_sections(md)
-    if not title:
-        title = f"📅 Agenda — {date}"
-    elif not title.startswith(("📅", "Agenda")):
-        title = f"📅 {title}"
+    from datetime import datetime as _dt, timedelta as _td
+    from ..core import (
+        get_vault_index, resolve_natural_date, _resolve_date_range,
+        parse_iso_date,
+    )
+
+    range_result = _resolve_date_range(date)
+    if range_result is not None:
+        resolved, days = range_result
+    else:
+        resolved = resolve_natural_date(date)
+        if resolved is None:
+            return f"err: cannot parse date={date!r}"
+    start_date = _dt.strptime(resolved, "%Y-%m-%d").date()
+    end_date = start_date + _td(days=max(1, days) - 1)
+    date_from = start_date.isoformat()
+    date_to = end_date.isoformat()
+    today = _dt.now().date()
+
+    idx = get_vault_index()
+    events = idx.query_events(date_from=date_from, date_to=date_to)
+    all_tasks = idx.query_tasks(checked=False, limit=500)
+    all_rems = idx.query_reminders(checked=False, limit=500)
+
+    # Bucket tasks + reminders by date relative to window.
+    tasks_overdue: list[dict] = []
+    tasks_in_range: list[dict] = []
+    for t in all_tasks:
+        dd = parse_iso_date(t.get("due") or "")
+        if dd is None:
+            continue
+        if dd.date() < start_date:
+            tasks_overdue.append(t)
+        elif start_date <= dd.date() <= end_date:
+            tasks_in_range.append(t)
+    rems_overdue: list[dict] = []
+    rems_in_range: list[dict] = []
+    for r in all_rems:
+        rd = parse_iso_date(r.get("remind_on") or "")
+        if rd is None:
+            continue
+        if rd.date() < start_date:
+            rems_overdue.append(r)
+        elif start_date <= rd.date() <= end_date:
+            rems_in_range.append(r)
+
+    def _fmt_event(ev: dict) -> str:
+        when = ev.get("time") or ""
+        end = ev.get("end_time") or ""
+        if ev.get("all_day"):
+            stamp = "all-day"
+        elif when and end:
+            stamp = f"{when}–{end}"
+        elif when:
+            stamp = when
+        else:
+            stamp = ""
+        loc = f" @ {ev['location']}" if ev.get("location") else ""
+        prefix = f"**{ev['date']}**" + (f" {stamp}" if stamp else "")
+        return f"- {prefix} — {ev.get('title', '?')}{loc}"
+
+    def _fmt_task(t: dict) -> str:
+        due = t.get("due") or ""
+        note = t.get("note_path") or ""
+        note_part = f" — [[{note[:-3]}]]" if note.endswith(".md") else ""
+        return f"- [ ] {t.get('text', '?')} (due {due}){note_part}"
+
+    def _fmt_reminder(r: dict) -> str:
+        when = r.get("remind_on") or ""
+        note = r.get("note_path") or ""
+        note_part = f" — [[{note[:-3]}]]" if note.endswith(".md") else ""
+        return f"- {r.get('text', '?')} (📅 {when}){note_part}"
+
+    fields: list[dict] = []
+    has_overdue = bool(tasks_overdue or rems_overdue)
+
+    if events:
+        body = "\n".join(_fmt_event(e) for e in events[:15])
+        if len(events) > 15:
+            body += f"\n_…+{len(events) - 15} more_"
+        if len(body) > 1020:
+            body = body[:1017] + "…"
+        fields.append({"name": f"📅 Events ({len(events)})",
+                       "value": body, "inline": False})
+
+    if tasks_overdue:
+        body = "\n".join(_fmt_task(t) for t in tasks_overdue[:10])
+        if len(tasks_overdue) > 10:
+            body += f"\n_…+{len(tasks_overdue) - 10} more_"
+        if len(body) > 1020:
+            body = body[:1017] + "…"
+        fields.append({"name": f"⏰ Overdue Tasks ({len(tasks_overdue)})",
+                       "value": body, "inline": False})
+
+    if tasks_in_range:
+        body = "\n".join(_fmt_task(t) for t in tasks_in_range[:15])
+        if len(tasks_in_range) > 15:
+            body += f"\n_…+{len(tasks_in_range) - 15} more_"
+        if len(body) > 1020:
+            body = body[:1017] + "…"
+        fields.append({"name": f"✅ Tasks Due ({len(tasks_in_range)})",
+                       "value": body, "inline": False})
+
+    if rems_overdue:
+        body = "\n".join(_fmt_reminder(r) for r in rems_overdue[:10])
+        if len(rems_overdue) > 10:
+            body += f"\n_…+{len(rems_overdue) - 10} more_"
+        if len(body) > 1020:
+            body = body[:1017] + "…"
+        fields.append({"name": f"🔔 Overdue Reminders ({len(rems_overdue)})",
+                       "value": body, "inline": False})
+
+    if rems_in_range:
+        body = "\n".join(_fmt_reminder(r) for r in rems_in_range[:15])
+        if len(rems_in_range) > 15:
+            body += f"\n_…+{len(rems_in_range) - 15} more_"
+        if len(body) > 1020:
+            body = body[:1017] + "…"
+        fields.append({"name": f"🔔 Reminders ({len(rems_in_range)})",
+                       "value": body, "inline": False})
+
+    if not fields:
+        fields = [{"name": "🎉 Clear", "value": "Nothing scheduled.",
+                   "inline": False}]
+
+    # Title shows the range; description shows a relative-date hint.
+    if days == 1:
+        title = f"📅 Agenda — {date_from}"
+        if start_date == today:
+            title += " (today)"
+        elif start_date == today + _td(days=1):
+            title += " (tomorrow)"
+        intro = None
+    else:
+        title = f"📅 Agenda · {date_from} → {date_to}"
+        intro = f"_{days} days · {len(events)} events, " \
+                f"{len(tasks_in_range)} tasks, {len(rems_in_range)} reminders_"
+
+    chosen_color = "yellow" if has_overdue else color
     embed = _build_embed_dict(
         title=title,
         description=intro,
-        color=_resolve_color(color),
+        color=_resolve_color(chosen_color),
         fields=fields,
-        footer=f"daily_agenda · {date}",
+        footer=f"daily_agenda · {date_from}" + (f" → {date_to}" if days > 1 else ""),
     )
     return _enqueue_embed(channel_id, embed)
 
