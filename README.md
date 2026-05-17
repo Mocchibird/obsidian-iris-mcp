@@ -237,7 +237,8 @@ Iris exposes ~140 tools. Some highlights:
 | `sqlite_query(sql)` | Read-only SELECT against any table/view |
 | `schedule_event(...)` | Add a calendar event to a daily note's `## Schedule` |
 | `daily_agenda(date)` | Tasks + reminders + events for a date, including cross-day events |
-| `pull_ical_subscription(url)` | Sync events from a `webcal://` or `https://` iCal feed (iCloud, Google, Outlook). RRULE-aware, dedupes by UID. |
+| `pull_ical_subscription(url, link_to_person?)` | Sync events from a `webcal://` or `https://` iCal feed (iCloud, Google, Outlook). RRULE-aware. Dedupes by UID AND by `(date, time, title)` so same-event-in-two-calendars doesn't double-import. Optional `link_to_person` adds `with: [[path]]` backlink to a contact. |
+| `sync_all_calendars()` | Sync every feed configured in `IRIS_DEFAULT_ICAL_URLS` (pipe-separated, per-feed tags + person-link). |
 | `list_unfinished_tasks()` | What's still open from recent days |
 | `carry_forward_tasks()` | Move missed items to today's daily note |
 | `morning_briefing()` | "What's on today" summary |

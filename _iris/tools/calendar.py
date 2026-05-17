@@ -367,6 +367,8 @@ def pull_ical_subscription(
     days_back: int = 0,
     dry_run: bool = False,
     source_tag: str = "ical",
+    link_to_person: str = "",
+    cross_calendar_dedupe: bool = True,
 ) -> str:
     """Sync events from a ``webcal://`` or ``https://`` iCalendar feed.
 
@@ -379,12 +381,29 @@ def pull_ical_subscription(
         → Publish → choose "ICS — anyone with the link".
 
     Each event is written into the appropriate daily note's ``## Schedule``
-    section via ``schedule_event``. Re-running the same URL deduplicates by
-    iCal UID (embedded as ``[ical-uid:...]`` in the event description), so
-    repeated syncs don't create duplicates.
+    section via ``schedule_event``. Recurring events (RRULE) are expanded
+    over the import window — you get one row per occurrence in the date
+    range.
 
-    Recurring events (RRULE) are expanded over the import window — you get
-    one row per occurrence in the date range.
+    **Two layers of dedupe so re-syncing is always safe:**
+
+    1. **By iCal UID** (always on). Each event embeds ``[ical-uid:<id>]`` in
+       its description; before importing, the vault is scanned for an
+       existing event with the same UID. Catches re-imports of the SAME
+       calendar.
+    2. **By (date, time, title)** — cross-calendar dedupe. When you sync
+       multiple feeds that share events (e.g. a meeting in BOTH your work
+       and personal calendar with different UIDs), this skips an incoming
+       event if there's already one at the same date + start time + title
+       in the vault. Toggle off with ``cross_calendar_dedupe=False`` if you
+       have legitimately-distinct events at identical slots.
+
+    **Person-linked calendars** (``link_to_person="10_Profile/People/Foo"``):
+    set this when syncing a calendar that belongs to a specific contact
+    (e.g. a partner's shared iCloud). Each imported event gets a
+    ``with: [[<path>]]`` line in its description, so Iris's wikilink graph
+    automatically backlinks the event to their profile. You can then ask
+    Iris "what's coming up with Foo?" and she pulls from the index.
 
     Args:
         url: Calendar feed URL. ``webcal://`` is auto-rewritten to ``https://``.
@@ -394,8 +413,14 @@ def pull_ical_subscription(
         dry_run: List what WOULD be imported without writing.
         source_tag: Marker for filtering later, e.g. ``icloud-personal``,
             ``google-work``. Stored in the event description.
+        link_to_person: Vault-relative path to a person note (with or
+            without ``.md``). When set, each imported event's description
+            includes ``with: [[<path>]]`` linking back to the person.
+        cross_calendar_dedupe: If True (default), skip events whose
+            (date, start_time, normalised title) match an existing event
+            from a different source — even if their UIDs differ.
 
-    Returns a summary like ``📅 12 added, 3 skipped (already synced), 0 errors``.
+    Returns a summary like ``📅 12 added, 3 dup'd by UID, 2 dup'd by content``.
     """
     try:
         import httpx
@@ -438,23 +463,49 @@ def pull_ical_subscription(
     except Exception as exc:
         return f"err: failed to expand recurring events: {exc}"
 
-    # Pre-load existing UIDs from the vault index for O(1) dedupe.
+    # Pre-load BOTH dedupe sets for O(1) lookups during the import loop:
+    #   1. Existing UIDs → catches re-syncs of the same calendar.
+    #   2. (date, time, normalised_title) triplets → catches the same
+    #      meeting appearing in multiple calendars with different UIDs.
     from ..core import get_vault_index
     idx = get_vault_index()
     existing_uids: set[str] = set()
+    existing_content_keys: set[tuple[str, str, str]] = set()
+
+    def _content_key(date_iso: str, time_str: str, title: str) -> tuple[str, str, str]:
+        """Normalised dedupe key. Lowercased + whitespace-collapsed title
+        so 'Daily Standup ' and 'daily standup' match."""
+        norm_title = re.sub(r"\s+", " ", (title or "").strip().lower())
+        return (date_iso, time_str or "", norm_title)
+
     try:
         rows = idx.conn.execute(
-            "SELECT description FROM events WHERE description LIKE '%[ical-uid:%'"
+            "SELECT date, time, title, description FROM events"
         ).fetchall()
         for r in rows:
-            desc = r["description"] if hasattr(r, "keys") else r[0]
-            for m in re.finditer(r"\[ical-uid:([^\]]+)\]", desc or ""):
+            desc = (r["description"] if hasattr(r, "keys") else r[3]) or ""
+            for m in re.finditer(r"\[ical-uid:([^\]]+)\]", desc):
                 existing_uids.add(m.group(1))
+            r_date = r["date"] if hasattr(r, "keys") else r[0]
+            r_time = r["time"] if hasattr(r, "keys") else r[1]
+            r_title = r["title"] if hasattr(r, "keys") else r[2]
+            if r_date and r_title:
+                existing_content_keys.add(_content_key(r_date, r_time, r_title))
     except Exception:
         pass  # if events table doesn't exist yet, just skip dedupe
 
+    # Normalise the person-link target. Strip trailing .md so the resulting
+    # wikilink is `[[10_Profile/People/Foo]]`, not `[[...Foo.md]]`.
+    person_link = ""
+    if link_to_person:
+        p = link_to_person.strip().lstrip("/")
+        if p.endswith(".md"):
+            p = p[:-3]
+        person_link = f"with: [[{p}]]"
+
     added = 0
-    skipped = 0
+    skipped_uid = 0
+    skipped_content = 0
     errors: list[str] = []
     previews: list[str] = []
 
@@ -499,16 +550,33 @@ def pull_ical_subscription(
                 all_day = True
 
             if uid and uid in existing_uids:
-                skipped += 1
+                skipped_uid += 1
+                continue
+            ck = _content_key(date_iso, time_str, summary)
+            if cross_calendar_dedupe and ck in existing_content_keys:
+                skipped_content += 1
                 continue
 
             marker = f"[ical-uid:{uid}][source:{source_tag}]" if uid else f"[source:{source_tag}]"
-            full_desc = (ical_desc + "\n\n" if ical_desc else "") + marker
+            desc_parts: list[str] = []
+            if ical_desc:
+                desc_parts.append(ical_desc)
+            if person_link:
+                desc_parts.append(person_link)
+            desc_parts.append(marker)
+            full_desc = "\n\n".join(desc_parts)
 
             if dry_run:
-                previews.append(f"  {date_iso} {time_str or 'all-day'} — {summary}"
-                                + (f" @ {location}" if location else ""))
+                preview_line = f"  {date_iso} {time_str or 'all-day'} — {summary}"
+                if location:
+                    preview_line += f" @ {location}"
+                if person_link:
+                    preview_line += f"  ← {person_link}"
+                previews.append(preview_line)
                 added += 1
+                existing_content_keys.add(ck)  # avoid re-counting dups within preview
+                if uid:
+                    existing_uids.add(uid)
                 continue
 
             result = schedule_event(
@@ -525,6 +593,7 @@ def pull_ical_subscription(
                 added += 1
                 if uid:
                     existing_uids.add(uid)
+                existing_content_keys.add(ck)
             else:
                 errors.append(f"{date_iso} {summary[:40]}: {result[:120]}")
         except Exception as exc:
@@ -532,9 +601,15 @@ def pull_ical_subscription(
 
     summary_lines: list[str] = []
     verb = "would add" if dry_run else "added"
+    skip_parts: list[str] = []
+    if skipped_uid:
+        skip_parts.append(f"{skipped_uid} dup'd by UID")
+    if skipped_content:
+        skip_parts.append(f"{skipped_content} dup'd by content")
+    skip_summary = (", " + ", ".join(skip_parts)) if skip_parts else ""
+    person_note = f" → linked to [[{link_to_person}]]" if link_to_person else ""
     summary_lines.append(
-        f"📅 iCal sync ({source_tag}): {added} {verb}, "
-        f"{skipped} skipped (already synced)"
+        f"📅 iCal sync ({source_tag}){person_note}: {added} {verb}{skip_summary}"
     )
     if dry_run and previews:
         summary_lines.append(f"Preview (first {min(15, len(previews))}):")
@@ -548,3 +623,89 @@ def pull_ical_subscription(
         if len(errors) > 5:
             summary_lines.append(f"  - ... +{len(errors) - 5} more")
     return "\n".join(summary_lines)
+
+
+def _parse_ical_url_spec(spec: str) -> dict:
+    """Parse one entry of ``IRIS_DEFAULT_ICAL_URLS``.
+
+    Format: ``URL[;key=value][;key=value]``. Supported keys:
+      * ``tag`` — source label (default ``ical``).
+      * ``person`` — vault path to a person note. Each event from this
+        feed gets ``with: [[<path>]]`` in its description.
+      * ``dedupe`` — ``content`` (default, cross-calendar dedupe ON) or
+        ``uid`` (UID-only).
+    """
+    parts = spec.split(";")
+    out: dict = {
+        "url": parts[0].strip(),
+        "tag": "ical",
+        "person": "",
+        "cross_calendar_dedupe": True,
+    }
+    for part in parts[1:]:
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if k == "tag":
+            out["tag"] = v
+        elif k == "person":
+            out["person"] = v
+        elif k == "dedupe":
+            out["cross_calendar_dedupe"] = v.lower() not in ("uid", "none", "off")
+    return out
+
+
+@mcp.tool()
+def sync_all_calendars(
+    days_ahead: int = 30,
+    days_back: int = 0,
+    dry_run: bool = False,
+) -> str:
+    """Sync every iCal feed configured in ``IRIS_DEFAULT_ICAL_URLS``.
+
+    Reads the env var, splits on ``|``, parses each entry as
+    ``URL[;tag=...][;person=...][;dedupe=...]``, and runs
+    ``pull_ical_subscription`` for each. Feeds are processed in order, so
+    the FIRST feed wins on content collisions — set your most-authoritative
+    calendar first.
+
+    Example ``.env`` entry:
+        IRIS_DEFAULT_ICAL_URLS=webcal://p01...icloud.../personal.ics;tag=icloud-personal|webcal://p02...icloud.../shared-with-marimo.ics;tag=marimo;person=10_Profile/People/Marimo Honda
+
+    Args:
+        days_ahead: Days into the future to import (passed to each feed).
+        days_back: Days into the past.
+        dry_run: List what each feed WOULD import without writing.
+
+    Returns a multi-line summary, one block per feed.
+    """
+    import os as _os
+    raw = (_os.environ.get("IRIS_DEFAULT_ICAL_URLS") or "").strip()
+    if not raw:
+        return ("err: IRIS_DEFAULT_ICAL_URLS not set. Either set it in .env "
+                "(pipe-separated feeds, see docker/.env.example) or call "
+                "`pull_ical_subscription(url=...)` directly with a URL.")
+
+    specs = [s.strip() for s in raw.split("|") if s.strip()]
+    if not specs:
+        return "err: IRIS_DEFAULT_ICAL_URLS is set but parsed to no feeds."
+
+    out_blocks: list[str] = []
+    for i, spec in enumerate(specs, start=1):
+        parsed = _parse_ical_url_spec(spec)
+        if not parsed["url"]:
+            out_blocks.append(f"feed #{i}: ⚠️ empty URL — skipped")
+            continue
+        out_blocks.append(f"── Feed {i}/{len(specs)} ({parsed['tag']}) ──")
+        out_blocks.append(pull_ical_subscription(
+            url=parsed["url"],
+            days_ahead=days_ahead,
+            days_back=days_back,
+            dry_run=dry_run,
+            source_tag=parsed["tag"],
+            link_to_person=parsed["person"],
+            cross_calendar_dedupe=parsed["cross_calendar_dedupe"],
+        ))
+    return "\n".join(out_blocks)
