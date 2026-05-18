@@ -1516,11 +1516,19 @@ class _AsyncToSyncByteStream(io.RawIOBase):
         return len(data)
 
 
-async def _speak_via_edge_streaming(guild_id: int, cleaned: str) -> bool:
+async def _speak_via_edge_streaming(
+    guild_id: int,
+    cleaned: str,
+    voice: str | None = None,
+) -> bool:
     """Stream Edge TTS audio directly into Discord — start playback as
     soon as the first MP3 chunk arrives instead of waiting for the full
     synthesis. Returns True on success, False to signal "couldn't stream,
     fall back to buffered path".
+
+    ``voice`` is the resolved Edge voice slug for the detected language
+    (caller's responsibility — see ``_speak_in_voice``). Falls back to
+    ``IRIS_EDGE_VOICE`` env / Ava when caller passes None.
 
     Pipeline:
         edge_tts.Communicate.stream() ─chunks→ _AsyncToSyncByteStream
@@ -1541,7 +1549,7 @@ async def _speak_via_edge_streaming(guild_id: int, cleaned: str) -> bool:
     except ImportError:
         return False
 
-    voice = (os.environ.get("IRIS_EDGE_VOICE") or "en-US-AvaNeural").strip()
+    voice = (voice or os.environ.get("IRIS_EDGE_VOICE") or "en-US-AvaNeural").strip()
     rate = (os.environ.get("IRIS_EDGE_RATE") or "+0%").strip()
     pitch = (os.environ.get("IRIS_EDGE_PITCH") or "+0Hz").strip()
 
@@ -1623,10 +1631,12 @@ async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
         return  # Nothing speakable (pure emoji / wikilinks reply)
 
     # Decide whether streaming is viable. Conditions:
-    #   - The configured engine resolves to Edge for this text's language.
+    #   - The configured engine resolves to Edge for this text's language
+    #     (always true today; left explicit so a future non-Edge engine
+    #     would auto-route through the buffered path).
     #   - The text doesn't contain multiple languages (the segmenter
     #     would synth each separately and concat, which doesn't stream).
-    streaming_ok = False
+    streaming_voice: str | None = None
     try:
         from _iris.tools.voice import (  # noqa: PLC0415
             _resolve_voice_spec, _segment_text_by_language,
@@ -1636,20 +1646,18 @@ async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
             lang = segments[0][0]
             chosen_engine, voice = _resolve_voice_spec(lang)
             if chosen_engine == "edge":
-                # Push voice into env so the streaming helper picks it up.
-                os.environ["IRIS_EDGE_VOICE"] = voice
-                streaming_ok = True
+                streaming_voice = voice
     except Exception:
         log.exception("voice: streaming decision failed — using buffered path")
-        streaming_ok = False
+        streaming_voice = None
 
     # Wait for any in-flight playback to drain — both paths share this rule.
     while vc.is_playing():
         await asyncio.sleep(0.2)
 
-    if streaming_ok:
+    if streaming_voice is not None:
         try:
-            if await _speak_via_edge_streaming(guild_id, cleaned):
+            if await _speak_via_edge_streaming(guild_id, cleaned, voice=streaming_voice):
                 return
         except Exception:
             log.exception("voice: streaming path failed — falling back to buffered")
