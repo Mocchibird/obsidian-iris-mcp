@@ -679,38 +679,30 @@ def _load_system_prompt() -> str | None:
         "   success) — ask him to repeat or type it instead.\n"
         " - When unsure where a file goes, ask in chat rather than "
         "   guessing.\n\n"
-        "Voice channel (Phase 2.2.0 — TTS one-way): Hyun-Min can ask "
-        "the bot to join his current voice channel via plain text "
-        "messages like 'join voice' / 'iris join my voice channel' "
-        "/ '/voice join' — these are handled by a keyword pre-router "
-        "BEFORE you see the message, so you don't need to do anything "
-        "special. Same for 'leave voice' / '/voice leave'. While the "
-        "bot is in a voice channel, EVERY reply you send is also "
-        "spoken aloud via the configured TTS engine (Piper by default, "
-        "Kokoro if `IRIS_TTS_ENGINE=kokoro`, or auto-routed per language "
-        "if `=auto`). Implications for how you write:\n"
+        "Voice channel (TTS one-way): Hyun-Min can ask the bot to join "
+        "his current voice channel via plain text messages like 'join "
+        "voice' / 'iris join my voice channel' / '/voice join' — these "
+        "are handled by a keyword pre-router BEFORE you see the "
+        "message, so you don't need to do anything special. Same for "
+        "'leave voice' / '/voice leave'. While the bot is in a voice "
+        "channel, EVERY reply you send is also spoken aloud via "
+        "Microsoft Edge TTS (Azure Neural voices, cloud-hosted, free, "
+        "no API key). Streaming playback starts ~300 ms after request. "
+        "Implications for how you write:\n"
         " - Match Hyun-Min's language. He fluently uses English, "
         "   German, Korean, and Japanese. When he writes in one of "
-        "   those, reply in the same language (with the same "
-        "   formatting/punctuation conventions). The TTS engine in "
-        "   `auto` mode language-detects your reply *per sentence* "
-        "   and routes each segment to Microsoft Edge TTS: English "
-        "   → en-US-AvaNeural, Korean → ko-KR-SunHiNeural, Japanese "
-        "   → ja-JP-NanamiNeural. Streaming playback starts ~300 ms "
-        "   after request, total round-trip < 1 s. German falls to "
-        "   the English "
-        "   voice (Kokoro has no German and engine-hopping sounds "
-        "   bad). CJK script is detected even on very short text "
-        "   (hangul → Korean, kana → Japanese) so short replies "
-        "   route correctly. Latin-only text below 10 chars defaults "
-        "   to English to avoid \"Ah!\" / \"Ja!\" misrouting.\n"
-        " - Japanese kanji are handled automatically — the synth "
-        "   pipeline pre-converts kanji to hiragana via pykakasi "
-        "   before sending to Kokoro. Write Japanese naturally with "
-        "   kanji as a Japanese speaker would; the TTS pronounces "
-        "   it correctly. (Caveat for homographs: 一日 ambiguity is "
-        "   resolved by the dictionary's most-common reading, which "
-        "   isn't always context-correct. Acceptable trade-off.)\n"
+        "   those, reply in the same language. The TTS layer language-"
+        "   detects your reply *per sentence* and routes each segment "
+        "   to a language-matching Edge voice: English → "
+        "   en-US-AvaNeural, Korean → ko-KR-SunHiNeural, Japanese → "
+        "   ja-JP-NanamiNeural. German falls to the English voice "
+        "   (Edge has German voices but engine consistency wins). CJK "
+        "   script is detected even on very short text (hangul → "
+        "   Korean, kana → Japanese) so short replies route "
+        "   correctly. Latin-only text below 10 chars defaults to "
+        "   English to avoid \"Ah!\" / \"Ja!\" misrouting. Japanese "
+        "   kanji are pronounced natively by Edge — write Japanese "
+        "   normally with kanji as a Japanese speaker would.\n"
         " - Reply text should READ ALOUD naturally. Long bulleted "
         "   technical answers sound awkward; short conversational "
         "   sentences sound good. Keep it concise when you know you're "
@@ -721,8 +713,8 @@ def _load_system_prompt() -> str | None:
         "   last path segment) — fine to use, just don't litter.\n"
         " - Emoji are stripped from the spoken text but shown in the "
         "   text reply — use them as visual markers without worrying "
-        "   about Piper saying 'sparkles emoji'.\n"
-        " - Code blocks are spoken as text (Piper reads the contents, "
+        "   about Edge saying 'sparkles emoji'.\n"
+        " - Code blocks are spoken as text (Edge reads the contents, "
         "   not the backticks). Avoid dropping a 50-line code block "
         "   while in voice — link to the file instead.\n"
         " - The bot auto-leaves the voice channel after 10 min of "
@@ -1120,14 +1112,12 @@ _VOICE_AUTO_DELETE = os.environ.get(
     "IRIS_DISCORD_VOICE_AUTO_DELETE", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
 
-# ── Phase 2.2.0 — voice channel TTS playback ────────────────────────────────
+# ── Voice channel TTS playback ──────────────────────────────────────────────
 # When enabled, the bot joins a Discord voice channel on command and speaks
-# Iris's text replies via the configured TTS engine (IRIS_TTS_ENGINE=piper
-# by default — fast, robotic-ish; or =kokoro — 82M-param neural model, much
-# higher quality, multilingual). Either way the synthesized WAV is piped
-# through ffmpeg to Discord's 48 kHz stereo Opus. Phase 2.2.1 will add voice
-# receive + STT for full duplex. For now this is one-way (you type, Iris
-# replies in text AND speaks the reply aloud in the voice channel).
+# Iris's text replies via Microsoft Edge TTS. The MP3 stream from Edge is
+# piped directly into ffmpeg → Discord's 48 kHz stereo Opus, so playback
+# starts ~300 ms after the request instead of waiting for the full synth.
+# Phase 2.2.1 will add voice receive + STT for full duplex.
 _VOICE_CHAT_ENABLED = os.environ.get(
     "IRIS_DISCORD_VOICE_CHAT", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
@@ -1356,7 +1346,7 @@ def _format_skipped_image_hint(skipped: list[dict]) -> str:
 
 # ── Phase 2.2.0 — voice channel state machine + TTS playback ────────────────
 
-# Markdown / emoji / link cleanup for TTS — Piper would otherwise read out
+# Markdown / emoji / link cleanup for TTS — Edge would otherwise read out
 # "asterisk asterisk bold asterisk asterisk" etc. The pattern set is
 # intentionally conservative: strip only what's clearly markdown noise,
 # keep punctuation that affects prosody (periods, commas, question marks).
@@ -1366,7 +1356,7 @@ _TTS_MD_CODE = re.compile(r"`([^`]+)`")
 _TTS_WIKILINK = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 _TTS_MASKED_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _TTS_EMOJI_PUNCT = re.compile(
-    # Strip a few Unicode ranges that Piper reads literally:
+    # Strip a few Unicode ranges that Edge reads literally:
     # - Discord/Obsidian emoji (most useful emoji)
     # - misc symbols
     r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0001F02F]"
@@ -1374,7 +1364,7 @@ _TTS_EMOJI_PUNCT = re.compile(
 
 
 def _clean_for_tts(text: str) -> str:
-    """Strip markdown decoration + emoji + URLs from a text reply so Piper
+    """Strip markdown decoration + emoji + URLs from a text reply so Edge
     speaks the content, not the formatting. Conservative — keeps punctuation
     that affects intonation, just removes the noise.
     """
@@ -1614,11 +1604,12 @@ async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
     """Synthesize + play Iris's reply in the voice channel, if she's in one.
 
     Two playback paths:
-      * Streaming (Edge only, single-language): pipe Edge MP3 chunks
-        directly into ffmpeg+Discord as they arrive. First-audio-out is
-        ~300-500ms after request — feels like a real conversation.
-      * Buffered (everything else): synth the full WAV first, then play.
-        Kokoro/Piper are fast enough that this is fine on GPU.
+      * Streaming (single-language): pipe Edge MP3 chunks directly into
+        ffmpeg+Discord as they arrive. First-audio-out is ~300-500ms after
+        request — feels like a real conversation.
+      * Buffered (multi-language): synth each segment to WAV, concat via
+        ffmpeg, then play. Used when a single reply mixes scripts (e.g.
+        an English sentence followed by a Korean one).
 
     Either way: if a previous reply is still playing, this one waits its
     turn so we don't talk over ourselves on a queued user message.
@@ -3517,7 +3508,7 @@ async def on_message(message: discord.Message) -> None:
                 "\nTreat the transcript above as if Hyun-Min typed it. "
                 "Respond in text — if I'm in a voice channel (see Phase "
                 "2.2.0) your text reply will also be spoken aloud via "
-                "Piper TTS."
+                "Edge TTS."
             )
         attachments_block += _format_skipped_image_hint(skipped_imgs)
         attachments_block += "]"
@@ -3587,10 +3578,10 @@ async def on_message(message: discord.Message) -> None:
                                     await stream.append(block.text)
                     await stream.finalize()
                     # Phase 2.2.0: if Iris is in a voice channel for this
-                    # guild, also speak the reply via Piper TTS. Fire-and-
+                    # guild, also speak the reply via Edge TTS. Fire-and-
                     # forget — the text reply is already on screen, the
                     # audio just plays asynchronously. Synthesis + playback
-                    # happen off the event loop (Piper is sync + CPU-bound).
+                    # happen off the event loop in a worker thread.
                     if _VOICE_CHAT_ENABLED and message.guild:
                         gid = message.guild.id
                         if gid in _voice_clients:

@@ -875,7 +875,7 @@ class VaultIndex:
         # check_same_thread=False is required because we share one connection
         # across the main asyncio loop AND any worker threads that asyncio.
         # to_thread() spins up (notably the SQL-view refresh loop, the habit
-        # reminder scanner, and Whisper/Piper synth callbacks). The default
+        # reminder scanner, and Whisper/Edge TTS synth callbacks). The default
         # `check_same_thread=True` is conservative for SQLite — actual
         # concurrent access is safe in WAL mode + a 10s busy timeout as long
         # as no two writers race. Our writers are externally serialized:

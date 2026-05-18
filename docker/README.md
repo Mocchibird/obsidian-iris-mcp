@@ -331,13 +331,17 @@ docker network create ai-models
 
 Both compose files then join it as `external: true`. Order of stack startup doesn't matter.
 
-## Phase 2 — voice (planned)
+## Phase 2 — voice
 
-Voice is a separate add-on that will:
+Voice is built in:
 
-- Join a Discord voice channel
-- Stream audio in → Whisper (STT) → Claude → Piper / Coqui (TTS) → audio out
-- Target ~1–2 s round-trip latency (mic → speaker)
-- Sentence-by-sentence streaming so audio starts before the full reply is done
+- Iris joins a Discord voice channel on demand
+- Voice messages: Whisper (STT, local, CPU) transcribes attached `.ogg` clips
+- Text replies in a voice channel are spoken via Microsoft Edge TTS
+  (Azure Neural voices, free, no API key). Per-sentence language routing
+  picks an English / Korean / Japanese voice automatically.
+- Streaming synth (Edge MP3 → ffmpeg → Discord) gives ~300-500ms first-audio
 
-Whisper / TTS models live in the container; no API keys involved. The image's `ffmpeg`/`libopus`/`libsndfile1` packages are pre-installed for this.
+Whisper runs locally; Edge TTS is an outbound HTTPS call to Microsoft's
+public endpoint (no key). The image's `ffmpeg`/`libopus`/`libsndfile1`
+packages are pre-installed for this.
