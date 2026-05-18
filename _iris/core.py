@@ -10,16 +10,12 @@ from __future__ import annotations
 import calendar
 import hashlib
 import json
-import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
 import unicodedata
-import uuid
 from datetime import datetime, timedelta
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Optional
 
