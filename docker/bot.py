@@ -644,11 +644,12 @@ def _load_system_prompt() -> str | None:
         "   a `🎙️ Voice message transcript` heading. Treat the "
         "   transcript as if Hyun-Min had typed it — same intent "
         "   resolution, same tool dispatch. Reply in text (voice-channel "
-        "   TTS is Phase 2.2). If the transcript shows `(silence / "
-        "   unintelligible)`, ask him to repeat or type it instead. The "
-        "   raw .ogg file is still in the inbox; only file it long-term "
-        "   if there's a reason (e.g. voice journaling). Otherwise leave "
-        "   it for the inbox triage pass to clean up.\n"
+        "   TTS is Phase 2.2). The .ogg file is **auto-deleted after "
+        "   successful transcription** because the transcript IS the "
+        "   record — don't try to read the audio file path; work from "
+        "   the transcript. If the transcript shows `(silence / "
+        "   unintelligible)` the file is kept (deletion only fires on "
+        "   success) — ask him to repeat or type it instead.\n"
         " - When unsure where a file goes, ask in chat rather than "
         "   guessing.\n\n"
         "Calorie + weight tracking (active goal): Hyun-Min is tracking "
@@ -1023,6 +1024,14 @@ _IMAGE_EXT_TO_MIME = {
 # files up to the full 30 MB / 8000-px ceiling, so the experience degrades
 # gracefully rather than failing.
 _MAX_IMAGE_BYTES = int(os.environ.get("IRIS_DISCORD_MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
+# Voice messages are transient — the transcript is the durable artifact, the
+# .ogg/Opus blob is just data-on-the-wire. Default: delete the audio file
+# from `90_Inbox/inbox/` after a successful Whisper transcription so the
+# inbox doesn't fill up with one-off voice clips. Set to "0" / "false" /
+# "no" to keep the audio (e.g. if voice journaling is a use case).
+_VOICE_AUTO_DELETE = os.environ.get(
+    "IRIS_DISCORD_VOICE_AUTO_DELETE", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
 # Cap total images per turn so a 10-attachment dump can't blow up the context.
 _MAX_IMAGES_PER_MSG = int(os.environ.get("IRIS_DISCORD_MAX_IMAGES_PER_MSG", "6"))
 # Absolute path inside the container where the vault is bind-mounted (see the
@@ -1122,48 +1131,72 @@ def _build_image_blocks_from_saved(
 async def _transcribe_voice_attachments(
     message: discord.Message,
     saved_paths: list[str],
-) -> list[tuple[str, str]]:
+) -> tuple[list[tuple[str, str, bool]], list[str]]:
     """For every audio attachment (Discord voice messages = .ogg/Opus),
-    run Whisper STT on the saved inbox file and return [(rel_path, text), …].
+    run Whisper STT on the saved inbox file. Returns
+    ``(transcripts, deleted_paths)`` where:
 
-    Skipped silently when:
-      - The attachment isn't audio (image/PDF/text — handled elsewhere).
-      - faster-whisper isn't installed (Phase 2.1 dep — soft-fail so the
-        bot still works during a partial rollout).
-      - Transcription raises (file unreadable, Whisper crash, etc.) — logged.
+      - ``transcripts`` is a list of ``(rel_path, text, was_deleted)``.
+        ``was_deleted`` lets the caller phrase the attachments block
+        correctly ("transcribed + cleaned up" vs "transcribed + kept").
+      - ``deleted_paths`` is a list of vault-relative paths the helper
+        removed from disk. The caller filters these out of the
+        "Files just saved to the vault inbox" listing so we don't tell
+        Iris about files that no longer exist.
 
-    Runs the actual transcription inside `asyncio.to_thread` because
-    faster-whisper is sync + CPU-bound; we don't want to block the event
-    loop while the model chews on a 30 s voice clip.
+    Deletion policy (`_VOICE_AUTO_DELETE`, env-configurable):
+      - Default: delete after a SUCCESSFUL transcription (non-empty
+        transcript). Failed / silent transcriptions keep the file so
+        the user / Iris can still inspect it.
+      - When the env var is set to a falsy value, the file is always
+        kept — useful for voice-journaling use cases.
+
+    Soft-fails when faster-whisper isn't installed (partial rollouts).
+    Runs Whisper inside `asyncio.to_thread` so the event loop isn't
+    blocked by CPU-bound inference.
     """
     if not saved_paths or not message.attachments:
-        return []
+        return [], []
     try:
         from _iris.tools.voice import (
             is_audio_file, transcribe_audio_internal,
         )
     except Exception as e:
         log.warning("voice: STT module unavailable (%s) — skipping", e)
-        return []
-    out: list[tuple[str, str]] = []
+        return [], []
+    out: list[tuple[str, str, bool]] = []
+    deleted: list[str] = []
     pairs = list(zip(message.attachments, saved_paths))
     for att, rel in pairs:
         if not is_audio_file(att.filename):
             continue
         abs_path = str(Path(VAULT_ROOT) / rel)
+        transcript = ""
         try:
             transcript, detected_lang = await asyncio.to_thread(
                 transcribe_audio_internal, abs_path,
             )
-            out.append((rel, transcript))
             log.info(
                 "voice: transcribed %s (lang=%s, chars=%d)",
                 rel, detected_lang, len(transcript),
             )
         except Exception:
             log.exception("voice: transcription failed for %s", rel)
-            out.append((rel, ""))  # empty transcript signals failure to caller
-    return out
+
+        # Only delete on SUCCESS (non-empty transcript) and only when the
+        # env-configured policy allows it. A failed transcription keeps the
+        # file so it's still recoverable via the Read tool.
+        was_deleted = False
+        if transcript and _VOICE_AUTO_DELETE:
+            try:
+                Path(abs_path).unlink()
+                deleted.append(rel)
+                was_deleted = True
+                log.info("voice: auto-deleted %s post-transcription", rel)
+            except OSError as e:
+                log.warning("voice: could not delete %s: %s", rel, e)
+        out.append((rel, transcript, was_deleted))
+    return out, deleted
 
 
 def _format_skipped_image_hint(skipped: list[dict]) -> str:
@@ -2868,18 +2901,28 @@ async def on_message(message: discord.Message) -> None:
     # the picture directly (calorie estimation, screenshot triage, etc.).
     saved_paths = await _save_attachments_to_inbox(message)
     image_blocks: list[dict] = []
-    voice_transcripts: list[tuple[str, str]] = []  # (vault_rel_path, transcript)
+    voice_transcripts: list[tuple[str, str, bool]] = []  # (rel, text, deleted)
+    deleted_voice_paths: list[str] = []
     if saved_paths:
         image_blocks, skipped_imgs = _build_image_blocks_from_saved(message, saved_paths)
         # Transcribe any audio attachments (Discord voice messages = .ogg) via
         # Whisper. Done BEFORE building the attachments_block so the transcript
         # can be folded in as context rather than just listed as a file path.
-        voice_transcripts = await _transcribe_voice_attachments(message, saved_paths)
-        attachments_block = "\n\n[Files just saved to the vault inbox:\n" + \
-            "\n".join(f"- {p}" for p in saved_paths) + \
-            "\nLook at them and decide what to do — file the binaries via " \
-            "`import_drop_zone`, or move them somewhere else if you've " \
-            "already inferred where they belong."
+        # On successful transcription the .ogg is auto-deleted (see
+        # _VOICE_AUTO_DELETE) — those paths are filtered out of the inbox
+        # listing below so we don't tell Iris about files that don't exist.
+        voice_transcripts, deleted_voice_paths = await _transcribe_voice_attachments(
+            message, saved_paths,
+        )
+        remaining_paths = [p for p in saved_paths if p not in deleted_voice_paths]
+        if remaining_paths:
+            attachments_block = "\n\n[Files just saved to the vault inbox:\n" + \
+                "\n".join(f"- {p}" for p in remaining_paths) + \
+                "\nLook at them and decide what to do — file the binaries via " \
+                "`import_drop_zone`, or move them somewhere else if you've " \
+                "already inferred where they belong."
+        else:
+            attachments_block = "\n\n["  # opens the bracket below for voice-only path
         if image_blocks:
             attachments_block += (
                 f"\n\nThe {len(image_blocks)} image attachment(s) above are "
@@ -2893,11 +2936,23 @@ async def on_message(message: discord.Message) -> None:
                 f"{'s' if len(voice_transcripts) > 1 else ''} "
                 f"(via local Whisper STT):"
             )
-            for rel, transcript in voice_transcripts:
+            for rel, transcript, was_deleted in voice_transcripts:
+                tail = "" if was_deleted else f" — file kept at `{rel}`"
                 if transcript:
-                    attachments_block += f"\n  - `{rel}` → \"{transcript}\""
+                    attachments_block += f"\n  - \"{transcript}\"{tail}"
                 else:
-                    attachments_block += f"\n  - `{rel}` → (silence / unintelligible)"
+                    attachments_block += (
+                        f"\n  - (silence / unintelligible — file kept at `{rel}`)"
+                    )
+            deletion_count = sum(1 for _, _, d in voice_transcripts if d)
+            if deletion_count:
+                attachments_block += (
+                    f"\n\nThe {deletion_count} successfully-transcribed voice "
+                    f"file{'s were' if deletion_count != 1 else ' was'} "
+                    f"auto-deleted from the inbox — the transcript is the "
+                    f"durable record. Do NOT try to read those .ogg paths; "
+                    f"work from the transcript directly."
+                )
             attachments_block += (
                 "\nTreat the transcript above as if Hyun-Min typed it. "
                 "Respond in text — voice-channel TTS is Phase 2.2."
