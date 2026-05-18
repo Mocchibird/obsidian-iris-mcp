@@ -33,6 +33,7 @@ Env vars (all optional unless noted):
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import fcntl
 import json
@@ -575,17 +576,38 @@ def _load_system_prompt() -> str | None:
         "File uploads via Discord: when Hyun-Min attaches a file, the bot "
         "automatically saves it under `90_Inbox/inbox/<timestamp>_<name>` "
         "and surfaces the saved path(s) in your prompt under a "
-        "`[Files just saved to the vault inbox: ...]` block. Treat that as "
-        "a task: figure out what each file is and route it. Quick playbook:\n"
-        " - Photo of a whiteboard / screenshot → `import_drop_zone` files "
-        "   it under `40_Attachments/Images/` and creates an inbox note "
-        "   that embeds it; you then decide if it belongs to an existing "
-        "   project page and `move_files` accordingly.\n"
+        "`[Files just saved to the vault inbox: ...]` block. The vault is "
+        "bind-mounted into this container at `/vault`, so the saved file "
+        "is REAL and READABLE — you can call `Read(\"/vault/<vault-relative-"
+        "path>\")` on any file in the vault and the Read tool will return "
+        "its contents, including rendering image bytes (JPEG/PNG/GIF/WebP) "
+        "directly into your multimodal context. There is no iCloud or "
+        "remote-sync wall here. Two paths for images:\n"
+        " 1. Inline path (default): images ≤ the bot's inline cap (20 MB) "
+        "   are also passed as vision content blocks in the same turn — "
+        "   you see the picture immediately, no tool call needed.\n"
+        " 2. Read-tool fallback: if the saved-files block notes an image "
+        "   was NOT inlined (e.g. too large, multi-image limit, decode "
+        "   failure), CALL `Read(\"/vault/90_Inbox/inbox/<filename>\")` "
+        "   to see it. NEVER tell Hyun-Min to re-send the picture — the "
+        "   vault copy is already on disk and the Read tool reads it just "
+        "   fine.\n"
+        "Treat the inbox save as a routing task on top of whatever "
+        "analysis you do. Quick playbook:\n"
+        " - Food / meal photo → analyse for calories + macros (path 1 if "
+        "   inlined, path 2 otherwise). When portions are ambiguous, ask "
+        "   ONE clarifying question (cooking method, portion size, hidden "
+        "   fats) before giving a number. Then OFFER to log it. See the "
+        "   separate \"Calorie + weight tracking\" guidance below.\n"
+        " - Whiteboard / screenshot / diagram → describe what's in it, "
+        "   then `import_drop_zone` files it under `40_Attachments/"
+        "Images/` and creates an inbox note that embeds it; decide if it "
+        "   belongs to an existing project page and `move_files` "
+        "   accordingly.\n"
         " - PDF (receipt, document) → `extract_pdf_text` to read it, then "
         "   route. Receipts/invoices often belong with warranties.\n"
-        " - Image you can see directly → use the Read tool to view the "
-        "   image and infer what it is, then file appropriately.\n"
-        " - When unsure where it goes, ask in chat rather than guessing.\n\n"
+        " - When unsure where a file goes, ask in chat rather than "
+        "   guessing.\n\n"
         "Calorie + weight tracking (active goal): Hyun-Min is tracking "
         "intake to lose weight (started May 2026 at 107.5 kg). When a food "
         "photo or text mention comes through, your job is to estimate "
@@ -778,6 +800,186 @@ _INBOX_REL = "90_Inbox/inbox"
 # Sanitize attachment filenames — strip anything outside a safe character set
 # so a hostile or weird name can't escape the inbox directory.
 _SAFE_FILENAME_RE = re.compile(r"[^\w\-. ]+")
+
+# ── Inline image attachments ────────────────────────────────────────────────
+# When a Discord attachment is an image we recognise, we base64-encode it and
+# pass it to Claude as a multimodal content block alongside the user's text,
+# so she can actually *see* the picture (calorie estimation, screenshot triage,
+# whiteboard OCR, etc.). Non-image attachments still go through the inbox-only
+# path — Iris reads/routes them with `extract_pdf_text`, `import_drop_zone`,
+# etc. by file path.
+_IMAGE_MIMES = {
+    "image/jpeg": "image/jpeg",
+    "image/jpg":  "image/jpeg",
+    "image/png":  "image/png",
+    "image/gif":  "image/gif",
+    "image/webp": "image/webp",
+}
+_IMAGE_EXT_TO_MIME = {
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png":  "image/png",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
+}
+# Anthropic's vision API accepts images up to 30 MB / 8000×8000 px regardless
+# of transport. The inline path here (base64-stuffed into the user message
+# envelope, sent over stdin to the Claude Code CLI) is more constrained than
+# the Read-tool path because:
+#   - base64 inflates bytes by ~33 % (a 20 MB image becomes ~27 MB of string)
+#   - the whole image lives in a single line of stream-json over a pipe
+#   - subprocess line-buffer + request-body limits kick in well before 30 MB
+# 20 MB is the sweet spot that covers virtually every phone photo at full
+# resolution (typical phone JPEG: 2–8 MB; high-res HEIC/PNG: 8–15 MB) while
+# leaving headroom for envelope overhead. Anything above the cap falls
+# through to the Read-tool hint in the saved-files prompt block — Claude
+# Code's Read tool uses Anthropic's native vision upload path and handles
+# files up to the full 30 MB / 8000-px ceiling, so the experience degrades
+# gracefully rather than failing.
+_MAX_IMAGE_BYTES = int(os.environ.get("IRIS_DISCORD_MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
+# Cap total images per turn so a 10-attachment dump can't blow up the context.
+_MAX_IMAGES_PER_MSG = int(os.environ.get("IRIS_DISCORD_MAX_IMAGES_PER_MSG", "6"))
+# Absolute path inside the container where the vault is bind-mounted (see the
+# `volumes:` block in docker-compose.yml — host vault is mounted at /vault).
+# The Read tool is rooted at the container's filesystem, so this is the prefix
+# Iris must use to read any vault file (image, PDF, .md, etc.) directly.
+_VAULT_MOUNT = "/vault"
+
+
+def _attachment_image_mime(att: discord.Attachment) -> str | None:
+    """Return the Anthropic-compatible MIME type for an image attachment,
+    or None if this attachment isn't an image we can pass to vision.
+    """
+    ct = (att.content_type or "").split(";", 1)[0].strip().lower()
+    if ct in _IMAGE_MIMES:
+        return _IMAGE_MIMES[ct]
+    ext = Path(att.filename).suffix.lower()
+    return _IMAGE_EXT_TO_MIME.get(ext)
+
+
+def _build_image_blocks_from_saved(
+    message: discord.Message,
+    saved_paths: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Read just-saved attachments off disk and turn each image into an
+    Anthropic content block. Returns (inline_blocks, skipped_records).
+
+    Each skipped record is a dict ``{"filename", "rel_path", "size_bytes",
+    "reason"}`` so the caller can build an actionable prompt hint pointing
+    Iris at the Read-tool fallback path instead of just naming the file.
+
+    We read from the already-saved inbox copy rather than re-downloading from
+    Discord — avoids double network I/O and guarantees Iris's vision input
+    matches what's stored in the vault. Order matches the Discord attachment
+    order so prompts like "the first picture" still make sense.
+    """
+    blocks: list[dict] = []
+    skipped: list[dict] = []
+    if not saved_paths or not message.attachments:
+        return blocks, skipped
+    # saved_paths[i] corresponds to message.attachments[i] — _save_attachments_to_inbox
+    # iterates attachments in order and appends to `saved` only on success, so a
+    # failed save would desync this. Be defensive: only zip up to the shorter list.
+    pairs = list(zip(message.attachments, saved_paths))
+    for att, rel in pairs:
+        mime = _attachment_image_mime(att)
+        if not mime:
+            continue  # not an image — non-image attachments aren't "skipped vision"
+        record_base = {
+            "filename": att.filename,
+            "rel_path": rel,
+            "size_bytes": att.size,
+        }
+        if len(blocks) >= _MAX_IMAGES_PER_MSG:
+            skipped.append({**record_base, "reason": "per-message image cap reached"})
+            continue
+        abs_path = Path(VAULT_ROOT) / rel
+        try:
+            raw = abs_path.read_bytes()
+        except OSError as e:
+            log.warning("could not read saved image %s for vision: %s", abs_path, e)
+            skipped.append({**record_base, "reason": f"could not read file ({e})"})
+            continue
+        size = len(raw)
+        record_base["size_bytes"] = size
+        if size > _MAX_IMAGE_BYTES:
+            log.info(
+                "skipping image %s for vision — %d bytes > cap %d",
+                att.filename, size, _MAX_IMAGE_BYTES,
+            )
+            skipped.append({
+                **record_base,
+                "reason": (
+                    f"too large for inline vision "
+                    f"({size / (1024 * 1024):.1f} MB > "
+                    f"{_MAX_IMAGE_BYTES / (1024 * 1024):.0f} MB cap)"
+                ),
+            })
+            continue
+        try:
+            data = base64.b64encode(raw).decode("ascii")
+        except Exception as e:  # pragma: no cover — should not happen
+            log.warning("base64 encode failed for %s: %s", att.filename, e)
+            skipped.append({**record_base, "reason": f"base64 encode failed ({e})"})
+            continue
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime,
+                "data": data,
+            },
+        })
+    return blocks, skipped
+
+
+def _format_skipped_image_hint(skipped: list[dict]) -> str:
+    """Render the skipped-image notice as an actionable prompt block.
+
+    Tells Iris *exactly* what to do: call the Read tool on the bind-mounted
+    /vault path. Previously we just listed filenames, which left her with no
+    plan and caused her to fall back to "ask the user to re-send" — even
+    though the file was sitting right there in the vault and Claude Code's
+    Read tool handles images natively.
+    """
+    if not skipped:
+        return ""
+    lines = ["\n\nSome image attachments were NOT inlined as vision content:"]
+    for s in skipped:
+        abs_path = f"{_VAULT_MOUNT}/{s['rel_path']}"
+        lines.append(
+            f"- {s['filename']} — {s['reason']}. "
+            f"View it by calling `Read(\"{abs_path}\")` — the Read tool "
+            f"renders image bytes directly into your context."
+        )
+    lines.append(
+        "Do NOT tell Hyun-Min to re-send the image — the vault copy is "
+        "already on disk and the Read tool can see it. The /vault mount is "
+        "real and bind-mounted into this container; image-handling via Read "
+        "works the same way it does for any other file."
+    )
+    return "\n".join(lines)
+
+
+async def _multimodal_query_stream(text: str, image_blocks: list[dict]):
+    """Async generator that yields a single multimodal user-message dict for
+    ClaudeSDKClient.query() — the SDK's AsyncIterable input path lets us send
+    structured content blocks (image + text) instead of a plain string, so
+    Claude sees the attached pictures directly.
+
+    The CLI/SDK adds `session_id` itself if we don't set one; we still produce
+    a single complete `{"type": "user", "message": {...}}` envelope.
+    """
+    yield {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                *image_blocks,
+                {"type": "text", "text": text},
+            ],
+        },
+    }
 
 
 async def _save_attachments_to_inbox(message: discord.Message) -> list[str]:
@@ -2150,14 +2352,27 @@ async def on_message(message: discord.Message) -> None:
     # Save any attached files to the vault's inbox before invoking Iris.
     # She'll see the saved paths in her prompt and can read / route them
     # via the iris MCP tools (extract_pdf_text, extract_excalidraw_text,
-    # import_drop_zone, move_files, etc.).
+    # import_drop_zone, move_files, etc.). For *image* attachments we also
+    # base64-encode them into Anthropic content blocks below so Iris can see
+    # the picture directly (calorie estimation, screenshot triage, etc.).
     saved_paths = await _save_attachments_to_inbox(message)
+    image_blocks: list[dict] = []
     if saved_paths:
+        image_blocks, skipped_imgs = _build_image_blocks_from_saved(message, saved_paths)
         attachments_block = "\n\n[Files just saved to the vault inbox:\n" + \
             "\n".join(f"- {p}" for p in saved_paths) + \
             "\nLook at them and decide what to do — file the binaries via " \
             "`import_drop_zone`, or move them somewhere else if you've " \
-            "already inferred where they belong.]"
+            "already inferred where they belong."
+        if image_blocks:
+            attachments_block += (
+                f"\n\nThe {len(image_blocks)} image attachment(s) above are "
+                "ALSO included inline in this message as vision input — you "
+                "can analyse them directly (describe contents, estimate "
+                "calories, read text, etc.) without needing to open the file."
+            )
+        attachments_block += _format_skipped_image_hint(skipped_imgs)
+        attachments_block += "]"
         content = (content + attachments_block).strip() if content else \
                   "(no text — see attachments below)" + attachments_block
 
@@ -2213,7 +2428,10 @@ async def on_message(message: discord.Message) -> None:
                 stream = StreamingReply(placeholder)
                 try:
                     agent = await _get_or_create_client(key, seed_message=message)
-                    await agent.query(content)
+                    if image_blocks:
+                        await agent.query(_multimodal_query_stream(content, image_blocks))
+                    else:
+                        await agent.query(content)
                     async for msg in agent.receive_response():
                         if isinstance(msg, AssistantMessage):
                             for block in msg.content:

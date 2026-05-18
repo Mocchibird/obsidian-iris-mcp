@@ -1636,8 +1636,15 @@ class VaultIndex:
                 link_rows,
             )
 
-        # -- tasks from ## Tasks section
-        task_lines = find_task_lines_in_section(text, "Tasks")
+        # -- tasks + reminders (whole-note walk with section skip-list)
+        # Previously only scanned `## Tasks` / `## Reminders` — that silently
+        # dropped every checkbox in notes using a different convention
+        # (e.g. Huawei To-Do.md uses `## High Priority`, `## General To-Do`).
+        # Now we walk the whole note, route reminder-section bullets to the
+        # reminders table, skip archive-style sections (Done / Completed /
+        # References / Related Notes / etc.), and put everything else in
+        # the tasks table — including loose checkboxes before any heading.
+        task_lines, reminder_lines = find_all_task_lines(text)
         task_rows = [
             (rel, p["text"], int(p["checked"]), p["due"], p["priority"], p["done"])
             for _, _, p in task_lines
@@ -1649,8 +1656,6 @@ class VaultIndex:
                 task_rows,
             )
 
-        # -- reminders from ## Reminders section
-        reminder_lines = find_task_lines_in_section(text, "Reminders")
         reminder_rows = [
             (rel, p["text"], int(p["checked"]), p.get("remind_on", ""), p.get("repeat", ""), p["done"])
             for _, _, p in reminder_lines
@@ -2836,6 +2841,115 @@ def find_task_lines_in_section(text: str, section: str) -> list[tuple[int, str, 
             results.append((cursor, stripped, parsed))
         cursor += len(line)
     return results
+
+
+# Headings whose contents we deliberately exclude from task indexing. Keyed by
+# lower-cased, stripped heading text (without leading `#`s). Matching is
+# substring-ish via `_section_is_skipped` below so "Old Tasks", "Archived
+# stuff", "Reference Material", etc. all hit.
+_TASK_SKIP_HEADINGS: tuple[str, ...] = (
+    "done",
+    "completed",
+    "archive",
+    "archived",
+    "old",
+    "deprecated",
+    "abandoned",
+    "cancelled",
+    "canceled",
+    "references",
+    "reference",
+    "related notes",
+    "related",
+    "resources",
+    "links",
+    "appendix",
+    "history",
+    # Note: deliberately NOT skipping "backlog" — backlog items are real open
+    # work and should be visible. Same for "someday", "later", "ideas".
+)
+
+# Heading we treat as the *reminders* bucket (gets routed to the reminders
+# table instead of tasks). Same matching rules as the skip-list.
+_REMINDERS_HEADINGS: tuple[str, ...] = ("reminders", "reminder")
+
+
+def _heading_text_matches(heading: str, candidates: tuple[str, ...]) -> bool:
+    """Return True if any candidate appears as a whole word in the heading.
+
+    Matching is case-insensitive and word-boundary-aware so "Done" matches
+    "## Done" and "## ✅ Done — 2026" but NOT "## Doing".
+    """
+    h = heading.lower()
+    for cand in candidates:
+        # Word-boundary match: cand surrounded by non-word chars or string ends.
+        if re.search(rf"(?:^|\W){re.escape(cand)}(?:\W|$)", h):
+            return True
+    return False
+
+
+def find_all_task_lines(
+    text: str,
+    skip_headings: tuple[str, ...] = _TASK_SKIP_HEADINGS,
+    reminder_headings: tuple[str, ...] = _REMINDERS_HEADINGS,
+) -> tuple[list[tuple[int, str, dict[str, Any]]], list[tuple[int, str, dict[str, Any]]]]:
+    """Walk the whole note and return (task_lines, reminder_lines).
+
+    Why this exists: the previous indexer only looked at `## Tasks` and
+    `## Reminders` sections, which silently dropped every checkbox in a note
+    that used a different heading convention (e.g. `## High Priority`,
+    `## General To-Do`). That made entire to-do notes invisible to the
+    morning brief and `query_tasks()`.
+
+    The walk tracks the active heading stack and:
+      - Routes bullets under any `reminder_headings` heading (at any depth)
+        to the reminders bucket.
+      - Skips bullets under any `skip_headings` heading (archive-style:
+        Done / Completed / References / Related Notes / etc.).
+      - Includes everything else in the tasks bucket — including loose
+        checkboxes at the top of a file before any heading.
+
+    A skip/reminder mark applies until a sibling-or-shallower heading closes
+    the section, mirroring `find_section_bounds`.
+    """
+    tasks: list[tuple[int, str, dict[str, Any]]] = []
+    reminders: list[tuple[int, str, dict[str, Any]]] = []
+    # heading_stack[i] = (level, heading_text) for headings currently open
+    heading_stack: list[tuple[int, str]] = []
+    # Bit-flags propagated from any active heading in the stack
+    skip_active = False
+    reminder_active = False
+
+    def _recompute_flags() -> tuple[bool, bool]:
+        sk = any(_heading_text_matches(h, skip_headings) for _, h in heading_stack)
+        rm = any(_heading_text_matches(h, reminder_headings) for _, h in heading_stack)
+        return sk, rm
+
+    heading_re = re.compile(r"^(?P<hashes>#+)\s+(?P<title>.+?)\s*$")
+    cursor = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\n")
+        m = heading_re.match(stripped)
+        if m:
+            level = len(m.group("hashes"))
+            title = m.group("title").strip()
+            # Pop any stack entries at this level or deeper (they're closed now)
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, title))
+            skip_active, reminder_active = _recompute_flags()
+            cursor += len(line)
+            continue
+        parsed = parse_task_bullet(stripped)
+        if parsed:
+            if skip_active:
+                pass  # archived / referenced — don't index
+            elif reminder_active:
+                reminders.append((cursor, stripped, parsed))
+            else:
+                tasks.append((cursor, stripped, parsed))
+        cursor += len(line)
+    return tasks, reminders
 
 
 # -- Schedule / event parsing --------------------------------------------------
