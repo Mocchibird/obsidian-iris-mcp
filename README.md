@@ -20,6 +20,7 @@ Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidia
 - Run as a **Discord bot** through Docker — chat with Iris from anywhere using your Claude subscription
 - **Image vision** through Discord: drop a photo and Iris analyses it inline (food calorie estimation, whiteboard OCR, screenshot triage, etc.)
 - **Health tracking**: meal/weight logging, Mifflin-St Jeor BMR/TDEE math, target-intake recommendations, scheduled daily + weekly health-channel cards, auto-routing of food photos into a dated archive
+- **Training + injury tracking**: skill goals (handstand, pull-ups, muscle-up, asian squat, etc.) with cached progression plans, session log, injury records with restriction lists that gate Iris's training recommendations (so the shoulder-rehab phase doesn't get a "do overhead pressing" suggestion)
 - _(optional)_ Track anime watch lists with MyAnimeList sync
 
 ---
@@ -214,6 +215,7 @@ _iris/
     ├── import_export.py        # import_file, mass_import, triage_inbox, summarize_note_with_llm
     ├── routines.py             # morning_briefing, weekly_review
     ├── health.py               # meals + weights logging, BMR/TDEE math, target intake, daily/weekly summaries, auto-routes food photos into 40_Attachments/Food Log/
+    ├── training.py             # skill_goals + injuries + training_sessions — skill-coach role with injury-aware recommendations
     ├── people.py               # people_upsert (occupation, employer, team, nicknames, email, phone, socials)
     ├── anime.py                # anime list + full MAL OAuth sync (search, ranking, seasonal, user list, push/pull)
     ├── vocab.py                # vocab_upsert, vocab_review (SM-2 spaced repetition)
@@ -267,6 +269,9 @@ Iris exposes ~180 tools. Some highlights:
 | `log_meal(description, kcal, photo_path?, ...) / log_weight(kg) / daily_calories / weight_trend` | Calorie + weight logging. Food photos passed via `photo_path` auto-route from `90_Inbox/inbox/` to `40_Attachments/Food Log/YYYY-MM/<descriptive-filename>`. |
 | `health_profile_set / tdee_estimate / target_intake` | Mifflin-St Jeor BMR + activity-multiplier TDEE, deficit-adjusted intake recommendation with safety floor at BMR. |
 | `embed_health_daily / embed_health_weekly` | Scheduled (or on-demand) recap cards posted to `IRIS_DISCORD_HEALTH_CHANNEL`. Daily fires at 08:30 by default; weekly Mondays at 09:00. Times + grace windows configurable. |
+| `skill_upsert / skill_list / skill_remove` | Long-running physical-skill goals (handstand, pull-ups, muscle-up, planche…) with cached `progression` plans + `constraint_ref_ids` linking to gating injuries. |
+| `injury_upsert / injury_list / injury_remove` | Injury records with free-text `restrictions` field that Iris reads before recommending any training session. Status: active / managing / healed. |
+| `log_training / recent_training / remove_training` | Lightweight session log (kind, duration, RPE, summary, `skill_ids` worked). Raw set/rep detail stays in your Gym.md note via `note_path`. |
 
 ## Why the SQLite-backed approach
 

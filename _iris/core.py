@@ -858,7 +858,7 @@ class VaultIndex:
     fts        – FTS5 full-text search over note body text
     """
 
-    SCHEMA_VERSION = 12
+    SCHEMA_VERSION = 13
 
     def __init__(self, vault_root: Path):
         self._root = vault_root
@@ -1409,6 +1409,104 @@ class VaultIndex:
             )
         """)
 
+        # ── skill_goals: physical-skill targets (handstand, muscle-up, etc.)
+        # ────────────────────────────────────────────────────────────────────
+        # Long-running goals with text-described current vs. target levels.
+        # `progression` holds the multi-step plan Iris suggests so we don't
+        # have to regenerate it from scratch each conversation. `constraints`
+        # + `constraint_ref_ids` link to the `injuries` table so Iris's
+        # recommendations stay shoulder-aware (or knee-aware, whatever).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS skill_goals (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                name              TEXT NOT NULL,
+                category          TEXT NOT NULL DEFAULT '',
+                target            TEXT NOT NULL DEFAULT '',
+                current_level     TEXT NOT NULL DEFAULT '',
+                status            TEXT NOT NULL DEFAULT 'active',
+                priority          INTEGER NOT NULL DEFAULT 2,
+                progression       TEXT NOT NULL DEFAULT '',
+                constraints       TEXT NOT NULL DEFAULT '',
+                constraint_ref_ids TEXT NOT NULL DEFAULT '',
+                note_path         TEXT NOT NULL DEFAULT '',
+                notes             TEXT NOT NULL DEFAULT '',
+                started_at        TEXT NOT NULL DEFAULT '',
+                target_date       TEXT NOT NULL DEFAULT '',
+                achieved_at       TEXT NOT NULL DEFAULT '',
+                updated_at        TEXT NOT NULL
+            )
+        """)
+
+        # ── injuries: current + historical body issues that gate training ───
+        # Tracked as first-class rows because they directly constrain what
+        # `skill_goals` can be worked on safely. The shoulder rehab case
+        # is the motivating example: an active left-shoulder injury should
+        # make Iris route around overhead pressing when suggesting a
+        # handstand progression.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS injuries (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                body_part         TEXT NOT NULL,
+                side              TEXT NOT NULL DEFAULT '',
+                status            TEXT NOT NULL DEFAULT 'active',
+                description       TEXT NOT NULL DEFAULT '',
+                severity          TEXT NOT NULL DEFAULT '',
+                started_at        TEXT NOT NULL DEFAULT '',
+                healed_at         TEXT NOT NULL DEFAULT '',
+                physio_started_at TEXT NOT NULL DEFAULT '',
+                therapist         TEXT NOT NULL DEFAULT '',
+                restrictions      TEXT NOT NULL DEFAULT '',
+                note_path         TEXT NOT NULL DEFAULT '',
+                notes             TEXT NOT NULL DEFAULT '',
+                updated_at        TEXT NOT NULL
+            )
+        """)
+
+        # ── training_sessions: structured log of training sessions ──────────
+        # Lightweight schema — the actual set/rep detail lives in the
+        # existing Gym.md note (or wherever the user logs raw sessions).
+        # This table is for queries like "how many sessions did I do in
+        # the last 30 days?" and for cross-linking to skill_goals via
+        # `skill_ids` so we can see which sessions worked which goal.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS training_sessions (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_at    TEXT NOT NULL,
+                kind          TEXT NOT NULL DEFAULT '',
+                duration_min  INTEGER,
+                rpe           INTEGER,
+                summary       TEXT NOT NULL DEFAULT '',
+                skill_ids     TEXT NOT NULL DEFAULT '',
+                note_path     TEXT NOT NULL DEFAULT '',
+                notes         TEXT NOT NULL DEFAULT '',
+                created_at    TEXT NOT NULL
+            )
+        """)
+
+        # Views: a single "training" view that joins sessions with the
+        # primary skill they worked (when set), and an "active_goals" view
+        # that filters skill_goals to status='active' sorted by priority.
+        c.execute("DROP VIEW IF EXISTS skill_goals_active")
+        c.execute("""
+            CREATE VIEW skill_goals_active AS
+            SELECT id, name, category, target, current_level,
+                   priority, progression, constraints, constraint_ref_ids,
+                   started_at, target_date, notes, updated_at
+            FROM skill_goals
+            WHERE status = 'active'
+            ORDER BY priority ASC, name COLLATE NOCASE ASC
+        """)
+        c.execute("DROP VIEW IF EXISTS injuries_active")
+        c.execute("""
+            CREATE VIEW injuries_active AS
+            SELECT id, body_part, side, status, severity, description,
+                   started_at, physio_started_at, therapist, restrictions,
+                   note_path, notes, updated_at
+            FROM injuries
+            WHERE status IN ('active', 'managing')
+            ORDER BY started_at DESC
+        """)
+
         # ── health_profile: singleton row of user stats for TDEE estimates ──
         # Hard-constrained to id=1 so we can never end up with two competing
         # profiles. The values here are inputs to BMR / TDEE / target-intake
@@ -1489,6 +1587,11 @@ class VaultIndex:
         c.execute("CREATE INDEX IF NOT EXISTS idx_meals_eaten ON meals(eaten_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_meals_source ON meals(source)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_weights_measured ON weights(measured_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_skill_goals_status ON skill_goals(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_skill_goals_priority ON skill_goals(priority)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_injuries_status ON injuries(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_injuries_body ON injuries(body_part)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_training_sessions_at ON training_sessions(session_at)")
 
         c.execute(
             "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)",
