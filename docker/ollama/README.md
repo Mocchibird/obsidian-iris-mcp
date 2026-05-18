@@ -26,7 +26,7 @@ Switch to the `.env` tab and paste:
 ```dotenv
 # Adjust <pool> to your actual pool name.
 # Convention: keep all local AI-model dirs under a shared ai-models/ parent
-# so future tools (Whisper, Piper, LM Studio, …) live next to Ollama.
+# so future tools (Whisper, LM Studio, …) live next to Ollama.
 OLLAMA_DATA_DIR=/mnt/HDDs/Applications/ai-models/ollama
 ```
 

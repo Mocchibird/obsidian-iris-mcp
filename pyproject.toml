@@ -32,15 +32,11 @@ dependencies = [
     "icalendar>=6.0",           # iCal parsing for pull_ical_subscription
     "recurring-ical-events>=3.0", # expands RRULE/recurring events
     "matplotlib>=3.7",          # PNG chart rendering for Discord embed attachments
-    "faster-whisper>=1.0",      # Local Whisper STT (CTranslate2 backend) for voice messages — Phase 2.1
-    "piper-tts>=1.2",           # Local neural TTS for voice channel replies — Phase 2.2.0
-    "kokoro-onnx>=0.5",         # Higher-quality alternative to Piper (82M params, multilingual)
-    "soundfile>=0.13",          # WAV/FLAC IO for Kokoro output (numpy array → WAV)
-    "lingua-language-detector>=2.0",  # Fast language detection for IRIS_TTS_ENGINE=auto (EN/DE/KO/JA routing)
-    "pykakasi>=2.2",            # Kanji → hiragana preprocessor for Japanese TTS (Kokoro/espeak can't read kanji directly)
-    "edge-tts>=6.1",            # Microsoft Edge TTS — Azure Neural voices, free, no API key. State-of-the-art for JA/KO/DE where Kokoro is weak.
-    # Note: PyNaCl + davey for Discord voice are pulled via the `discord.py[voice]`
-    # extras in docker/requirements.txt — no need to pin them here too.
+    "faster-whisper>=1.0",      # Local Whisper STT (CTranslate2 backend) for Discord voice messages
+    "edge-tts>=6.1",            # Microsoft Edge TTS — Azure Neural voices, free, no API key. Sole TTS engine.
+    "lingua-language-detector>=2.0",  # Per-sentence language routing (EN/KO/JA → Edge voice)
+    # Note: PyNaCl + davey for Discord voice (send + receive) are pulled via
+    # the `discord.py[voice]` extras in docker/requirements.txt.
 ]
 
 [project.optional-dependencies]
