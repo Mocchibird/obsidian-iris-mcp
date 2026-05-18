@@ -448,8 +448,11 @@ def _ensure_kokoro_models() -> tuple[Path, Path]:
 
 
 def _load_kokoro():
-    """Lazy-load + module-cache the Kokoro model. Picks providers based on
-    IRIS_KOKORO_USE_CUDA — same fallback pattern as Piper.
+    """Lazy-load + module-cache the Kokoro model. Reads provider preference
+    from IRIS_KOKORO_USE_CUDA — Kokoro doesn't accept a ``providers`` kwarg,
+    it reads the ``ONNX_PROVIDER`` env var at construction time and uses
+    that. We set it explicitly here so the choice is deterministic
+    regardless of what onnxruntime-gpu auto-detects.
     """
     global _kokoro_inst
     if _kokoro_inst is not None:
@@ -462,28 +465,34 @@ def _load_kokoro():
             "updated pyproject.toml"
         ) from e
     model_path, voices_path = _ensure_kokoro_models()
-    t0 = time.monotonic()
     use_cuda = _kokoro_use_cuda()
-    log.info(
-        "kokoro: loading model from %s (device=%s)",
-        model_path.name, "cuda" if use_cuda else "cpu",
+    # Force the desired provider via the env var Kokoro reads on init.
+    prev_provider = os.environ.get("ONNX_PROVIDER")
+    os.environ["ONNX_PROVIDER"] = (
+        "CUDAExecutionProvider" if use_cuda else "CPUExecutionProvider"
     )
-    if use_cuda:
-        # Kokoro defers to the onnxruntime provider order; pass CUDA first.
-        try:
-            _kokoro_inst = Kokoro(
-                str(model_path), str(voices_path),
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            )
-        except (TypeError, Exception) as e:
-            # Older kokoro-onnx may not accept `providers`. Fall back to
-            # default (CPU) instead of crashing.
-            log.warning(
-                "kokoro: CUDA init failed (%s) — falling back to CPU.", e,
-            )
-            _kokoro_inst = Kokoro(str(model_path), str(voices_path))
-    else:
+    log.info(
+        "kokoro: loading model from %s (provider=%s)",
+        model_path.name, os.environ["ONNX_PROVIDER"],
+    )
+    t0 = time.monotonic()
+    try:
         _kokoro_inst = Kokoro(str(model_path), str(voices_path))
+    except Exception as e:
+        if use_cuda:
+            log.warning(
+                "kokoro: CUDA init failed (%s) — falling back to CPU. "
+                "Check onnxruntime-gpu is installed + GPU passthrough.", e,
+            )
+            os.environ["ONNX_PROVIDER"] = "CPUExecutionProvider"
+            _kokoro_inst = Kokoro(str(model_path), str(voices_path))
+        else:
+            # Restore env before re-raising so we don't poison future calls.
+            if prev_provider is None:
+                os.environ.pop("ONNX_PROVIDER", None)
+            else:
+                os.environ["ONNX_PROVIDER"] = prev_provider
+            raise
     log.info("kokoro: model loaded in %.1fs", time.monotonic() - t0)
     return _kokoro_inst
 
@@ -635,6 +644,83 @@ def _resolve_voice_spec(lang: str) -> tuple[str, str]:
     return engine.strip().lower(), voice.strip()
 
 
+# Sentence splitter — handles English + CJK punctuation. The split keeps the
+# delimiter on the preceding sentence so prosody isn't chopped mid-pause.
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?。！？])\s+|"        # English / Japanese / Chinese end-of-sentence
+    r"(?<=[\n])\s*",                # Line breaks (markdown lists, "Japanese: …\nKorean: …")
+)
+
+
+def _segment_text_by_language(text: str) -> list[tuple[str, str]]:
+    """Split ``text`` into runs of (language, segment_text) tuples. Adjacent
+    same-language sentences are merged so the synth gets natural prosody
+    rather than choppy sentence-by-sentence audio.
+
+    A single-language input returns a single tuple — no segmentation
+    overhead. This is the common case (Iris replies in one language).
+    """
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    if not sentences:
+        return []
+    if len(sentences) == 1:
+        return [(_detect_language(sentences[0]), sentences[0])]
+    runs: list[tuple[str, str]] = []
+    for sent in sentences:
+        lang = _detect_language(sent)
+        if runs and runs[-1][0] == lang:
+            runs[-1] = (lang, runs[-1][1] + " " + sent)
+        else:
+            runs.append((lang, sent))
+    return runs
+
+
+def _concat_wavs_via_ffmpeg(input_paths: list[str], out_path: str) -> None:
+    """Concatenate WAV files into one via ffmpeg's concat filter. Handles
+    sample-rate mismatches automatically (Piper outputs 22050 Hz, Kokoro
+    outputs 24000 Hz — both upsampled to 48 kHz mono int16 for Discord).
+    """
+    import subprocess  # noqa: PLC0415
+
+    if len(input_paths) == 1:
+        # No concat needed — just copy/rename.
+        import shutil  # noqa: PLC0415
+        shutil.copy(input_paths[0], out_path)
+        return
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    for p in input_paths:
+        cmd.extend(["-i", p])
+    inputs = "".join(f"[{i}:a]" for i in range(len(input_paths)))
+    cmd.extend([
+        "-filter_complex", f"{inputs}concat=n={len(input_paths)}:v=0:a=1[out]",
+        "-map", "[out]",
+        "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le",
+        out_path,
+    ])
+    subprocess.run(cmd, check=True)
+
+
+def _synthesize_segment(text: str, lang: str, out_path: str) -> dict:
+    """Synthesize one same-language segment using the right engine + voice."""
+    chosen_engine, voice = _resolve_voice_spec(lang)
+    env_key = "IRIS_KOKORO_VOICE" if chosen_engine == "kokoro" else "IRIS_PIPER_VOICE"
+    prev = os.environ.get(env_key)
+    os.environ[env_key] = voice
+    try:
+        if chosen_engine == "kokoro":
+            try:
+                return _synthesize_kokoro(text, out_path)
+            except Exception:
+                log.exception("kokoro segment synth failed — falling back to Piper")
+                return _synthesize_piper(text, out_path)
+        return _synthesize_piper(text, out_path)
+    finally:
+        if prev is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = prev
+
+
 def synthesize_to_wav(text: str, out_path: str) -> dict:
     """Synthesize ``text`` to a 16-bit mono WAV at ``out_path``.
 
@@ -643,10 +729,12 @@ def synthesize_to_wav(text: str, out_path: str) -> dict:
         ``kokoro`` — always use Kokoro. 82M-param neural, much better, ~3×
                      realtime CPU / ~30× realtime GPU. Multilingual EN/JA/
                      KO/ZH/+ but NOT German.
-        ``auto``   — detect language, route per ``IRIS_TTS_VOICE_<LANG>``
-                     env (defaults: EN/JA/KO → Kokoro, DE → Piper).
-                     Restricted to four languages for fast / accurate
-                     detection on short replies.
+        ``auto``   — detect language per sentence, route per
+                     ``IRIS_TTS_VOICE_<LANG>`` env (defaults: EN/JA/KO →
+                     Kokoro, DE → Piper). Multi-language replies are
+                     split + synthesized per segment + concatenated via
+                     ffmpeg so a "Japanese: …\\nKorean: …" reply doesn't
+                     get spoken in one English voice.
 
     The Discord voice-send pipeline pipes the WAV through ffmpeg to upsample
     to Discord's 48 kHz stereo Opus, so per-engine sample rates differ but
@@ -654,39 +742,53 @@ def synthesize_to_wav(text: str, out_path: str) -> dict:
     """
     engine = (os.environ.get("IRIS_TTS_ENGINE") or "piper").strip().lower()
     if engine == "auto":
-        lang = _detect_language(text)
-        chosen_engine, voice = _resolve_voice_spec(lang)
-        log.info("tts auto-route: lang=%s engine=%s voice=%s", lang, chosen_engine, voice)
-        # Push the resolved voice into the env so the engine-specific
-        # synth function picks it up. Restore after the call so we don't
-        # mutate global state for future calls in different languages.
-        env_key = "IRIS_KOKORO_VOICE" if chosen_engine == "kokoro" else "IRIS_PIPER_VOICE"
-        prev = os.environ.get(env_key)
-        os.environ[env_key] = voice
-        try:
-            if chosen_engine == "kokoro":
-                try:
-                    meta = _synthesize_kokoro(text, out_path)
-                except Exception:
-                    log.exception("kokoro synth failed in auto-route — falling back to Piper")
-                    meta = _synthesize_piper(text, out_path)
-            else:
-                meta = _synthesize_piper(text, out_path)
+        segments = _segment_text_by_language(text)
+        if not segments:
+            raise ValueError("empty text for synthesis")
+        if len(segments) == 1:
+            # Fast path — single language, no concat.
+            lang, seg_text = segments[0]
+            chosen_engine, voice = _resolve_voice_spec(lang)
+            log.info(
+                "tts auto-route: lang=%s engine=%s voice=%s",
+                lang, chosen_engine, voice,
+            )
+            meta = _synthesize_segment(seg_text, lang, out_path)
             meta["detected_lang"] = lang
             return meta
+        # Multi-language path: synth each segment to its own WAV, then concat.
+        log.info(
+            "tts auto-route (multilingual): %d segments — %s",
+            len(segments),
+            ", ".join(f"{lang}({len(t)}c)" for lang, t in segments),
+        )
+        tmp_paths: list[str] = []
+        try:
+            for i, (lang, seg_text) in enumerate(segments):
+                tmp = f"{out_path}.seg{i}.wav"
+                _synthesize_segment(seg_text, lang, tmp)
+                tmp_paths.append(tmp)
+            _concat_wavs_via_ffmpeg(tmp_paths, out_path)
+            return {
+                "sample_rate": 48000,  # ffmpeg upsampled to 48 kHz for concat
+                "duration_sec": 0.0,   # not computed for concat; caller doesn't use it
+                "byte_count": 0,
+                "engine": "auto (multi-segment)",
+                "voice": "per-segment",
+                "lang": "mixed",
+                "segments": [{"lang": l, "len": len(t)} for l, t in segments],
+            }
         finally:
-            if prev is None:
-                os.environ.pop(env_key, None)
-            else:
-                os.environ[env_key] = prev
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     if engine == "kokoro":
         try:
             return _synthesize_kokoro(text, out_path)
         except Exception:
-            # On Kokoro failure (model download error, bad voice name, etc.)
-            # fall back to Piper so the user still gets *some* speech rather
-            # than silence. Log loudly so the misconfig gets noticed.
             log.exception("kokoro synth failed — falling back to Piper")
     return _synthesize_piper(text, out_path)
 
