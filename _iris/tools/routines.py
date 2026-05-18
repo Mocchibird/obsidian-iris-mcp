@@ -110,14 +110,21 @@ def morning_briefing(date: str = "today") -> str:
     else:
         lines.append("- No events scheduled.")
 
-    # 2. Overdue & today tasks
-    all_tasks = idx.query_tasks(checked=False, limit=500)
+    # 2. Tasks — sorted into time-buckets + a dateless "by source" overview.
+    # The bucketing logic deliberately includes ALL open tasks (not just the
+    # `## Tasks` section) because the indexer now picks up checkboxes from
+    # any heading. Without the by-source overview the brief would silently
+    # hide entire backlog notes (Huawei To-Do, Plex queue, etc.).
+    all_tasks = idx.query_tasks(checked=False, limit=1000)
     overdue: list[dict] = []
     due_today: list[dict] = []
     upcoming: list[dict] = []
+    far_future: list[dict] = []
+    dateless: list[dict] = []
     for t in all_tasks:
         due_dt = parse_iso_date(t["due"])
         if due_dt is None:
+            dateless.append(t)
             continue
         due_date = due_dt.date()
         if due_date < d:
@@ -126,6 +133,8 @@ def morning_briefing(date: str = "today") -> str:
             due_today.append(t)
         elif due_date <= d + timedelta(days=3):
             upcoming.append(t)
+        else:
+            far_future.append(t)
 
     if overdue:
         lines.append(f"\n## Overdue Tasks ({len(overdue)})")
@@ -139,6 +148,46 @@ def morning_briefing(date: str = "today") -> str:
         lines.append(f"\n## Upcoming Tasks ({len(upcoming)})")
         for t in upcoming[:10]:
             lines.append(f"- [ ] {t['text']} (due {t['due']})")
+
+    # Backlog overview — dateless + far-future tasks grouped by source note.
+    # Capped at top 6 sources × 2-line preview so the brief stays scannable.
+    # The user can ask `list_unfinished_tasks(note_path=...)` to drill in.
+    backlog = dateless + far_future
+    if backlog:
+        from collections import defaultdict
+        by_source: dict[str, list[dict]] = defaultdict(list)
+        for t in backlog:
+            by_source[t["note_path"]].append(t)
+        # Sort sources by open-task count desc, then by path for stability.
+        sources_ranked = sorted(
+            by_source.items(),
+            key=lambda kv: (-len(kv[1]), kv[0]),
+        )
+        total = len(backlog)
+        lines.append(
+            f"\n## Open Backlog ({total} task{'s' if total != 1 else ''} "
+            f"across {len(by_source)} note{'s' if len(by_source) != 1 else ''})"
+        )
+        for path, items in sources_ranked[:6]:
+            # Strip the `.md` and use the last path segment for compactness.
+            title = path.rsplit("/", 1)[-1].removesuffix(".md")
+            future_count = sum(1 for t in items if t["due"])
+            label = f"{len(items)} open"
+            if future_count:
+                label += f" ({future_count} dated)"
+            lines.append(f"- **[[{path}|{title}]]** — {label}")
+            for t in items[:2]:
+                due_tag = f" *(due {t['due']})*" if t.get("due") else ""
+                preview = t["text"][:80] + ("…" if len(t["text"]) > 80 else "")
+                lines.append(f"  - {preview}{due_tag}")
+            if len(items) > 2:
+                lines.append(f"  - _…and {len(items) - 2} more_")
+        if len(sources_ranked) > 6:
+            tail_total = sum(len(items) for _, items in sources_ranked[6:])
+            lines.append(
+                f"- _…and {tail_total} more across "
+                f"{len(sources_ranked) - 6} other notes_"
+            )
 
     # 3. Reminders
     all_reminders = idx.query_reminders(checked=False, limit=500)
