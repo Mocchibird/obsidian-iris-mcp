@@ -28,8 +28,6 @@ Public tools (all @mcp.tool):
 """
 from __future__ import annotations
 
-import hashlib
-import os
 import re
 import sqlite3
 from datetime import date, datetime, timedelta

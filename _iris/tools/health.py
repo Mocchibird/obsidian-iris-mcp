@@ -28,9 +28,7 @@ from __future__ import annotations
 
 import re
 import shutil
-import sqlite3
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Optional
 
 from .. import mcp
@@ -852,12 +850,6 @@ def health_daily_summary(date: str = "yesterday") -> str:
     # ── Weight section: latest reading + delta vs reading on or before `day`
     latest_row = c.execute(
         "SELECT measured_at, kg FROM weights ORDER BY measured_at DESC LIMIT 1"
-    ).fetchone()
-    on_or_before = c.execute(
-        "SELECT measured_at, kg FROM weights "
-        "WHERE substr(measured_at, 1, 10) <= ? "
-        "ORDER BY measured_at DESC LIMIT 1",
-        (day,),
     ).fetchone()
     if latest_row:
         lines.append("\n## ⚖️ Weight")
