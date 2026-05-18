@@ -21,6 +21,7 @@ Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidia
 - **Image vision** through Discord: drop a photo and Iris analyses it inline (food calorie estimation, whiteboard OCR, screenshot triage, etc.)
 - **Health tracking**: meal/weight logging, Mifflin-St Jeor BMR/TDEE math, target-intake recommendations, scheduled daily + weekly health-channel cards, auto-routing of food photos into a dated archive
 - **Training + injury tracking**: skill goals (handstand, pull-ups, muscle-up, asian squat, etc.) with cached progression plans, session log, injury records with restriction lists that gate Iris's training recommendations (so the shoulder-rehab phase doesn't get a "do overhead pressing" suggestion)
+- **Habit tracker**: daily check-offs with GitHub-style 🟩⬜⬛ heatmaps, cadence-aware reminders (Iris pings the bot's PING_CHANNEL once when a habit's target time passes without being logged), per-day idempotent logging, optional cross-links to skill goals or injuries (so a "shoulder rehab" habit auto-clears when the injury is healed)
 - _(optional)_ Track anime watch lists with MyAnimeList sync
 
 ---
@@ -216,6 +217,7 @@ _iris/
     ├── routines.py             # morning_briefing, weekly_review
     ├── health.py               # meals + weights logging, BMR/TDEE math, target intake, daily/weekly summaries, auto-routes food photos into 40_Attachments/Food Log/
     ├── training.py             # skill_goals + injuries + training_sessions — skill-coach role with injury-aware recommendations
+    ├── habits.py               # daily habits + idempotent done-logging + GitHub-style heatmap renderer + cadence-aware reminders
     ├── people.py               # people_upsert (occupation, employer, team, nicknames, email, phone, socials)
     ├── anime.py                # anime list + full MAL OAuth sync (search, ranking, seasonal, user list, push/pull)
     ├── vocab.py                # vocab_upsert, vocab_review (SM-2 spaced repetition)
@@ -272,6 +274,9 @@ Iris exposes ~180 tools. Some highlights:
 | `skill_upsert / skill_list / skill_remove` | Long-running physical-skill goals (handstand, pull-ups, muscle-up, planche…) with cached `progression` plans + `constraint_ref_ids` linking to gating injuries. |
 | `injury_upsert / injury_list / injury_remove` | Injury records with free-text `restrictions` field that Iris reads before recommending any training session. Status: active / managing / healed. |
 | `log_training / recent_training / remove_training` | Lightweight session log (kind, duration, RPE, summary, `skill_ids` worked). Raw set/rep detail stays in your Gym.md note via `note_path`. |
+| `habit_upsert / habit_done / habit_undo / habit_list / habit_streak` | Daily habit tracker. `habit_done` is idempotent — re-marking the same day is a safe no-op update. |
+| `habit_heatmap(habit_id, weeks=12)` | GitHub-style 🟩⬜⬛ heatmap as a markdown block. 7 rows × N weeks; cadence-aware (off-days render as inactive). |
+| `habit_pending_today / habit_status_today` | "What's left to do today" — also drives the bot's once-per-day-per-habit reminder pings. |
 
 ## Why the SQLite-backed approach
 

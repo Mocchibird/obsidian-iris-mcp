@@ -810,7 +810,38 @@ def _load_system_prompt() -> str | None:
         "   - `recent_training(days=14)` — adherence sanity-check.\n"
         "  Vault dashboards: [[10_Profile/Personal/Skills & Training]] "
         "and [[10_Profile/Personal/Physio]] are the auto-refreshing "
-        "SQL view notes; link them when explaining the workflow.\n\n"
+        "SQL view notes; link them when explaining the workflow.\n"
+        "  Habit-tracker role: Hyun-Min has 5 daily habits (BunPro "
+        "reviews, Robokana, Kanji study, Asian squat hold, Shoulder "
+        "rehab) plus whatever he adds via `habit_upsert`. When he "
+        "says \"did BunPro\" / \"✅ kanji\" / \"asian squat done, 3 "
+        "min\" → call `habit_done(habit_id, day='today', "
+        "duration_min=...)`. It's idempotent (re-marking the same "
+        "day is a no-op update, not a duplicate). When he says "
+        "\"what's left today?\" → `habit_pending_today()`. For a "
+        "GitHub-style heatmap of any habit → `habit_heatmap(habit_id, "
+        "weeks=12)` returns a ready-to-drop markdown block with a "
+        "7×N grid of 🟩 (done) / ⬜ (missed) / ⬛ (inactive) squares.\n"
+        "   Proactive nudges: the bot pings PING_CHANNEL once per "
+        "day per habit that's past `target_time + grace_min` without "
+        "being logged. Cadence-aware: weekday-only habits don't ping "
+        "on weekends. The nudge is a yellow embed; reacting ✅ on it "
+        "doesn't yet auto-log (the user has to tell you), but a quick "
+        "\"did it\" reply from him should trigger `habit_done(...)`.\n"
+        "   Habit tool inventory:\n"
+        "    - `habit_upsert(name, cadence, target_time, ...)` — new/update.\n"
+        "    - `habit_done(habit_id, day='today', duration_min=..., "
+        "notes=...)` — mark done (idempotent).\n"
+        "    - `habit_undo(habit_id, day)` — un-mark.\n"
+        "    - `habit_list(status='active')` — list with 7d/30d counts.\n"
+        "    - `habit_streak(habit_id)` — current consecutive-day streak.\n"
+        "    - `habit_pending_today()` — what's left for today.\n"
+        "    - `habit_status_today()` — one-line X/Y done rollup.\n"
+        "    - `habit_heatmap(habit_id, weeks=12)` — markdown heatmap.\n"
+        "    - `habit_remove(habit_id)` — hard delete (prefer "
+        "status='archived').\n"
+        "   Dashboard: [[10_Profile/Personal/Habits]]. Link it when "
+        "explaining streaks / progress.\n\n"
         "Updating an existing note — append vs edit-in-place (IMPORTANT):\n"
         "When Hyun-Min asks you to add information to a note, your default "
         "should NOT be `append_to_note` — that tool only makes sense for "
@@ -1555,6 +1586,7 @@ async def on_ready() -> None:
         client.loop.create_task(_notification_loop())
         client.loop.create_task(_scheduled_briefings_loop())
         client.loop.create_task(_scheduled_health_loop())
+        client.loop.create_task(_habit_reminder_loop())
         client.loop.create_task(_snooze_replay_loop())
         client.loop.create_task(_pingback_loop())
         client.loop.create_task(_embed_queue_loop())
@@ -1629,6 +1661,11 @@ _last_evening_fired: str = ""
 # even if the bot bounces.
 _last_health_daily_fired: str = ""
 _last_health_weekly_fired: str = ""
+# Habit reminder dedupe — per-day map of "{date}:{habit_id}" → True so a
+# habit is nudged at most once per calendar day. The special key "__day"
+# stores the date itself so the loop can detect midnight rollover and
+# reset the map without growing unbounded.
+_habits_pinged_today: dict[str, object] = {}
 
 
 async def _notification_loop() -> None:
@@ -1910,6 +1947,100 @@ async def _scheduled_briefings_loop() -> None:
 
 
 # ── Scheduled health-channel cards ──────────────────────────────────────────
+
+async def _habit_reminder_loop() -> None:
+    """Once a minute, check whether any active habit needs a "you haven't
+    done this yet today" nudge in PING_CHANNEL.
+
+    Per-habit dedupe: a habit is pinged at most ONCE per calendar day.
+    The dedupe state (`_habits_pinged_today`) is a dict keyed by date so
+    it resets cleanly across midnight. Habits without a `target_time` set
+    are skipped entirely — they're treated as "log it when you can",
+    not as time-anchored reminders.
+
+    Cadence-aware: a 'weekdays' habit doesn't ping on Saturday/Sunday;
+    a 'weekly' habit only pings on Monday; etc. The cadence-active check
+    in tools/habits.py is reused via the `habit_pending_today` tool.
+    """
+    global _habits_pinged_today
+    if PING_CHANNEL == 0:
+        log.info("ping channel not set — _habit_reminder_loop exiting")
+        return
+    await asyncio.sleep(20)  # slight stagger vs the other scheduled loops
+
+    while not client.is_closed():
+        try:
+            now = _now_local()
+            today_iso = now.date().isoformat()
+
+            # Reset dedupe map across midnight rollover
+            if _habits_pinged_today.get("__day") != today_iso:
+                _habits_pinged_today = {"__day": today_iso}
+
+            # Pull active habits with target_time set + check each
+            from _iris.core import get_vault_index
+            from _iris.tools.habits import _cadence_active_on  # noqa: PLC0415
+            idx = get_vault_index()
+            c = idx.conn
+            rows = c.execute(
+                "SELECT id, name, category, cadence, cadence_n, target_time, "
+                " grace_min, icon, created_at "
+                "FROM habits "
+                "WHERE status = 'active' AND target_time != ''"
+            ).fetchall()
+            for r in rows:
+                hid = r["id"]
+                key = f"{today_iso}:{hid}"
+                if _habits_pinged_today.get(key):
+                    continue
+                # Cadence check: don't ping on off-days
+                created = None
+                if r["created_at"]:
+                    try:
+                        created = datetime.fromisoformat(r["created_at"]).date()
+                    except ValueError:
+                        pass
+                if not _cadence_active_on(now.date(), r["cadence"], r["cadence_n"], created):
+                    continue
+                # Already done today? skip
+                done = c.execute(
+                    "SELECT 1 FROM habit_logs WHERE habit_id = ? AND day = ? AND done = 1",
+                    (hid, today_iso),
+                ).fetchone()
+                if done:
+                    continue
+                # Past target + grace?
+                target_time = r["target_time"]
+                grace = r["grace_min"] or 120
+                past_min = _minutes_past_target(target_time, now)
+                if past_min is None or past_min < grace:
+                    continue
+                # Fire the ping
+                icon = (r["icon"] or "📌").strip()
+                embed = {
+                    "title": f"{icon} Habit nudge: {r['name']}",
+                    "description": (
+                        f"You haven't logged this yet today (target was "
+                        f"{target_time}, {int(past_min)} min ago). React "
+                        f"with ✅ to mark done, or just tell me in chat."
+                    ),
+                    "color": COLOR_YELLOW,
+                    "footer": f"habit_reminder · id:{hid}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+                try:
+                    await _send_embed_payload(PING_CHANNEL, embed)
+                    _habits_pinged_today[key] = True
+                    log.info(
+                        "habit reminder fired: id=%s name=%r (past target by %.0f min)",
+                        hid, r["name"], past_min,
+                    )
+                except Exception:
+                    log.exception("habit reminder send failed for id=%s", hid)
+        except Exception:
+            log.exception("habit reminder loop")
+        await asyncio.sleep(60)
+
 
 async def _scheduled_health_loop() -> None:
     """Once a minute, check whether the daily / weekly health card should
