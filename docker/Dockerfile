@@ -53,6 +53,33 @@ COPY docker/requirements.txt ./docker/requirements.txt
 RUN pip install -e . \
     && pip install -r docker/requirements.txt
 
+# ── Optional: GPU acceleration (CUDA) ────────────────────────────────────────
+# Set --build-arg IRIS_GPU=1 to enable NVIDIA GPU acceleration for Whisper
+# STT (faster-whisper) + Piper TTS (onnxruntime). Adds ~600 MB to the image
+# (onnxruntime-gpu wheel bundles CUDA EP libs).
+#
+# Build:
+#   docker compose build --build-arg IRIS_GPU=1 iris
+#
+# Runtime requirements (host side):
+#   - NVIDIA driver + nvidia-container-toolkit installed
+#   - docker-compose.yml exposes the GPU (see the `deploy.resources` block
+#     in our compose file — uncomment when building with IRIS_GPU=1)
+#   - .env: IRIS_PIPER_USE_CUDA=1, IRIS_WHISPER_DEVICE=cuda
+#
+# Pascal cards (GTX 10xx series) are still supported via CUDA 12.x but may
+# be deprecated in future onnxruntime releases.
+ARG IRIS_GPU=0
+RUN if [ "$IRIS_GPU" = "1" ]; then \
+        echo "Building with CUDA GPU support" && \
+        pip uninstall -y onnxruntime || true && \
+        pip install onnxruntime-gpu>=1.19 && \
+        pip install nvidia-cudnn-cu12 nvidia-cublas-cu12 && \
+        python -c "import onnxruntime as ort; print('onnxruntime providers:', ort.get_available_providers())" ; \
+    else \
+        echo "Building CPU-only (set --build-arg IRIS_GPU=1 to enable GPU)" ; \
+    fi
+
 # ── Discord bot ──────────────────────────────────────────────────────────────
 COPY docker/bot.py ./docker/bot.py
 COPY docker/bot_embeds.py ./docker/bot_embeds.py

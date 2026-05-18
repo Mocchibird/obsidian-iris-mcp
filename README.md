@@ -24,7 +24,8 @@ Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidia
 - **Habit tracker**: daily check-offs with GitHub-style 🟩⬜⬛ heatmaps, cadence-aware reminders (Iris pings the bot's PING_CHANNEL once when a habit's target time passes without being logged), per-day idempotent logging, optional cross-links to skill goals or injuries (so a "shoulder rehab" habit auto-clears when the injury is healed)
 - **Matplotlib chart embeds**: line / bar / pie charts rendered server-side and posted to Discord with the PNG attached inline (weight trend, daily kcal vs target, macro split, habit duration over time, habit consistency, and a generic SQL-driven escape hatch). PNGs archive under `40_Attachments/Charts/YYYY-MM/` so they're browsable in Obsidian too.
 - **Voice messages** (Phase 2.1): Discord voice messages (🎙️) are auto-transcribed via local `faster-whisper` STT and treated as text input — no audio data leaves the host. The .ogg blob is auto-deleted after successful transcription (the transcript is the durable record); set `IRIS_DISCORD_VOICE_AUTO_DELETE=0` to keep voice files for journaling. Model + device + compute type configurable via `IRIS_WHISPER_MODEL` / `IRIS_WHISPER_DEVICE` / `IRIS_WHISPER_COMPUTE`.
-- **Voice channel TTS** (Phase 2.2.0): say "join voice" in any allowed text channel (while you're in a voice channel) and Iris joins it. Her text replies are then ALSO spoken aloud via local `piper-tts` neural TTS — no audio data leaves the host. Supports English (US/GB), German, and Chinese voices out of the box; configurable via `IRIS_PIPER_VOICE` (default `en_US-lessac-medium`). Optional GPU acceleration via `IRIS_PIPER_USE_CUDA=1` (requires `onnxruntime-gpu` + nvidia-container-toolkit). **Japanese and Korean TTS are NOT in the Piper voice repo** — those would need a different engine (MeloTTS / Coqui XTTS / Edge TTS) which isn't wired up yet. Idle auto-leave after 10 min via `IRIS_DISCORD_VOICE_IDLE_SEC`. Phase 2.2.1 will add voice receive + Whisper STT inside the channel for full duplex.
+- **Voice channel TTS** (Phase 2.2.0): say "join voice" in any allowed text channel (while you're in a voice channel) and Iris joins it. Her text replies are then ALSO spoken aloud via local `piper-tts` neural TTS — no audio data leaves the host. Supports English (US/GB), German, and Chinese voices out of the box; configurable via `IRIS_PIPER_VOICE` (default `en_US-lessac-medium`). **Japanese and Korean TTS are NOT in the Piper voice repo** — those would need a different engine (MeloTTS / Coqui XTTS / Edge TTS) which isn't wired up yet. Idle auto-leave after 10 min via `IRIS_DISCORD_VOICE_IDLE_SEC`. Phase 2.2.1 will add voice receive + Whisper STT inside the channel for full duplex.
+- **GPU acceleration** (optional): Whisper STT + Piper TTS can run on CUDA. Build with `IRIS_GPU=1`, set `IRIS_WHISPER_DEVICE=cuda` + `IRIS_PIPER_USE_CUDA=1`, expose the GPU in `docker-compose.yml`. When CUDA is detected, Whisper auto-upgrades from `base` to `large-v3` (much better accuracy + multilingual). See the GPU section below for the TrueNAS walkthrough.
 - _(optional)_ Track anime watch lists with MyAnimeList sync
 
 ---
@@ -302,6 +303,64 @@ Everything runs locally — vault data never leaves your machine unless you poin
 - **Windows**: core MCP works; some OS-specific helpers are untested.
 
 ---
+
+## GPU acceleration (Whisper STT + Piper TTS)
+
+Iris's voice features (STT for voice messages, TTS for voice channel replies) run on CPU by default — fine for small models. If you have an NVIDIA GPU available (even an older Pascal card like a GTX 1080 Ti), you can offload both to free up CPU + RAM and unlock the high-quality Whisper `large-v3` model (~3 GB VRAM, multilingual, ~5× realtime on a 1080 Ti).
+
+### TrueNAS SCALE walkthrough
+
+1. **Install NVIDIA drivers** in TrueNAS (System Settings → Advanced → Sysctl → enable, then `apt install nvidia-container-toolkit` via the shell on older releases, or just toggle it in the Apps UI on 24.04+).
+
+2. **Verify GPU is visible to Docker:**
+   ```bash
+   docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
+   ```
+   If you see your GPU's specs, you're set.
+
+3. **Set in `.env`:**
+   ```bash
+   IRIS_GPU=1                      # enables onnxruntime-gpu in the build
+   IRIS_WHISPER_DEVICE=cuda        # Whisper uses GPU (auto-upgrades model to large-v3)
+   IRIS_PIPER_USE_CUDA=1           # Piper uses GPU
+   ```
+
+4. **Uncomment the GPU device block in `docker-compose.yml`:**
+   ```yaml
+   deploy:
+     resources:
+       reservations:
+         devices:
+           - driver: nvidia
+             count: 1
+             capabilities: [gpu]
+   ```
+
+5. **Rebuild + restart:**
+   ```bash
+   docker compose build iris && docker compose up -d iris
+   ```
+
+6. **Verify the GPU path is active:**
+   ```bash
+   docker exec iris-discord python -c \
+     "import onnxruntime as ort; print(ort.get_available_providers())"
+   ```
+   Should include `CUDAExecutionProvider`. First voice message will then trigger Whisper large-v3 download (~3 GB, one-time) and load it onto the GPU.
+
+### Container cost
+- `onnxruntime-gpu` wheel: ~500 MB (vs ~80 MB for `onnxruntime`)
+- Whisper large-v3 model: ~3 GB (auto-downloaded to `~/.cache/huggingface` inside the container — bind-mount the cache dir for persistence)
+- Piper voice model: ~60 MB
+- All models stay in VRAM after first load — no per-request overhead
+
+### Honest expectation
+- **Whisper**: meaningful — base CPU 2× realtime → large-v3 GPU ~5× realtime, with much better multilingual accuracy
+- **Piper**: marginal — already fast on CPU; GPU mostly frees up CPU for other work
+- **Headroom**: a GTX 1080 Ti has 11 GB VRAM; the above uses ~3.5 GB. Plenty of room for a future Kokoro TTS upgrade or a small local LLM.
+
+### Fallback behaviour
+If `IRIS_WHISPER_DEVICE=cuda` is set but the CUDA load fails (no GPU visible, libs missing, etc.), the code logs a warning and silently falls back to CPU with the `base` model. Same for Piper. No crash on misconfiguration.
 
 ## Optional integrations
 
