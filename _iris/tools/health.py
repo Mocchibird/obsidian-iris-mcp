@@ -787,3 +787,316 @@ def weight_trend(days: int = 30) -> str:
         f"({sign}{delta:.1f} kg in {span_days} day(s)) · "
         f"last: {last['measured_at'][:10]}"
     )
+
+
+# =============================================================================
+# Scheduled summaries — markdown output formatted for the morning-brief style
+# section parser in discord.py (`# Title`, then `## Section` blocks).
+# =============================================================================
+
+
+def _target_intake_kcal() -> Optional[int]:
+    """Compute the safety-floored daily intake target from the current
+    profile + latest weight. Returns None when the profile / weight is
+    incomplete (e.g. before bootstrapping) so the summary can fall back
+    to "target not yet configured" instead of inventing a number.
+    """
+    profile = _load_profile()
+    if not profile:
+        return None
+    for f in ("height_cm", "date_of_birth", "sex", "activity_level"):
+        if not profile.get(f):
+            return None
+    w = _latest_weight_kg()
+    if w is None:
+        return None
+    age = _age_years(profile["date_of_birth"])
+    if age is None:
+        return None
+    bmr = _mifflin_st_jeor(w, profile["height_cm"], age, profile["sex"])
+    tdee = bmr * _ACTIVITY_MULTIPLIERS[profile["activity_level"]]
+    weekly = profile.get("target_weekly_loss_kg") or 0.5
+    daily_deficit = 7700.0 * weekly / 7.0
+    return int(round(max(tdee - daily_deficit, bmr)))
+
+
+@mcp.tool()
+def health_daily_summary(date: str = "yesterday") -> str:
+    """Markdown summary of one day's health data (default: yesterday).
+
+    Designed for the scheduled health-channel fire in bot.py — produces
+    a `# Title` + `## Section` structure that `_parse_md_sections` can
+    split into Discord embed fields. Same output is also useful in
+    chat: "show me yesterday's health" / "today's intake so far".
+
+    Sections rendered when there's data for them:
+        ⚖️ Weight, 🍽️ Intake, 🎯 Target, 📝 Notes (always-on tail).
+    """
+    today = datetime.now().date()
+    if date.lower() == "today":
+        d = today
+    elif date.lower() == "yesterday":
+        d = today - timedelta(days=1)
+    else:
+        try:
+            d = datetime.strptime(date[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return f"err: date must be 'today', 'yesterday', or YYYY-MM-DD (got '{date}')"
+    day = d.isoformat()
+    day_label = d.strftime("%A, %Y-%m-%d")
+    idx = get_vault_index()
+    c = idx.conn
+
+    lines: list[str] = [f"# Health · {day_label}"]
+
+    # ── Weight section: latest reading + delta vs reading on or before `day`
+    latest_row = c.execute(
+        "SELECT measured_at, kg FROM weights ORDER BY measured_at DESC LIMIT 1"
+    ).fetchone()
+    on_or_before = c.execute(
+        "SELECT measured_at, kg FROM weights "
+        "WHERE substr(measured_at, 1, 10) <= ? "
+        "ORDER BY measured_at DESC LIMIT 1",
+        (day,),
+    ).fetchone()
+    if latest_row:
+        lines.append("\n## ⚖️ Weight")
+        lines.append(
+            f"- Latest: **{latest_row['kg']:.1f} kg** "
+            f"({latest_row['measured_at'][:10]})"
+        )
+        # 7-day delta if we have a prior reading
+        prior = c.execute(
+            "SELECT kg FROM weights "
+            "WHERE measured_at < ? AND measured_at >= ? "
+            "ORDER BY measured_at ASC LIMIT 1",
+            (latest_row["measured_at"],
+             (datetime.fromisoformat(latest_row["measured_at"])
+              - timedelta(days=8)).isoformat(timespec="seconds")),
+        ).fetchone()
+        if prior is not None:
+            delta = latest_row["kg"] - prior["kg"]
+            sign = "+" if delta >= 0 else ""
+            lines.append(f"- 7-day delta: {sign}{delta:.1f} kg")
+
+    # ── Intake section: meals for the day from meals_daily view
+    intake = c.execute(
+        "SELECT meal_count, total_kcal, total_kcal_high, "
+        " total_protein_g, total_carbs_g, total_fat_g "
+        "FROM meals_daily WHERE day = ?",
+        (day,),
+    ).fetchone()
+    target = _target_intake_kcal()
+    lines.append("\n## 🍽️ Intake")
+    if intake and intake["meal_count"]:
+        lines.append(
+            f"- **{intake['meal_count']} meal(s) · {intake['total_kcal']} kcal**"
+        )
+        if intake["total_kcal_high"] and intake["total_kcal_high"] != intake["total_kcal"]:
+            lines.append(
+                f"  (uncertainty high-end: {intake['total_kcal_high']} kcal)"
+            )
+        macros: list[str] = []
+        if intake["total_protein_g"]:
+            macros.append(f"P {intake['total_protein_g']:.0f}g")
+        if intake["total_carbs_g"]:
+            macros.append(f"C {intake['total_carbs_g']:.0f}g")
+        if intake["total_fat_g"]:
+            macros.append(f"F {intake['total_fat_g']:.0f}g")
+        if macros:
+            lines.append(f"- Macros: {' · '.join(macros)}")
+    else:
+        lines.append(f"- No meals logged for {day}.")
+
+    # ── Target section: deficit/surplus vs computed daily target
+    lines.append("\n## 🎯 Target")
+    if target is None:
+        lines.append(
+            "- Daily target not yet configured — run "
+            "`health_profile_set(...)` with height / DoB / sex / "
+            "activity_level so I can compute it."
+        )
+    else:
+        consumed = intake["total_kcal"] if (intake and intake["meal_count"]) else 0
+        diff = consumed - target
+        if intake and intake["meal_count"]:
+            if diff < 0:
+                lines.append(
+                    f"- Target: **{target} kcal/day**  ·  "
+                    f"{abs(diff)} kcal **under** "
+                    f"({consumed} / {target})"
+                )
+            elif diff > 0:
+                lines.append(
+                    f"- Target: **{target} kcal/day**  ·  "
+                    f"{diff} kcal **over** "
+                    f"({consumed} / {target})"
+                )
+            else:
+                lines.append(
+                    f"- Target: **{target} kcal/day**  ·  bang on "
+                    f"({consumed} / {target})"
+                )
+        else:
+            lines.append(f"- Target: **{target} kcal/day** (nothing logged yet)")
+
+    # ── Notes section: light coaching / nudge based on the data
+    nudges: list[str] = []
+    # Stale weigh-in nudge
+    if latest_row:
+        last_dt = datetime.fromisoformat(latest_row["measured_at"])
+        days_since = (datetime.now() - last_dt).days
+        if days_since >= 7:
+            nudges.append(
+                f"⚖️ Last weigh-in was {days_since} day(s) ago — "
+                f"consider stepping on the scale today."
+            )
+    else:
+        nudges.append(
+            "⚖️ No weight on file yet — log one with "
+            "`log_weight(<kg>)` to start the trend."
+        )
+    # Missing-target nudge — only show on the daily card, not on backfills
+    if target is None and d == today:
+        nudges.append(
+            "ℹ️  Profile isn't fully set up yet. I'll bootstrap it as "
+            "you share stats (height / DoB / sex / activity)."
+        )
+    if nudges:
+        lines.append("\n## 📝 Notes")
+        for n in nudges:
+            lines.append(f"- {n}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def health_weekly_summary(date: str = "today") -> str:
+    """Markdown summary of the week ending on ``date`` (default: today,
+    so a Monday-fire produces last Mon-Sun's recap).
+
+    Sections rendered: ⚖️ Weight change, 🍽️ Intake (avg + adherence),
+    🎯 vs target, 📝 Notes.
+    """
+    if date.lower() == "today":
+        end = datetime.now().date()
+    elif date.lower() == "yesterday":
+        end = datetime.now().date() - timedelta(days=1)
+    else:
+        try:
+            end = datetime.strptime(date[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return f"err: date must be 'today', 'yesterday', or YYYY-MM-DD (got '{date}')"
+    start = end - timedelta(days=6)
+    week_label = f"{start.isoformat()} → {end.isoformat()}"
+    idx = get_vault_index()
+    c = idx.conn
+
+    lines: list[str] = [f"# Weekly Health · {week_label}"]
+
+    # Weight delta over the window: first and last in-range readings
+    first_row = c.execute(
+        "SELECT measured_at, kg FROM weights "
+        "WHERE substr(measured_at, 1, 10) >= ? "
+        "AND substr(measured_at, 1, 10) <= ? "
+        "ORDER BY measured_at ASC LIMIT 1",
+        (start.isoformat(), end.isoformat()),
+    ).fetchone()
+    last_row = c.execute(
+        "SELECT measured_at, kg FROM weights "
+        "WHERE substr(measured_at, 1, 10) >= ? "
+        "AND substr(measured_at, 1, 10) <= ? "
+        "ORDER BY measured_at DESC LIMIT 1",
+        (start.isoformat(), end.isoformat()),
+    ).fetchone()
+    weight_count = c.execute(
+        "SELECT COUNT(*) AS n FROM weights "
+        "WHERE substr(measured_at, 1, 10) >= ? "
+        "AND substr(measured_at, 1, 10) <= ?",
+        (start.isoformat(), end.isoformat()),
+    ).fetchone()["n"]
+
+    if first_row and last_row and first_row["measured_at"] != last_row["measured_at"]:
+        delta = last_row["kg"] - first_row["kg"]
+        sign = "+" if delta >= 0 else ""
+        lines.append("\n## ⚖️ Weight")
+        lines.append(
+            f"- **{first_row['kg']:.1f} → {last_row['kg']:.1f} kg "
+            f"({sign}{delta:.1f} kg)**"
+        )
+        lines.append(f"- {weight_count} weigh-in(s) this week")
+    elif last_row:
+        lines.append("\n## ⚖️ Weight")
+        lines.append(
+            f"- {last_row['kg']:.1f} kg (only one reading this week — "
+            f"no delta yet)"
+        )
+    else:
+        lines.append("\n## ⚖️ Weight")
+        lines.append("- No weigh-ins this week.")
+
+    # Intake: avg daily kcal + days-with-meals adherence
+    daily_rows = c.execute(
+        "SELECT day, meal_count, total_kcal, total_kcal_high, "
+        " total_protein_g, total_carbs_g, total_fat_g "
+        "FROM meals_daily "
+        "WHERE day >= ? AND day <= ? ORDER BY day",
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    days_logged = len(daily_rows)
+    total_kcal = sum(r["total_kcal"] for r in daily_rows)
+    total_meals = sum(r["meal_count"] for r in daily_rows)
+    avg_kcal = (total_kcal // days_logged) if days_logged else 0
+    lines.append("\n## 🍽️ Intake")
+    if daily_rows:
+        lines.append(
+            f"- **{total_meals} meals over {days_logged}/7 days** · "
+            f"avg {avg_kcal} kcal/day"
+        )
+        # Protein average (only across days that have protein data)
+        p_days = [r for r in daily_rows if r["total_protein_g"]]
+        if p_days:
+            avg_p = sum(r["total_protein_g"] for r in p_days) / len(p_days)
+            lines.append(f"- Avg protein: {avg_p:.0f} g/day "
+                         f"(across {len(p_days)} day(s) with macros)")
+    else:
+        lines.append("- No meals logged this week.")
+
+    # Target alignment
+    target = _target_intake_kcal()
+    if target and daily_rows:
+        diff = avg_kcal - target
+        sign = "+" if diff >= 0 else ""
+        # Estimated weekly weight change from observed average deficit
+        weekly_change = (diff * 7) / 7700.0  # kg
+        lines.append("\n## 🎯 Target")
+        lines.append(
+            f"- Daily target: **{target} kcal**  ·  "
+            f"avg {sign}{diff} kcal/day vs target"
+        )
+        wc_sign = "+" if weekly_change >= 0 else ""
+        lines.append(
+            f"- Implied weight change this week: "
+            f"~{wc_sign}{weekly_change:.2f} kg "
+            f"(from intake vs TDEE alone; actual scale movement may "
+            f"differ due to water + activity variance)"
+        )
+
+    # Adherence note
+    nudges: list[str] = []
+    if days_logged < 5:
+        nudges.append(
+            f"📉 Only {days_logged}/7 days had meal logs this week — "
+            f"the more days you log, the better the trend math gets."
+        )
+    if weight_count < 2:
+        nudges.append(
+            f"⚖️ {weight_count} weigh-in(s) this week — even 2-3 "
+            f"morning readings smooth out water-weight noise."
+        )
+    if nudges:
+        lines.append("\n## 📝 Notes")
+        for n in nudges:
+            lines.append(f"- {n}")
+
+    return "\n".join(lines)

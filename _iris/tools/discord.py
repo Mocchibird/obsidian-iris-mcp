@@ -832,6 +832,64 @@ def embed_evening_wrapup(
 
 
 @mcp.tool()
+def embed_health_daily(
+    date: str = "yesterday",
+    color: str = "green",
+    channel_id: int | None = None,
+) -> str:
+    """Render ``health_daily_summary(date)`` as a Discord embed and post it.
+
+    Default ``date='yesterday'`` because this is meant to fire in the
+    morning and recap the previous day. The scheduled-fire loop in bot.py
+    overrides ``channel_id`` to the IRIS_DISCORD_HEALTH_CHANNEL — pass it
+    explicitly to post a one-off into a different channel.
+    """
+    from .health import health_daily_summary
+    md = health_daily_summary(date)
+    title, intro, fields = _parse_markdown_sections(md)
+    if not title:
+        title = "🥗 Health · daily"
+    elif not title.startswith(("🥗", "Health")):
+        title = f"🥗 {title}"
+    embed = _build_embed_dict(
+        title=title,
+        description=intro,
+        color=_resolve_color(color),
+        fields=fields,
+        footer="health_daily",
+    )
+    return _enqueue_embed(channel_id, embed)
+
+
+@mcp.tool()
+def embed_health_weekly(
+    date: str = "today",
+    color: str = "violet",
+    channel_id: int | None = None,
+) -> str:
+    """Render ``health_weekly_summary(date)`` as a Discord embed and post it.
+
+    Default ``date='today'`` so a Monday-morning fire produces last
+    Mon-Sun's recap. Pass any in-week date to recap that window.
+    """
+    from .health import health_weekly_summary
+    md = health_weekly_summary(date)
+    title, intro, fields = _parse_markdown_sections(md)
+    if not title:
+        title = "📊 Weekly health"
+    elif not title.startswith(("📊", "Weekly")):
+        title = f"📊 {title}"
+    embed = _build_embed_dict(
+        title=title,
+        description=intro,
+        color=_resolve_color(color),
+        fields=fields,
+        footer="health_weekly",
+    )
+    return _enqueue_embed(channel_id, embed)
+
+
+@mcp.tool()
 def embed_daily_agenda(
     date: str = "today",
     days: int = 1,
