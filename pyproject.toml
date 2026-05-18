@@ -32,6 +32,7 @@ dependencies = [
     "icalendar>=6.0",           # iCal parsing for pull_ical_subscription
     "recurring-ical-events>=3.0", # expands RRULE/recurring events
     "matplotlib>=3.7",          # PNG chart rendering for Discord embed attachments
+    "faster-whisper>=1.0",      # Local Whisper STT (CTranslate2 backend) for voice messages — Phase 2.1
 ]
 
 [project.optional-dependencies]

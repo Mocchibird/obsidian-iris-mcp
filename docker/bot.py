@@ -638,6 +638,17 @@ def _load_system_prompt() -> str | None:
         "   accordingly.\n"
         " - PDF (receipt, document) → `extract_pdf_text` to read it, then "
         "   route. Receipts/invoices often belong with warranties.\n"
+        " - Voice message (Discord's 🎙️ feature, .ogg/Opus) → the bot "
+        "   already ran Whisper STT on it before handing the message to "
+        "   you. The transcript appears in the saved-files block under "
+        "   a `🎙️ Voice message transcript` heading. Treat the "
+        "   transcript as if Hyun-Min had typed it — same intent "
+        "   resolution, same tool dispatch. Reply in text (voice-channel "
+        "   TTS is Phase 2.2). If the transcript shows `(silence / "
+        "   unintelligible)`, ask him to repeat or type it instead. The "
+        "   raw .ogg file is still in the inbox; only file it long-term "
+        "   if there's a reason (e.g. voice journaling). Otherwise leave "
+        "   it for the inbox triage pass to clean up.\n"
         " - When unsure where a file goes, ask in chat rather than "
         "   guessing.\n\n"
         "Calorie + weight tracking (active goal): Hyun-Min is tracking "
@@ -1106,6 +1117,53 @@ def _build_image_blocks_from_saved(
             },
         })
     return blocks, skipped
+
+
+async def _transcribe_voice_attachments(
+    message: discord.Message,
+    saved_paths: list[str],
+) -> list[tuple[str, str]]:
+    """For every audio attachment (Discord voice messages = .ogg/Opus),
+    run Whisper STT on the saved inbox file and return [(rel_path, text), …].
+
+    Skipped silently when:
+      - The attachment isn't audio (image/PDF/text — handled elsewhere).
+      - faster-whisper isn't installed (Phase 2.1 dep — soft-fail so the
+        bot still works during a partial rollout).
+      - Transcription raises (file unreadable, Whisper crash, etc.) — logged.
+
+    Runs the actual transcription inside `asyncio.to_thread` because
+    faster-whisper is sync + CPU-bound; we don't want to block the event
+    loop while the model chews on a 30 s voice clip.
+    """
+    if not saved_paths or not message.attachments:
+        return []
+    try:
+        from _iris.tools.voice import (
+            is_audio_file, transcribe_audio_internal,
+        )
+    except Exception as e:
+        log.warning("voice: STT module unavailable (%s) — skipping", e)
+        return []
+    out: list[tuple[str, str]] = []
+    pairs = list(zip(message.attachments, saved_paths))
+    for att, rel in pairs:
+        if not is_audio_file(att.filename):
+            continue
+        abs_path = str(Path(VAULT_ROOT) / rel)
+        try:
+            transcript, detected_lang = await asyncio.to_thread(
+                transcribe_audio_internal, abs_path,
+            )
+            out.append((rel, transcript))
+            log.info(
+                "voice: transcribed %s (lang=%s, chars=%d)",
+                rel, detected_lang, len(transcript),
+            )
+        except Exception:
+            log.exception("voice: transcription failed for %s", rel)
+            out.append((rel, ""))  # empty transcript signals failure to caller
+    return out
 
 
 def _format_skipped_image_hint(skipped: list[dict]) -> str:
@@ -2810,8 +2868,13 @@ async def on_message(message: discord.Message) -> None:
     # the picture directly (calorie estimation, screenshot triage, etc.).
     saved_paths = await _save_attachments_to_inbox(message)
     image_blocks: list[dict] = []
+    voice_transcripts: list[tuple[str, str]] = []  # (vault_rel_path, transcript)
     if saved_paths:
         image_blocks, skipped_imgs = _build_image_blocks_from_saved(message, saved_paths)
+        # Transcribe any audio attachments (Discord voice messages = .ogg) via
+        # Whisper. Done BEFORE building the attachments_block so the transcript
+        # can be folded in as context rather than just listed as a file path.
+        voice_transcripts = await _transcribe_voice_attachments(message, saved_paths)
         attachments_block = "\n\n[Files just saved to the vault inbox:\n" + \
             "\n".join(f"- {p}" for p in saved_paths) + \
             "\nLook at them and decide what to do — file the binaries via " \
@@ -2823,6 +2886,21 @@ async def on_message(message: discord.Message) -> None:
                 "ALSO included inline in this message as vision input — you "
                 "can analyse them directly (describe contents, estimate "
                 "calories, read text, etc.) without needing to open the file."
+            )
+        if voice_transcripts:
+            attachments_block += (
+                f"\n\n🎙️ Voice message transcript"
+                f"{'s' if len(voice_transcripts) > 1 else ''} "
+                f"(via local Whisper STT):"
+            )
+            for rel, transcript in voice_transcripts:
+                if transcript:
+                    attachments_block += f"\n  - `{rel}` → \"{transcript}\""
+                else:
+                    attachments_block += f"\n  - `{rel}` → (silence / unintelligible)"
+            attachments_block += (
+                "\nTreat the transcript above as if Hyun-Min typed it. "
+                "Respond in text — voice-channel TTS is Phase 2.2."
             )
         attachments_block += _format_skipped_image_hint(skipped_imgs)
         attachments_block += "]"
