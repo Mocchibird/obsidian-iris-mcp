@@ -275,7 +275,7 @@ Iris exposes ~180 tools. Some highlights:
 | `injury_upsert / injury_list / injury_remove` | Injury records with free-text `restrictions` field that Iris reads before recommending any training session. Status: active / managing / healed. |
 | `log_training / recent_training / remove_training` | Lightweight session log (kind, duration, RPE, summary, `skill_ids` worked). Raw set/rep detail stays in your Gym.md note via `note_path`. |
 | `habit_upsert / habit_done / habit_undo / habit_list / habit_streak` | Daily habit tracker. `habit_done` is idempotent — re-marking the same day is a safe no-op update. |
-| `habit_heatmap(habit_id, weeks=12)` | GitHub-style 🟩⬜⬛ heatmap as a markdown block. 7 rows × N weeks; cadence-aware (off-days render as inactive). |
+| `habit_heatmap(habit_id, weeks=10)` | GitHub-style 🟩⬜⬛ heatmap as a markdown block. 7 rows (Mon-Sun) × N columns (each column = 1 week, rightmost = this week). Cadence-aware (off-days render as inactive). |
 | `habit_pending_today / habit_status_today` | "What's left to do today" — also drives the bot's once-per-day-per-habit reminder pings. |
 
 ## Why the SQLite-backed approach
