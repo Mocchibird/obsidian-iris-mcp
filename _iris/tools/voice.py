@@ -21,14 +21,15 @@ streaming path implemented in ``docker/bot.py``).
 
 Configuration (env vars):
     IRIS_WHISPER_MODEL    default 'base' (74M params, multilingual)
-    IRIS_WHISPER_DEVICE   default 'cpu' (faster-whisper supports CUDA
-                          via CTranslate2 if you wire it up yourself)
-    IRIS_WHISPER_COMPUTE  default 'int8' on cpu, 'float16' on cuda
+    IRIS_WHISPER_COMPUTE  default 'int8' (CPU-only — GPU support
+                          removed; rebuild the image if you want it
+                          back)
     IRIS_EDGE_VOICE       default 'en-US-AvaNeural' (used when no
                           per-language override applies)
     IRIS_EDGE_RATE        default '+0%'  (e.g. '+10%', '-15%')
     IRIS_EDGE_PITCH       default '+0Hz' (e.g. '+50Hz', '-30Hz')
     IRIS_TTS_VOICE_EN     default 'edge:en-US-AvaNeural'
+    IRIS_TTS_VOICE_DE     default 'edge:de-DE-KatjaNeural'
     IRIS_TTS_VOICE_JA     default 'edge:ja-JP-NanamiNeural'
     IRIS_TTS_VOICE_KO     default 'edge:ko-KR-SunHiNeural'
 """
@@ -67,13 +68,13 @@ def is_audio_file(filename: str) -> bool:
 
 
 def _load_whisper():
-    """Lazy-load + module-cache the Whisper model."""
+    """Lazy-load + module-cache the Whisper model. CPU-only —
+    GPU support was removed along with the rest of the CUDA stack.
+    Bump IRIS_WHISPER_MODEL to 'small' / 'medium' / 'large-v3' if
+    your host has the CPU to spare.
+    """
     global _whisper_model, _whisper_model_name
-    device = os.environ.get("IRIS_WHISPER_DEVICE", "cpu").strip() or "cpu"
-    desired = (
-        os.environ.get("IRIS_WHISPER_MODEL", "").strip()
-        or ("large-v3" if device == "cuda" else "base")
-    )
+    desired = os.environ.get("IRIS_WHISPER_MODEL", "").strip() or "base"
     if _whisper_model is not None and _whisper_model_name == desired:
         return _whisper_model
     try:
@@ -83,28 +84,10 @@ def _load_whisper():
             "faster-whisper is not installed — rebuild the container with "
             "the updated pyproject.toml"
         ) from e
-    default_compute = "float16" if device == "cuda" else "int8"
-    compute = os.environ.get("IRIS_WHISPER_COMPUTE", default_compute).strip()
-    log.info(
-        "whisper: loading model %r on %s (compute=%s)",
-        desired, device, compute,
-    )
+    compute = os.environ.get("IRIS_WHISPER_COMPUTE", "int8").strip()
+    log.info("whisper: loading model %r on cpu (compute=%s)", desired, compute)
     t0 = time.monotonic()
-    try:
-        _whisper_model = WhisperModel(desired, device=device, compute_type=compute)
-    except Exception as e:
-        if device == "cuda":
-            log.warning(
-                "whisper: CUDA load failed (%s) — falling back to CPU. "
-                "Check CTranslate2 CUDA libs + GPU passthrough.", e,
-            )
-            fallback_model = "base" if desired == "large-v3" else desired
-            _whisper_model = WhisperModel(
-                fallback_model, device="cpu", compute_type="int8",
-            )
-            desired = fallback_model
-        else:
-            raise
+    _whisper_model = WhisperModel(desired, device="cpu", compute_type=compute)
     log.info("whisper: model loaded in %.1fs", time.monotonic() - t0)
     _whisper_model_name = desired
     return _whisper_model
@@ -275,6 +258,7 @@ def _synthesize_edge(text: str, out_path: str) -> dict:
 # with streaming playback (see _speak_via_edge_streaming in bot.py).
 _DEFAULT_VOICE_BY_LANG = {
     "en": "edge:en-US-AvaNeural",
+    "de": "edge:de-DE-KatjaNeural",
     "ko": "edge:ko-KR-SunHiNeural",
     "ja": "edge:ja-JP-NanamiNeural",
 }
@@ -302,10 +286,12 @@ def _script_based_detect(text: str) -> str | None:
 
 
 def _detect_language(text: str) -> str:
-    """Detect EN / KO / JA. Two-stage:
+    """Detect EN / DE / KO / JA. Two-stage:
       1. Script-based: hangul → ko, kana → ja (no min-length needed).
       2. Statistical via lingua, guarded by _LANG_DETECT_MIN_CHARS for
-         Latin-only text to avoid misrouting 3-char interjections like "Ah!".
+         Latin-only text to avoid misrouting 3-char interjections like
+         "Ah!" or "Ja!" (which used to flip to DE on the older shorter
+         threshold).
     """
     if not text or not text.strip():
         return "en"
@@ -319,7 +305,8 @@ def _detect_language(text: str) -> str:
         if _lang_detector is None:
             from lingua import Language, LanguageDetectorBuilder  # type: ignore
             _lang_detector = LanguageDetectorBuilder.from_languages(
-                Language.ENGLISH, Language.KOREAN, Language.JAPANESE,
+                Language.ENGLISH, Language.GERMAN,
+                Language.KOREAN, Language.JAPANESE,
             ).build()
         from lingua import Language  # type: ignore
         detected = _lang_detector.detect_language_of(text)
@@ -327,6 +314,7 @@ def _detect_language(text: str) -> str:
             return "en"
         return {
             Language.ENGLISH: "en",
+            Language.GERMAN: "de",
             Language.KOREAN: "ko",
             Language.JAPANESE: "ja",
         }.get(detected, "en")
