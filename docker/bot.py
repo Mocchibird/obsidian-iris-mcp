@@ -583,7 +583,7 @@ def _load_system_prompt() -> str | None:
         "its contents, including rendering image bytes (JPEG/PNG/GIF/WebP) "
         "directly into your multimodal context. There is no iCloud or "
         "remote-sync wall here. Two paths for images:\n"
-        " 1. Inline path (default): images ≤ the bot's inline cap (5 MB) "
+        " 1. Inline path (default): images ≤ the bot's inline cap (20 MB) "
         "   are also passed as vision content blocks in the same turn — "
         "   you see the picture immediately, no tool call needed.\n"
         " 2. Read-tool fallback: if the saved-files block notes an image "
@@ -738,13 +738,21 @@ _IMAGE_EXT_TO_MIME = {
     ".gif":  "image/gif",
     ".webp": "image/webp",
 }
-# Anthropic accepts up to 5 MB / image. Default to exactly 5 MB so typical
-# full-resolution phone photos (4-7 MB) fit inline whenever possible. Anything
-# above this cap falls through to the Read-tool fallback hint in the saved-
-# files prompt block — Claude Code's built-in Read tool can render image
-# bytes from /vault/<path> directly via its multimodal context, so the
-# experience degrades gracefully rather than failing.
-_MAX_IMAGE_BYTES = int(os.environ.get("IRIS_DISCORD_MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
+# Anthropic's vision API accepts images up to 30 MB / 8000×8000 px regardless
+# of transport. The inline path here (base64-stuffed into the user message
+# envelope, sent over stdin to the Claude Code CLI) is more constrained than
+# the Read-tool path because:
+#   - base64 inflates bytes by ~33 % (a 20 MB image becomes ~27 MB of string)
+#   - the whole image lives in a single line of stream-json over a pipe
+#   - subprocess line-buffer + request-body limits kick in well before 30 MB
+# 20 MB is the sweet spot that covers virtually every phone photo at full
+# resolution (typical phone JPEG: 2–8 MB; high-res HEIC/PNG: 8–15 MB) while
+# leaving headroom for envelope overhead. Anything above the cap falls
+# through to the Read-tool hint in the saved-files prompt block — Claude
+# Code's Read tool uses Anthropic's native vision upload path and handles
+# files up to the full 30 MB / 8000-px ceiling, so the experience degrades
+# gracefully rather than failing.
+_MAX_IMAGE_BYTES = int(os.environ.get("IRIS_DISCORD_MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
 # Cap total images per turn so a 10-attachment dump can't blow up the context.
 _MAX_IMAGES_PER_MSG = int(os.environ.get("IRIS_DISCORD_MAX_IMAGES_PER_MSG", "6"))
 # Absolute path inside the container where the vault is bind-mounted (see the
