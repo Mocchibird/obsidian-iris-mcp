@@ -74,11 +74,28 @@ RUN if [ "$IRIS_GPU" = "1" ]; then \
         echo "Building with CUDA GPU support" && \
         pip uninstall -y onnxruntime || true && \
         pip install onnxruntime-gpu>=1.19 && \
-        pip install nvidia-cudnn-cu12 nvidia-cublas-cu12 && \
+        pip install \
+            nvidia-cudnn-cu12 \
+            nvidia-cublas-cu12 \
+            nvidia-cuda-runtime-cu12 \
+            nvidia-cuda-nvrtc-cu12 \
+            nvidia-cufft-cu12 \
+            nvidia-curand-cu12 && \
         python -c "import onnxruntime as ort; print('onnxruntime providers:', ort.get_available_providers())" ; \
     else \
         echo "Building CPU-only (set --build-arg IRIS_GPU=1 to enable GPU)" ; \
     fi
+
+# Put the pip-installed nvidia .so files on LD_LIBRARY_PATH so onnxruntime-gpu
+# can actually find them at load time. Without this, the CUDAExecutionProvider
+# fails to register with:
+#   "Failed to load library libonnxruntime_providers_cuda.so with error:
+#    libcublasLt.so.12: cannot open shared object file"
+# …because the libs live under site-packages/nvidia/<pkg>/lib/, not /usr/lib.
+# This ENV is a no-op when IRIS_GPU=0 (the nvidia pip packages aren't
+# installed, the dirs simply don't exist, and LD_LIBRARY_PATH lookup falls
+# through to system paths).
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.13/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.13/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.13/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.13/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/lib/python3.13/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.13/site-packages/nvidia/curand/lib:${LD_LIBRARY_PATH}"
 
 # ── Discord bot ──────────────────────────────────────────────────────────────
 COPY docker/bot.py ./docker/bot.py

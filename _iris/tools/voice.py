@@ -623,46 +623,59 @@ def _synthesize_piper(text: str, out_path: str) -> dict:
 # Multilingual auto-routing — IRIS_TTS_ENGINE=auto
 # =============================================================================
 # Detects Iris's reply language and picks the right engine+voice combo. The
-# detection is restricted to four languages (EN/DE/KO/JA) for speed and
-# accuracy on short Discord-reply-length text.
+# detection is restricted to three languages (EN/KO/JA — all served by
+# Kokoro). German was previously routed to Piper, but the engine-switch
+# mid-sentence + Piper's lower quality made it not worth it; sentences in
+# German now get the English voice (acceptable: rare in the user's actual
+# Discord usage). Short snippets (<10 chars) also force English to avoid
+# false positives on "Ah!" / "Ja!" / "Si!" type interjections.
 #
 # Default voice mapping (override per-language via env):
 #   en → kokoro:af_sarah          (warm American female)
-#   de → piper:de_DE-thorsten-medium  (Kokoro has no German)
 #   ko → kokoro:kf_001
 #   ja → kokoro:jf_alpha
 #
 # Override examples in .env:
 #   IRIS_TTS_VOICE_EN=kokoro:af_bella
-#   IRIS_TTS_VOICE_DE=piper:de_DE-kerstin-low
 #   IRIS_TTS_VOICE_KO=kokoro:km_001
 #   IRIS_TTS_VOICE_JA=kokoro:jm_kumo
 
 _DEFAULT_VOICE_BY_LANG = {
     "en": "kokoro:af_sarah",
-    "de": "piper:de_DE-thorsten-medium",  # Kokoro has no German voices
     "ko": "kokoro:kf_001",
     "ja": "kokoro:jf_alpha",
 }
+
+# Below this many characters, language detection is unreliable — force
+# English (the lingua-franca fallback) so e.g. "Ah!" / "Ja!" / "Si!" don't
+# get routed to the wrong voice. Empirically 10 chars catches most short
+# interjections without losing useful Japanese/Korean sentences (those
+# rarely fit in fewer than ~5 chars including the actual meaningful
+# content + the script's character density).
+_LANG_DETECT_MIN_CHARS = 10
 
 _lang_detector = None  # lazy-init
 
 
 def _detect_language(text: str) -> str:
-    """Detect EN/DE/KO/JA from text. Falls back to 'en' on errors or
-    indeterminate input (very short / pure punctuation). Restricted to
-    four candidate languages so detection is fast + accurate on short
-    Discord-reply-length input.
+    """Detect EN/KO/JA from text. Falls back to 'en' on errors,
+    indeterminate input (very short / pure punctuation), or text below
+    ``_LANG_DETECT_MIN_CHARS``. Restricted to three candidate languages so
+    detection is fast + accurate on short Discord-reply-length input.
+
+    German was previously a candidate but dropped — it routed to Piper
+    (lower quality) and engine-switching mid-sentence sounded worse than
+    just speaking German text with the English voice. Iris can still
+    *understand and reply in* German; only the TTS layer ignores it.
     """
     global _lang_detector
-    if not text or not text.strip():
+    if not text or len(text.strip()) < _LANG_DETECT_MIN_CHARS:
         return "en"
     try:
         if _lang_detector is None:
             from lingua import Language, LanguageDetectorBuilder  # type: ignore
             _lang_detector = LanguageDetectorBuilder.from_languages(
-                Language.ENGLISH, Language.GERMAN,
-                Language.KOREAN, Language.JAPANESE,
+                Language.ENGLISH, Language.KOREAN, Language.JAPANESE,
             ).build()
         from lingua import Language  # type: ignore
         detected = _lang_detector.detect_language_of(text)
@@ -670,7 +683,6 @@ def _detect_language(text: str) -> str:
             return "en"
         return {
             Language.ENGLISH: "en",
-            Language.GERMAN: "de",
             Language.KOREAN: "ko",
             Language.JAPANESE: "ja",
         }.get(detected, "en")
