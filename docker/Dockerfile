@@ -56,6 +56,7 @@ RUN pip install -e . \
 # ── Discord bot ──────────────────────────────────────────────────────────────
 COPY docker/bot.py ./docker/bot.py
 COPY docker/bot_embeds.py ./docker/bot_embeds.py
+COPY docker/voice_listen.py ./docker/voice_listen.py
 COPY docker/iris_mcp.example.json ./docker/iris_mcp.example.json
 
 # Conventional volume mount points (docker-compose sets the real source paths)
