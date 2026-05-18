@@ -1389,6 +1389,28 @@ class VaultIndex:
             )
         """)
 
+        # ── health_profile: singleton row of user stats for TDEE estimates ──
+        # Hard-constrained to id=1 so we can never end up with two competing
+        # profiles. The values here are inputs to BMR / TDEE / target-intake
+        # math in tools/health.py — kept minimal because the downstream
+        # formulas (Mifflin-St Jeor + activity multiplier + deficit) only
+        # need: weight (pulled from latest `weights` row), height, age
+        # (computed from DoB so it doesn't go stale), sex (affects BMR
+        # constant), activity level, and target weight-loss rate.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS health_profile (
+                id                     INTEGER PRIMARY KEY CHECK (id = 1),
+                height_cm              REAL,
+                date_of_birth          TEXT,
+                sex                    TEXT,
+                activity_level         TEXT,
+                target_kg              REAL,
+                target_weekly_loss_kg  REAL,
+                notes                  TEXT,
+                updated_at             TEXT NOT NULL
+            )
+        """)
+
         # ── views: daily nutrition + weekly weight rollups ──────────────────
         # Materialised views would be nice but SQLite doesn't have them; the
         # tables are small enough that a regular VIEW + the indexes below
