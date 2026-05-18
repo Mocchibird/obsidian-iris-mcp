@@ -26,12 +26,15 @@ Calorie-estimation philosophy (also baked into the system prompt):
 """
 from __future__ import annotations
 
+import re
+import shutil
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 from .. import mcp
-from ..core import get_vault_index, maybe_reload_db_plugin
+from ..core import get_vault_index, get_vault_root, maybe_reload_db_plugin
 
 
 # =============================================================================
@@ -40,6 +43,99 @@ from ..core import get_vault_index, maybe_reload_db_plugin
 
 _VALID_SOURCES = {"manual", "photo", "label", "barcode", "restaurant"}
 _VALID_CONFIDENCE = {"high", "medium", "low"}
+
+# Photos that come in via Discord land at `90_Inbox/inbox/<timestamp>_<name>`
+# (see _save_attachments_to_inbox in bot.py). When we log a meal with one of
+# those as its photo_path, we route it to a permanent food-log location:
+#   40_Attachments/Food Log/YYYY-MM/YYYY-MM-DD_HHMM_<slug>.<ext>
+# The slug is derived from the meal description so the on-disk filename is
+# self-describing instead of a timestamp+hash blob.
+_INBOX_PREFIX = "90_Inbox/inbox/"
+_FOOD_LOG_DIR = "40_Attachments/Food Log"
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    """Turn a meal description into a filename-safe slug.
+
+    Examples:
+      "braised pork + brown rice + salad"  → "braised-pork-brown-rice-salad"
+      "Coca-Cola Zero (330 ml)"            → "coca-cola-zero-330-ml"
+      "🍣 Salmon nigiri × 6"               → "salmon-nigiri-6"
+
+    Strips emoji + punctuation, lowercases, collapses whitespace, truncates
+    on a word boundary, returns "meal" as a fallback when the result would
+    be empty.
+    """
+    if not text:
+        return "meal"
+    # Normalise to ASCII-ish: lowercase, replace non-alphanum runs with '-'
+    s = _SLUG_RE.sub("-", text.lower()).strip("-")
+    if not s:
+        return "meal"
+    if len(s) > max_len:
+        # Truncate, then back off to the last hyphen so we don't break mid-word
+        cut = s[:max_len]
+        last_dash = cut.rfind("-")
+        if last_dash > max_len * 0.6:  # only back off if it doesn't strand us at the start
+            cut = cut[:last_dash]
+        s = cut.strip("-")
+    return s or "meal"
+
+
+def _route_food_photo(
+    inbox_rel: str,
+    description: str,
+    eaten_at_iso: str,
+) -> tuple[str, str]:
+    """Move a photo from the inbox to the food-log archive with a
+    descriptive name. Returns (new_vault_rel_path, status_message).
+
+    Skips the move (and returns the original path) when:
+      - The source isn't actually in the inbox (already routed, or some
+        other vault path Iris picked up by hand).
+      - The source file doesn't exist on disk (shouldn't normally happen,
+        but be defensive — log + leave the DB row pointing at the original).
+
+    Always preserves the original file extension. Collisions are resolved
+    with a numeric suffix (rare, but possible if two meals get logged with
+    the same description within the same minute).
+    """
+    if not inbox_rel or not inbox_rel.startswith(_INBOX_PREFIX):
+        return inbox_rel, "kept original path (not in inbox)"
+    root = get_vault_root()
+    src = root / inbox_rel
+    if not src.exists():
+        return inbox_rel, f"source file not found at {src}, kept original path"
+
+    # Parse the eaten_at timestamp so the new filename mirrors WHEN the meal
+    # was eaten (not when the photo was uploaded — these can differ when the
+    # user back-logs a meal from earlier in the day).
+    try:
+        dt = datetime.fromisoformat(eaten_at_iso)
+    except ValueError:
+        dt = datetime.now()
+    yyyymm = dt.strftime("%Y-%m")
+    slug = _slugify(description)
+    ext = src.suffix.lower() or ".jpg"
+    base_name = f"{dt.strftime('%Y-%m-%d_%H%M')}_{slug}{ext}"
+
+    dest_dir = root / _FOOD_LOG_DIR / yyyymm
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / base_name
+    # Collision: append numeric suffix until free.
+    counter = 1
+    while dest.exists():
+        dest = dest_dir / f"{dt.strftime('%Y-%m-%d_%H%M')}_{slug}_{counter}{ext}"
+        counter += 1
+
+    try:
+        shutil.move(str(src), str(dest))
+    except OSError as e:
+        return inbox_rel, f"move failed ({e}), kept original path"
+
+    new_rel = str(dest.relative_to(root)).replace("\\", "/")
+    return new_rel, f"routed {inbox_rel} → {new_rel}"
 
 
 def _parse_when(value: str) -> str:
@@ -111,12 +207,20 @@ def log_meal(
         source: One of 'manual', 'photo', 'label', 'barcode', 'restaurant'.
         confidence: 'high' (label / barcode), 'medium' (restaurant / known
             recipe), or 'low' (ambiguous home-cooked photo).
-        photo_path: Vault-relative path to the source photo, if any.
+        photo_path: Vault-relative path to the source photo, if any. When
+            this points into `90_Inbox/inbox/...` (typical for a fresh
+            Discord upload), the file is automatically routed: renamed to
+            `YYYY-MM-DD_HHMM_<meal-slug>.<ext>` and moved into
+            `40_Attachments/Food Log/YYYY-MM/`. The stored path reflects
+            the new location, so the meal row + file stay in sync and
+            you don't end up with stale `inbox/<timestamp>_image.png`
+            references that get cleaned up later.
         notes: Free-text context — useful for "after gym", "Bu's cooking",
             "shared plate, ~70 % of this".
 
     Returns:
         Status string with the new row id, e.g. "ok inserted id:42 kcal:670".
+        Includes a "photo: routed → ..." breadcrumb when a photo got moved.
     """
     desc = (description or "").strip()
     if not desc:
@@ -132,6 +236,16 @@ def log_meal(
 
     when = _parse_when(eaten_at)
     now = datetime.now().isoformat(timespec="seconds")
+
+    # Route an inbox photo to the permanent food-log archive (no-op for paths
+    # that are already routed or external). Done BEFORE the DB insert so the
+    # stored photo_path is always the final on-disk location.
+    photo_clean = (photo_path or "").strip()
+    routing_msg = ""
+    if photo_clean:
+        new_path, routing_msg = _route_food_photo(photo_clean, desc, when)
+        photo_clean = new_path
+
     idx = get_vault_index()
     c = idx.conn
     cur = c.execute(
@@ -142,17 +256,20 @@ def log_meal(
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (when, desc, int(kcal), kcal_low, kcal_high,
          protein_g, carbs_g, fat_g, source, confidence,
-         (photo_path or "").strip() or None,
+         photo_clean or None,
          (notes or "").strip() or None,
          now),
     )
     c.commit()
     if reload_db:
         maybe_reload_db_plugin()
-    return (
+    base = (
         f"ok inserted id:{cur.lastrowid} kcal:{int(kcal)} "
         f"at:{when} source:{source}"
     )
+    if photo_clean and routing_msg and "kept" not in routing_msg:
+        base += f" · photo: {routing_msg}"
+    return base
 
 
 @mcp.tool()
