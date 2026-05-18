@@ -684,7 +684,9 @@ def _load_system_prompt() -> str | None:
         "BEFORE you see the message, so you don't need to do anything "
         "special. Same for 'leave voice' / '/voice leave'. While the "
         "bot is in a voice channel, EVERY reply you send is also "
-        "spoken aloud via Piper TTS. Implications for how you write:\n"
+        "spoken aloud via the configured TTS engine (Piper by default, "
+        "Kokoro if `IRIS_TTS_ENGINE=kokoro`). Implications for how you "
+        "write:\n"
         " - Reply text should READ ALOUD naturally. Long bulleted "
         "   technical answers sound awkward; short conversational "
         "   sentences sound good. Keep it concise when you know you're "
@@ -1096,8 +1098,10 @@ _VOICE_AUTO_DELETE = os.environ.get(
 
 # ── Phase 2.2.0 — voice channel TTS playback ────────────────────────────────
 # When enabled, the bot joins a Discord voice channel on command and speaks
-# Iris's text replies via Piper TTS (synthesized to WAV, piped through
-# ffmpeg to Discord's 48 kHz stereo Opus). Phase 2.2.1 will add voice
+# Iris's text replies via the configured TTS engine (IRIS_TTS_ENGINE=piper
+# by default — fast, robotic-ish; or =kokoro — 82M-param neural model, much
+# higher quality, multilingual). Either way the synthesized WAV is piped
+# through ffmpeg to Discord's 48 kHz stereo Opus. Phase 2.2.1 will add voice
 # receive + STT for full duplex. For now this is one-way (you type, Iris
 # replies in text AND speaks the reply aloud in the voice channel).
 _VOICE_CHAT_ENABLED = os.environ.get(
