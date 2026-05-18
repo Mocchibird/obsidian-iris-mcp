@@ -36,9 +36,11 @@ import asyncio
 import base64
 import contextlib
 import fcntl
+import io
 import json
 import logging
 import os
+import queue
 import re
 import sqlite3
 import sys
@@ -1471,14 +1473,154 @@ async def _handle_voice_leave(message: discord.Message, *, reason: str = "manual
     return "Left voice. 👋"
 
 
+class _AsyncToSyncByteStream(io.RawIOBase):
+    """Sync file-like that exposes bytes fed in from an async source.
+
+    discord.py's FFmpegPCMAudio(source, pipe=True) needs a sync, blocking
+    file-like for ffmpeg's stdin. Edge TTS streams chunks asynchronously
+    via an async generator. This class bridges them: the event-loop side
+    calls .feed(chunk) / .close_writer(), the discord.py side calls
+    .read(n) and blocks on a thread-safe queue until bytes are available
+    or EOF is signalled.
+
+    Thread-safety: queue.Queue is the bridge; read() runs in the discord.py
+    player thread, feed()/close_writer() run on the asyncio loop.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._q: "queue.Queue[bytes | None]" = queue.Queue()
+        self._eof = False
+        self._leftover = b""
+
+    # ── writer side (asyncio loop) ──────────────────────────────────────
+    def feed(self, data: bytes) -> None:
+        if data:
+            self._q.put(data)
+
+    def close_writer(self) -> None:
+        """Signal EOF to the reader. Idempotent."""
+        self._q.put(None)
+
+    # ── reader side (discord.py player thread) ──────────────────────────
+    def readable(self) -> bool:
+        return True
+
+    def read(self, n: int = -1) -> bytes:
+        out = self._leftover
+        self._leftover = b""
+        while not self._eof and (n < 0 or len(out) < n):
+            chunk = self._q.get()  # blocks until producer feeds or EOF
+            if chunk is None:
+                self._eof = True
+                break
+            out += chunk
+        if n >= 0 and len(out) > n:
+            self._leftover = out[n:]
+            out = out[:n]
+        return out
+
+    def readinto(self, b) -> int:  # type: ignore[override]
+        data = self.read(len(b))
+        b[: len(data)] = data
+        return len(data)
+
+
+async def _speak_via_edge_streaming(guild_id: int, cleaned: str) -> bool:
+    """Stream Edge TTS audio directly into Discord — start playback as
+    soon as the first MP3 chunk arrives instead of waiting for the full
+    synthesis. Returns True on success, False to signal "couldn't stream,
+    fall back to buffered path".
+
+    Pipeline:
+        edge_tts.Communicate.stream() ─chunks→ _AsyncToSyncByteStream
+                                              │
+                                              ▼ (sync read from ffmpeg's stdin)
+                                          ffmpeg [-i pipe:0 -f s16le ...]
+                                              │
+                                              ▼ (sync read by discord.py player thread)
+                                          discord voice channel
+
+    Latency win: Edge's first MP3 byte typically lands ~200-400ms after
+    request; playback can start as soon as ffmpeg has decoded ~20ms of
+    PCM (one frame). End-to-end first-audio-out is ~300-500ms vs ~1-2s
+    for the buffered path on typical reply lengths.
+    """
+    try:
+        import edge_tts  # type: ignore  # noqa: PLC0415
+    except ImportError:
+        return False
+
+    voice = (os.environ.get("IRIS_EDGE_VOICE") or "en-US-AvaNeural").strip()
+    rate = (os.environ.get("IRIS_EDGE_RATE") or "+0%").strip()
+    pitch = (os.environ.get("IRIS_EDGE_PITCH") or "+0Hz").strip()
+
+    bridge = _AsyncToSyncByteStream()
+    # ffmpeg reads MP3 from the bridge's read() (discord.py wires it as
+    # ffmpeg's stdin), outputs PCM that discord.py consumes.
+    try:
+        source = discord.FFmpegPCMAudio(
+            bridge,
+            pipe=True,
+            options="-loglevel error",
+        )
+    except Exception:
+        log.exception("voice: FFmpegPCMAudio pipe init failed")
+        return False
+
+    async with _voice_lock:
+        vc = _voice_clients.get(guild_id)
+        if vc is None or not vc.is_connected():
+            bridge.close_writer()
+            return False
+        try:
+            vc.play(source)
+            _voice_last_activity[guild_id] = time.monotonic()
+        except Exception:
+            log.exception("voice: streaming play failed for guild=%s", guild_id)
+            bridge.close_writer()
+            return False
+
+    # Pipe Edge chunks → bridge → ffmpeg → discord, all running concurrently.
+    t0 = time.monotonic()
+    first_chunk_ms: float | None = None
+    chunk_count = 0
+    try:
+        comm = edge_tts.Communicate(cleaned, voice, rate=rate, pitch=pitch)
+        async for chunk in comm.stream():
+            if chunk.get("type") == "audio":
+                if first_chunk_ms is None:
+                    first_chunk_ms = (time.monotonic() - t0) * 1000
+                bridge.feed(chunk["data"])
+                chunk_count += 1
+    except Exception:
+        log.exception("voice: edge stream failed mid-playback")
+    finally:
+        bridge.close_writer()
+
+    log.info(
+        "edge-streaming: first chunk %.0fms · %d chunks · stream %.1fs",
+        first_chunk_ms or 0.0, chunk_count, time.monotonic() - t0,
+    )
+
+    # Wait for playback to finish (ffmpeg + discord.py drain the buffered PCM).
+    while vc.is_playing():
+        await asyncio.sleep(0.2)
+    return True
+
+
 async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
     """Synthesize + play Iris's reply in the voice channel, if she's in one.
 
-    Runs Piper synthesis in a worker thread (CPU-bound), then queues the
-    WAV via discord.FFmpegPCMAudio. ffmpeg handles the 22050Hz mono →
-    48kHz stereo Opus conversion Discord wants. If a previous reply is
-    still playing, this one waits for it to finish before starting (so
-    we don't talk over ourselves on a queued user message).
+    Two playback paths:
+      * Streaming (Edge only, single-language): pipe Edge MP3 chunks
+        directly into ffmpeg+Discord as they arrive. First-audio-out is
+        ~300-500ms after request — feels like a real conversation.
+      * Buffered (everything else): synth the full WAV first, then play.
+        Kokoro/Piper are fast enough that this is fine on GPU.
+
+    Either way: if a previous reply is still playing, this one waits its
+    turn so we don't talk over ourselves on a queued user message.
     """
     if not _VOICE_CHAT_ENABLED:
         return
@@ -1489,13 +1631,44 @@ async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
     if not cleaned:
         return  # Nothing speakable (pure emoji / wikilinks reply)
 
-    # Synthesize off the event loop
+    # Decide whether streaming is viable. Conditions:
+    #   - The configured engine resolves to Edge for this text's language.
+    #   - The text doesn't contain multiple languages (the segmenter
+    #     would synth each separately and concat, which doesn't stream).
+    streaming_ok = False
+    try:
+        from _iris.tools.voice import (  # noqa: PLC0415
+            _resolve_voice_spec, _segment_text_by_language,
+        )
+        segments = _segment_text_by_language(cleaned)
+        if len(segments) == 1:
+            lang = segments[0][0]
+            chosen_engine, voice = _resolve_voice_spec(lang)
+            if chosen_engine == "edge":
+                # Push voice into env so the streaming helper picks it up.
+                os.environ["IRIS_EDGE_VOICE"] = voice
+                streaming_ok = True
+    except Exception:
+        log.exception("voice: streaming decision failed — using buffered path")
+        streaming_ok = False
+
+    # Wait for any in-flight playback to drain — both paths share this rule.
+    while vc.is_playing():
+        await asyncio.sleep(0.2)
+
+    if streaming_ok:
+        try:
+            if await _speak_via_edge_streaming(guild_id, cleaned):
+                return
+        except Exception:
+            log.exception("voice: streaming path failed — falling back to buffered")
+
+    # ── Buffered fallback path ──────────────────────────────────────────
     try:
         from _iris.tools.voice import synthesize_to_wav  # noqa: PLC0415
     except Exception as e:
         log.warning("voice: TTS module unavailable (%s) — skipping speech", e)
         return
-    # Use a per-guild tmp file so concurrent guilds don't clobber each other.
     tmp_path = f"/tmp/iris_tts_{guild_id}_{int(time.monotonic()*1000)}.wav"
     try:
         await asyncio.to_thread(synthesize_to_wav, cleaned, tmp_path)
@@ -1503,7 +1676,6 @@ async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
         log.exception("voice: synthesis failed for guild=%s", guild_id)
         return
 
-    # Wait for any in-flight playback to finish before starting ours.
     async with _voice_lock:
         vc = _voice_clients.get(guild_id)
         if vc is None or not vc.is_connected():
@@ -1512,8 +1684,6 @@ async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
             except OSError:
                 pass
             return
-        # If something's still playing, wait it out — outside the lock so
-        # other guilds aren't blocked. (Re-acquire after.)
     while vc.is_playing():
         await asyncio.sleep(0.2)
     async with _voice_lock:
@@ -1528,7 +1698,6 @@ async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
             except OSError:
                 pass
             return
-    # Wait for playback to finish so we can clean up the WAV
     while vc.is_playing():
         await asyncio.sleep(0.3)
     try:
