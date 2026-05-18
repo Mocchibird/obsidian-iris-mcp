@@ -81,6 +81,69 @@ except ImportError:
     )
 
 
+# ── Defensive patches for discord-ext-voice-recv 0.5.x ───────────────────────
+#
+# Symptom: shortly after joining a voice channel, the router thread crashes with
+#
+#   discord.opus.OpusError: corrupted stream
+#     File ".../voice_recv/opus.py", line 154, in _decode_packet
+#       pcm = self._decoder.decode(packet.decrypted_data, fec=False)
+#
+# Root cause: voice_recv's RTCP→RTP demux occasionally leaks an RTCP control
+# packet (e.g. Sender Reports, packet type 200) into the audio decode path.
+# The decoder then hands non-Opus bytes to libopus, which (correctly) rejects
+# them. The router thread has no top-level except, so it DIES — and from that
+# point on no audio reaches our sink, but the bot looks healthy from outside.
+#
+# Fix: wrap PacketDecoder._decode_packet (and pop_data as a belt-and-braces
+# layer) so any decode error is logged and the bad packet is silently skipped.
+# A single dropped 20ms frame is invisible to Whisper; a dead router is fatal.
+#
+# Idempotent — safe to call multiple times. Logged when installed so the deploy
+# log makes it obvious we're running with the patch.
+
+
+def _install_voice_recv_patches() -> None:
+    if not VOICE_RECV_AVAILABLE:
+        return
+    try:
+        from discord.ext.voice_recv import opus as vr_opus  # type: ignore
+    except ImportError:
+        log.warning("voice-recv: opus submodule missing — skipping patches")
+        return
+    decoder_cls = getattr(vr_opus, "PacketDecoder", None)
+    if decoder_cls is None:
+        log.warning("voice-recv: PacketDecoder not found — skipping patches")
+        return
+    if getattr(decoder_cls, "_iris_patched", False):
+        return
+
+    original_decode = decoder_cls._decode_packet
+
+    def patched_decode(self, packet):
+        try:
+            return original_decode(self, packet)
+        except Exception as e:
+            # OpusError is the common one; catch broadly so any decode-time
+            # failure (truncated packet, codec assertion, etc.) doesn't
+            # propagate to the router thread.
+            log.debug(
+                "voice-recv: dropping undecodable packet (%s: %s)",
+                type(e).__name__, e,
+            )
+            return packet, b""
+
+    decoder_cls._decode_packet = patched_decode
+    decoder_cls._iris_patched = True
+    log.info(
+        "voice-recv: installed defensive decoder patch "
+        "(suppresses OpusError 'corrupted stream' from RTCP leakage)"
+    )
+
+
+_install_voice_recv_patches()
+
+
 # ── Wake-word gate ───────────────────────────────────────────────────────────
 
 
