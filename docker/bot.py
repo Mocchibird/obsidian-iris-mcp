@@ -669,14 +669,42 @@ def _load_system_prompt() -> str | None:
         "   a `🎙️ Voice message transcript` heading. Treat the "
         "   transcript as if Hyun-Min had typed it — same intent "
         "   resolution, same tool dispatch. Reply in text (voice-channel "
-        "   TTS is Phase 2.2). The .ogg file is **auto-deleted after "
-        "   successful transcription** because the transcript IS the "
-        "   record — don't try to read the audio file path; work from "
-        "   the transcript. If the transcript shows `(silence / "
+        "   TTS) The .ogg file is **auto-deleted after successful "
+        "   transcription** because the transcript IS the record — "
+        "   don't try to read the audio file path; work from the "
+        "   transcript. If the transcript shows `(silence / "
         "   unintelligible)` the file is kept (deletion only fires on "
         "   success) — ask him to repeat or type it instead.\n"
         " - When unsure where a file goes, ask in chat rather than "
         "   guessing.\n\n"
+        "Voice channel (Phase 2.2.0 — TTS one-way): Hyun-Min can ask "
+        "the bot to join his current voice channel via plain text "
+        "messages like 'join voice' / 'iris join my voice channel' "
+        "/ '/voice join' — these are handled by a keyword pre-router "
+        "BEFORE you see the message, so you don't need to do anything "
+        "special. Same for 'leave voice' / '/voice leave'. While the "
+        "bot is in a voice channel, EVERY reply you send is also "
+        "spoken aloud via Piper TTS. Implications for how you write:\n"
+        " - Reply text should READ ALOUD naturally. Long bulleted "
+        "   technical answers sound awkward; short conversational "
+        "   sentences sound good. Keep it concise when you know you're "
+        "   in voice mode (you may not know — there's no env signal — "
+        "   but if Hyun-Min just said \"join voice\", default to "
+        "   concise prose for the next few turns).\n"
+        " - Wikilinks (`[[path|alias]]`) are spoken as the alias (or "
+        "   last path segment) — fine to use, just don't litter.\n"
+        " - Emoji are stripped from the spoken text but shown in the "
+        "   text reply — use them as visual markers without worrying "
+        "   about Piper saying 'sparkles emoji'.\n"
+        " - Code blocks are spoken as text (Piper reads the contents, "
+        "   not the backticks). Avoid dropping a 50-line code block "
+        "   while in voice — link to the file instead.\n"
+        " - The bot auto-leaves the voice channel after 10 min of "
+        "   silence (configurable via `IRIS_DISCORD_VOICE_IDLE_SEC`). "
+        "   When that happens it posts a status message in the text "
+        "   channel where the join was invoked.\n"
+        " - Phase 2.2.1 (next iteration) will add voice receive + "
+        "   Whisper STT inside the voice channel for full duplex.\n\n"
         "Calorie + weight tracking (active goal): Hyun-Min is tracking "
         "intake to lose weight (started May 2026 at 107.5 kg). When a food "
         "photo or text mention comes through, your job is to estimate "
@@ -1065,6 +1093,44 @@ _MAX_IMAGE_BYTES = int(os.environ.get("IRIS_DISCORD_MAX_IMAGE_BYTES", str(20 * 1
 _VOICE_AUTO_DELETE = os.environ.get(
     "IRIS_DISCORD_VOICE_AUTO_DELETE", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
+
+# ── Phase 2.2.0 — voice channel TTS playback ────────────────────────────────
+# When enabled, the bot joins a Discord voice channel on command and speaks
+# Iris's text replies via Piper TTS (synthesized to WAV, piped through
+# ffmpeg to Discord's 48 kHz stereo Opus). Phase 2.2.1 will add voice
+# receive + STT for full duplex. For now this is one-way (you type, Iris
+# replies in text AND speaks the reply aloud in the voice channel).
+_VOICE_CHAT_ENABLED = os.environ.get(
+    "IRIS_DISCORD_VOICE_CHAT", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+# Auto-leave the voice channel after this many seconds of no replies fired.
+# Default 10 min. Set to 0 to disable.
+_VOICE_IDLE_TIMEOUT_SEC = int(os.environ.get("IRIS_DISCORD_VOICE_IDLE_SEC", "600"))
+# Optional ACL: comma-separated voice-channel IDs the bot is allowed to
+# join. Empty = allowed in any voice channel (within the text-channel ACL).
+_VOICE_ALLOWED_CHANNELS = _parse_csv_ids(
+    os.environ.get("IRIS_DISCORD_VOICE_ALLOWED_CHANNELS", "")
+)
+# Per-guild active voice client state (guild_id → VoiceClient). One bot can
+# only be in one voice channel per guild, which matches Iris's personal-use
+# shape — no need for per-channel state.
+_voice_clients: dict[int, discord.VoiceClient] = {}
+_voice_last_activity: dict[int, float] = {}  # guild_id → time.monotonic()
+# Text channel the user invited Iris from (so status messages — "joined
+# #voice-1", "leaving due to idle" — go back to the right place rather
+# than the voice channel's text feed).
+_voice_invite_channel: dict[int, int] = {}  # guild_id → text channel id
+_voice_lock = asyncio.Lock()  # serialize join/leave/play per guild
+
+# Regex matching the common voice-command keywords in the user's message.
+# Applied BEFORE the @mention strip, so works with or without the mention.
+_VOICE_JOIN_RE = re.compile(
+    r"\b(?:join\s+(?:my\s+)?voice|voice\s+join|/voice\s*join)\b", re.IGNORECASE,
+)
+_VOICE_LEAVE_RE = re.compile(
+    r"\b(?:leave\s+voice|voice\s+leave|/voice\s*leave|disconnect\s+voice)\b",
+    re.IGNORECASE,
+)
 # Cap total images per turn so a 10-attachment dump can't blow up the context.
 _MAX_IMAGES_PER_MSG = int(os.environ.get("IRIS_DISCORD_MAX_IMAGES_PER_MSG", "6"))
 # Absolute path inside the container where the vault is bind-mounted (see the
@@ -1258,6 +1324,237 @@ def _format_skipped_image_hint(skipped: list[dict]) -> str:
         "works the same way it does for any other file."
     )
     return "\n".join(lines)
+
+
+# ── Phase 2.2.0 — voice channel state machine + TTS playback ────────────────
+
+# Markdown / emoji / link cleanup for TTS — Piper would otherwise read out
+# "asterisk asterisk bold asterisk asterisk" etc. The pattern set is
+# intentionally conservative: strip only what's clearly markdown noise,
+# keep punctuation that affects prosody (periods, commas, question marks).
+_TTS_MD_BOLD = re.compile(r"\*\*([^*]+)\*\*|__([^_]+)__")
+_TTS_MD_ITALIC = re.compile(r"\*([^*]+)\*|_([^_]+)_")
+_TTS_MD_CODE = re.compile(r"`([^`]+)`")
+_TTS_WIKILINK = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
+_TTS_MASKED_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_TTS_EMOJI_PUNCT = re.compile(
+    # Strip a few Unicode ranges that Piper reads literally:
+    # - Discord/Obsidian emoji (most useful emoji)
+    # - misc symbols
+    r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0001F02F]"
+)
+
+
+def _clean_for_tts(text: str) -> str:
+    """Strip markdown decoration + emoji + URLs from a text reply so Piper
+    speaks the content, not the formatting. Conservative — keeps punctuation
+    that affects intonation, just removes the noise.
+    """
+    if not text:
+        return ""
+    # Wikilinks: prefer the alias when present, else the path's last segment.
+    def _wikilink_sub(m: re.Match) -> str:
+        alias = m.group(2)
+        if alias:
+            return alias
+        target = m.group(1)
+        return target.rsplit("/", 1)[-1]  # last path segment
+    text = _TTS_WIKILINK.sub(_wikilink_sub, text)
+    text = _TTS_MASKED_LINK.sub(lambda m: m.group(1), text)
+    text = _TTS_MD_BOLD.sub(lambda m: m.group(1) or m.group(2), text)
+    text = _TTS_MD_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
+    text = _TTS_MD_CODE.sub(lambda m: m.group(1), text)
+    text = _TTS_EMOJI_PUNCT.sub("", text)
+    # Collapse repeated whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _voice_command_kind(content: str) -> str | None:
+    """Return 'join' / 'leave' / None based on the user message. Pre-router
+    runs BEFORE Claude — keyword-based, no LLM dispatch, so 'iris join voice'
+    feels instant."""
+    if _VOICE_JOIN_RE.search(content):
+        return "join"
+    if _VOICE_LEAVE_RE.search(content):
+        return "leave"
+    return None
+
+
+async def _handle_voice_join(message: discord.Message) -> str:
+    """Connect the bot to the user's current voice channel. Returns a
+    short status string to reply with."""
+    if not _VOICE_CHAT_ENABLED:
+        return "Voice chat is disabled (`IRIS_DISCORD_VOICE_CHAT=0`)."
+    author_voice = getattr(message.author, "voice", None)
+    channel = getattr(author_voice, "channel", None)
+    if channel is None:
+        return "You're not in a voice channel — join one first, then ask me to join."
+    if _VOICE_ALLOWED_CHANNELS and channel.id not in _VOICE_ALLOWED_CHANNELS:
+        return (
+            f"#{getattr(channel, 'name', channel.id)} isn't on my voice "
+            f"allow-list. Set `IRIS_DISCORD_VOICE_ALLOWED_CHANNELS` in .env "
+            f"to include `{channel.id}` if you want me here."
+        )
+    guild_id = message.guild.id if message.guild else 0
+    async with _voice_lock:
+        existing = _voice_clients.get(guild_id)
+        if existing and existing.is_connected():
+            if existing.channel.id == channel.id:
+                return f"Already in #{channel.name}. 🎙️"
+            try:
+                await existing.move_to(channel)
+                _voice_last_activity[guild_id] = time.monotonic()
+                _voice_invite_channel[guild_id] = message.channel.id
+                return f"Moved to #{channel.name}. 🎙️"
+            except discord.DiscordException as e:
+                log.exception("voice: move_to failed")
+                return f"Couldn't move to #{channel.name}: {e}"
+        try:
+            vc = await channel.connect(timeout=10, reconnect=True)
+        except (discord.ClientException, asyncio.TimeoutError) as e:
+            log.exception("voice: connect failed")
+            return f"Couldn't join #{channel.name}: {e}"
+        _voice_clients[guild_id] = vc
+        _voice_last_activity[guild_id] = time.monotonic()
+        _voice_invite_channel[guild_id] = message.channel.id
+    log.info("voice: joined #%s (guild=%s)", channel.name, guild_id)
+    return (
+        f"Joined #{channel.name}. I'll speak replies aloud while I'm in there. "
+        f"Say _'leave voice'_ or just `/voice leave` when you're done. 🎙️"
+    )
+
+
+async def _handle_voice_leave(message: discord.Message, *, reason: str = "manual") -> str:
+    """Disconnect from the current voice channel for this guild."""
+    guild_id = message.guild.id if message.guild else 0
+    async with _voice_lock:
+        vc = _voice_clients.pop(guild_id, None)
+        _voice_last_activity.pop(guild_id, None)
+        _voice_invite_channel.pop(guild_id, None)
+    if vc is None:
+        return "I'm not in a voice channel right now."
+    try:
+        if vc.is_playing():
+            vc.stop()
+        await vc.disconnect(force=False)
+    except discord.DiscordException:
+        log.exception("voice: disconnect failed (force-detaching)")
+    log.info("voice: left voice (guild=%s, reason=%s)", guild_id, reason)
+    if reason == "idle":
+        return f"Left voice — idle for {_VOICE_IDLE_TIMEOUT_SEC // 60} min. 👋"
+    return "Left voice. 👋"
+
+
+async def _speak_in_voice(guild_id: int, reply_text: str) -> None:
+    """Synthesize + play Iris's reply in the voice channel, if she's in one.
+
+    Runs Piper synthesis in a worker thread (CPU-bound), then queues the
+    WAV via discord.FFmpegPCMAudio. ffmpeg handles the 22050Hz mono →
+    48kHz stereo Opus conversion Discord wants. If a previous reply is
+    still playing, this one waits for it to finish before starting (so
+    we don't talk over ourselves on a queued user message).
+    """
+    if not _VOICE_CHAT_ENABLED:
+        return
+    vc = _voice_clients.get(guild_id)
+    if vc is None or not vc.is_connected():
+        return
+    cleaned = _clean_for_tts(reply_text)
+    if not cleaned:
+        return  # Nothing speakable (pure emoji / wikilinks reply)
+
+    # Synthesize off the event loop
+    try:
+        from _iris.tools.voice import synthesize_to_wav  # noqa: PLC0415
+    except Exception as e:
+        log.warning("voice: TTS module unavailable (%s) — skipping speech", e)
+        return
+    # Use a per-guild tmp file so concurrent guilds don't clobber each other.
+    tmp_path = f"/tmp/iris_tts_{guild_id}_{int(time.monotonic()*1000)}.wav"
+    try:
+        await asyncio.to_thread(synthesize_to_wav, cleaned, tmp_path)
+    except Exception:
+        log.exception("voice: synthesis failed for guild=%s", guild_id)
+        return
+
+    # Wait for any in-flight playback to finish before starting ours.
+    async with _voice_lock:
+        vc = _voice_clients.get(guild_id)
+        if vc is None or not vc.is_connected():
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return
+        # If something's still playing, wait it out — outside the lock so
+        # other guilds aren't blocked. (Re-acquire after.)
+    while vc.is_playing():
+        await asyncio.sleep(0.2)
+    async with _voice_lock:
+        try:
+            source = discord.FFmpegPCMAudio(tmp_path)
+            vc.play(source)
+            _voice_last_activity[guild_id] = time.monotonic()
+        except Exception:
+            log.exception("voice: play failed for guild=%s", guild_id)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return
+    # Wait for playback to finish so we can clean up the WAV
+    while vc.is_playing():
+        await asyncio.sleep(0.3)
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+
+
+async def _voice_idle_loop() -> None:
+    """Every 30 s, leave any voice channel that's been idle past the
+    timeout. Idle = no replies fired into the channel."""
+    if _VOICE_IDLE_TIMEOUT_SEC <= 0:
+        log.info("voice idle-leave disabled (IRIS_DISCORD_VOICE_IDLE_SEC=0)")
+        return
+    await asyncio.sleep(30)
+    while not client.is_closed():
+        try:
+            now = time.monotonic()
+            stale: list[int] = []
+            for guild_id, last in list(_voice_last_activity.items()):
+                if now - last > _VOICE_IDLE_TIMEOUT_SEC:
+                    stale.append(guild_id)
+            for guild_id in stale:
+                vc = _voice_clients.get(guild_id)
+                invite_ch = _voice_invite_channel.get(guild_id)
+                async with _voice_lock:
+                    _voice_clients.pop(guild_id, None)
+                    _voice_last_activity.pop(guild_id, None)
+                    _voice_invite_channel.pop(guild_id, None)
+                if vc and vc.is_connected():
+                    try:
+                        if vc.is_playing():
+                            vc.stop()
+                        await vc.disconnect(force=False)
+                    except discord.DiscordException:
+                        log.exception("voice: idle disconnect failed")
+                log.info("voice: idle-left guild=%s after %.0f s", guild_id, now - last)
+                # Notify in the invite channel so the user knows.
+                if invite_ch:
+                    ch = client.get_channel(invite_ch)
+                    if ch is not None:
+                        try:
+                            await ch.send(  # type: ignore[union-attr]
+                                f"👋 Left voice — idle for "
+                                f"{_VOICE_IDLE_TIMEOUT_SEC // 60} min."
+                            )
+                        except discord.DiscordException:
+                            pass
+        except Exception:
+            log.exception("voice idle loop")
+        await asyncio.sleep(30)
 
 
 async def _multimodal_query_stream(text: str, image_blocks: list[dict]):
@@ -1673,6 +1970,7 @@ intents.message_content = True
 intents.messages = True
 intents.guilds = True
 intents.reactions = True  # for snooze emoji
+intents.voice_states = True  # Phase 2.2.0 — need to know which channel the user is in
 
 client = discord.Client(intents=intents)
 
@@ -1736,6 +2034,13 @@ async def on_ready() -> None:
         client.loop.create_task(_scheduled_briefings_loop())
         client.loop.create_task(_scheduled_health_loop())
         client.loop.create_task(_habit_reminder_loop())
+        if _VOICE_CHAT_ENABLED:
+            log.info(
+                "voice chat enabled: idle-leave after %ds (allowed channels: %s)",
+                _VOICE_IDLE_TIMEOUT_SEC,
+                sorted(_VOICE_ALLOWED_CHANNELS) if _VOICE_ALLOWED_CHANNELS else "any",
+            )
+            client.loop.create_task(_voice_idle_loop())
         client.loop.create_task(_snooze_replay_loop())
         client.loop.create_task(_pingback_loop())
         client.loop.create_task(_embed_queue_loop())
@@ -2926,6 +3231,33 @@ async def on_message(message: discord.Message) -> None:
         content = content.replace(f"<@{client.user.id}>", "").replace(
             f"<@!{client.user.id}>", "").strip()
 
+    # Voice command pre-router (Phase 2.2.0). "join voice" / "leave voice"
+    # short-circuit BEFORE Claude — no need to pay LLM latency for a
+    # connection management op. The Claude session never sees these.
+    voice_cmd = _voice_command_kind(content)
+    if voice_cmd == "join":
+        try:
+            reply = await _handle_voice_join(message)
+        except Exception:
+            log.exception("voice: join handler crashed")
+            reply = "Something went wrong joining voice — check the logs."
+        try:
+            await message.reply(reply)
+        except discord.HTTPException:
+            await message.channel.send(reply)  # type: ignore[union-attr]
+        return
+    if voice_cmd == "leave":
+        try:
+            reply = await _handle_voice_leave(message, reason="manual")
+        except Exception:
+            log.exception("voice: leave handler crashed")
+            reply = "Something went wrong leaving voice — check the logs."
+        try:
+            await message.reply(reply)
+        except discord.HTTPException:
+            await message.channel.send(reply)  # type: ignore[union-attr]
+        return
+
     # Save any attached files to the vault's inbox before invoking Iris.
     # She'll see the saved paths in her prompt and can read / route them
     # via the iris MCP tools (extract_pdf_text, extract_excalidraw_text,
@@ -2988,7 +3320,9 @@ async def on_message(message: discord.Message) -> None:
                 )
             attachments_block += (
                 "\nTreat the transcript above as if Hyun-Min typed it. "
-                "Respond in text — voice-channel TTS is Phase 2.2."
+                "Respond in text — if I'm in a voice channel (see Phase "
+                "2.2.0) your text reply will also be spoken aloud via "
+                "Piper TTS."
             )
         attachments_block += _format_skipped_image_hint(skipped_imgs)
         attachments_block += "]"
@@ -3057,6 +3391,15 @@ async def on_message(message: discord.Message) -> None:
                                 if isinstance(block, TextBlock):
                                     await stream.append(block.text)
                     await stream.finalize()
+                    # Phase 2.2.0: if Iris is in a voice channel for this
+                    # guild, also speak the reply via Piper TTS. Fire-and-
+                    # forget — the text reply is already on screen, the
+                    # audio just plays asynchronously. Synthesis + playback
+                    # happen off the event loop (Piper is sync + CPU-bound).
+                    if _VOICE_CHAT_ENABLED and message.guild:
+                        gid = message.guild.id
+                        if gid in _voice_clients:
+                            _fire_and_forget(_speak_in_voice(gid, stream._buffer))
                     # Drain any embed-queue entries Iris produced during this turn
                     # BEFORE the completion ping fires, so visual order is:
                     #   [text reply]  →  [embed cards]  →  [✓ completion ping]
