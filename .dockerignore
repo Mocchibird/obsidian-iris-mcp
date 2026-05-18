@@ -1,0 +1,62 @@
+# Files in this list are excluded from the Docker build context. The build
+# context is the directory the daemon receives BEFORE any COPY runs — anything
+# here doesn't get uploaded at all, which speeds up `docker compose build`
+# substantially when the repo contains large local-only stuff.
+#
+# Rule of thumb: anything that's developer-machine state, secrets, or won't
+# be COPY'd into the image anyway → ignore it.
+
+# ── Heavy local venvs / package dirs (200+ MB combined, not used in image) ──
+.venv/
+venv/
+env/
+obsidian-mcp/
+node_modules/
+
+# ── Python bytecode / build artefacts ──────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ── Git + editor metadata ──────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+.github/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Local-only Iris state (vault data, auth, generated files) ──────────────
+# The vault is bind-mounted at runtime — never bake it into the image.
+docker/claude-auth/
+docker/.env
+.env
+*.local
+*.log
+
+# ── Misc developer notes / scratch ─────────────────────────────────────────
+TODO.md
+NOTES.md
+scratch/
+tmp/
+
+# ── Docs that aren't needed at runtime ─────────────────────────────────────
+# Keep README + LICENSE for the image. Strip everything else.
+docs/
+*.png
+*.jpg
+*.jpeg
+*.gif
+# (re-include any image that actually IS needed in the image here with `!path`)
