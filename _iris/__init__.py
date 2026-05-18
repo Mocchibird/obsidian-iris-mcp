@@ -15,6 +15,7 @@ Package layout:
             files.py        # file CRUD, bulk replace, smart move
             health.py       # meal/weight logging, BMR/TDEE, daily/weekly summaries
             training.py     # skill goals, injuries, training sessions — injury-aware coaching
+            habits.py       # daily habit tracker + GitHub-style heatmap + reminder loop
             import_export.py# import_file, mass_import, triage_inbox, summarize_note_with_llm
             links.py        # find_issues, link_candidates, duplicates
             notes.py        # note CRUD, frontmatter, tags, templates
