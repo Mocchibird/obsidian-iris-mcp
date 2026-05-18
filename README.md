@@ -22,6 +22,7 @@ Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidia
 - **Health tracking**: meal/weight logging, Mifflin-St Jeor BMR/TDEE math, target-intake recommendations, scheduled daily + weekly health-channel cards, auto-routing of food photos into a dated archive
 - **Training + injury tracking**: skill goals (handstand, pull-ups, muscle-up, asian squat, etc.) with cached progression plans, session log, injury records with restriction lists that gate Iris's training recommendations (so the shoulder-rehab phase doesn't get a "do overhead pressing" suggestion)
 - **Habit tracker**: daily check-offs with GitHub-style 🟩⬜⬛ heatmaps, cadence-aware reminders (Iris pings the bot's PING_CHANNEL once when a habit's target time passes without being logged), per-day idempotent logging, optional cross-links to skill goals or injuries (so a "shoulder rehab" habit auto-clears when the injury is healed)
+- **Matplotlib chart embeds**: line / bar / pie charts rendered server-side and posted to Discord with the PNG attached inline (weight trend, daily kcal vs target, macro split, habit duration over time, habit consistency, and a generic SQL-driven escape hatch). PNGs archive under `40_Attachments/Charts/YYYY-MM/` so they're browsable in Obsidian too.
 - _(optional)_ Track anime watch lists with MyAnimeList sync
 
 ---
@@ -218,6 +219,7 @@ _iris/
     ├── health.py               # meals + weights logging, BMR/TDEE math, target intake, daily/weekly summaries, auto-routes food photos into 40_Attachments/Food Log/
     ├── training.py             # skill_goals + injuries + training_sessions — skill-coach role with injury-aware recommendations
     ├── habits.py               # daily habits + idempotent done-logging + GitHub-style heatmap renderer + cadence-aware reminders
+    ├── charts.py               # matplotlib PNG chart embeds (weight / kcal / macros / habit duration / consistency / generic SQL)
     ├── people.py               # people_upsert (occupation, employer, team, nicknames, email, phone, socials)
     ├── anime.py                # anime list + full MAL OAuth sync (search, ranking, seasonal, user list, push/pull)
     ├── vocab.py                # vocab_upsert, vocab_review (SM-2 spaced repetition)
@@ -277,6 +279,9 @@ Iris exposes ~180 tools. Some highlights:
 | `habit_upsert / habit_done / habit_undo / habit_list / habit_streak` | Daily habit tracker. `habit_done` is idempotent — re-marking the same day is a safe no-op update. |
 | `habit_heatmap(habit_id, weeks=10)` | GitHub-style 🟩⬜⬛ heatmap as a markdown block. 7 rows (Mon-Sun) × N columns (each column = 1 week, rightmost = this week). Cadence-aware (off-days render as inactive). |
 | `habit_pending_today / habit_status_today` | "What's left to do today" — also drives the bot's once-per-day-per-habit reminder pings. |
+| `embed_weight_chart / embed_kcal_chart / embed_macro_pie` | Matplotlib PNG charts attached inline to Discord embeds. Weight = line + target dashed line; kcal = bars coloured by target alignment + target line; macro = pie of P/C/F by kcal contribution. PNGs archive under `40_Attachments/Charts/YYYY-MM/`. |
+| `embed_habit_duration / embed_habit_consistency` | Per-habit duration over time (good for asian squat hold, meditation length) + daily across-habit completion bars (coloured by adherence). |
+| `embed_chart(sql, chart_kind="line", x, y, title, ...)` | Generic SQL-driven chart — line / bar / pie. Auto-detects date columns for nicer time axes. Same read-only safety rules as `sqlite_query`. |
 
 ## Why the SQLite-backed approach
 

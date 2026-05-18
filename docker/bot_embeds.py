@@ -322,6 +322,26 @@ def dict_to_embed(payload: dict) -> discord.Embed:
             value=_clean(field.get("value") or "—")[:1024],
             inline=bool(field.get("inline", False)),
         )
+    # Image / thumbnail support. Charts attached via _iris.tools.charts use
+    # `image.url = "attachment://<filename>.png"` and a sibling
+    # `image.attachment_path` (absolute host path) that the bot's
+    # `_send_embed_payload` opens as a `discord.File` to actually upload.
+    # The attachment_path is consumed there and never reaches this builder
+    # — we just forward the url so Discord renders the inline image.
+    img = payload.get("image")
+    if isinstance(img, dict):
+        img_url = img.get("url")
+        if isinstance(img_url, str) and img_url:
+            e.set_image(url=img_url)
+    elif isinstance(img, str) and img:
+        e.set_image(url=img)
+    thumb = payload.get("thumbnail")
+    if isinstance(thumb, dict):
+        thumb_url = thumb.get("url")
+        if isinstance(thumb_url, str) and thumb_url:
+            e.set_thumbnail(url=thumb_url)
+    elif isinstance(thumb, str) and thumb:
+        e.set_thumbnail(url=thumb)
     footer = payload.get("footer")
     if footer:
         # Footers also don't render masked links — same plain-label treatment.

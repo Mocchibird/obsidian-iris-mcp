@@ -841,7 +841,32 @@ def _load_system_prompt() -> str | None:
         "    - `habit_remove(habit_id)` — hard delete (prefer "
         "status='archived').\n"
         "   Dashboard: [[10_Profile/Personal/Habits]]. Link it when "
-        "explaining streaks / progress.\n\n"
+        "explaining streaks / progress.\n"
+        "  Chart embeds (matplotlib PNGs): when Hyun-Min asks for a "
+        "visual (\"show me my weight trend\", \"plot kcal vs target\", "
+        "\"macro breakdown for last week\", \"how's my squat duration "
+        "trending?\") prefer one of these tools over a text-only "
+        "summary:\n"
+        "    - `embed_weight_chart(days=60)` — line of weight + dashed "
+        "      target line.\n"
+        "    - `embed_kcal_chart(days=14)` — bar chart with bars "
+        "      coloured by target alignment (green under, yellow within "
+        "      ±10%, red over).\n"
+        "    - `embed_macro_pie(date_or_window)` — pie of P/C/F (by "
+        "      kcal contribution); accepts 'today', 'yesterday', ISO "
+        "      date, 'last_7d', 'last_30d'.\n"
+        "    - `embed_habit_duration(habit_id, days=30)` — line/bar of "
+        "      duration_min for a specific habit over time (great for "
+        "      asian squat hold, meditation length, etc.).\n"
+        "    - `embed_habit_consistency(days=30)` — daily count of "
+        "      habits completed, coloured by adherence.\n"
+        "    - `embed_chart(sql, chart_kind, title, x, y)` — generic "
+        "      SQL-driven escape hatch (line / bar / pie). Read-only.\n"
+        "   Each chart writes a PNG under `40_Attachments/Charts/"
+        "YYYY-MM/` and queues a Discord embed with the PNG attached. "
+        "Files are deterministically named so re-running with the same "
+        "args creates a new dated copy. Don't delete the old ones — "
+        "they're cheap archival.\n\n"
         "Updating an existing note — append vs edit-in-place (IMPORTANT):\n"
         "When Hyun-Min asks you to add information to a note, your default "
         "should NOT be `append_to_note` — that tool only makes sense for "
@@ -2291,7 +2316,14 @@ async def _send_embed_payload(
     embed_dict: dict,
     content: str = "",
 ) -> None:
-    """Build a discord.Embed and send it. Used by both proactive + queue paths."""
+    """Build a discord.Embed and send it. Used by both proactive + queue paths.
+
+    Chart embeds include an `image.attachment_path` pointing at a vault PNG.
+    When present, the file is opened + uploaded as a `discord.File` and the
+    embed's `image.url` (already `attachment://<basename>`) renders inline.
+    The matplotlib charts module is what populates that field — see
+    `_iris/tools/charts.py`.
+    """
     if not channel_id:
         return
     channel = client.get_channel(channel_id)
@@ -2301,11 +2333,35 @@ async def _send_embed_payload(
         except discord.HTTPException as e:
             log.warning("embed: could not fetch channel %s: %s", channel_id, e)
             return
+    # Pull out any attachment_path before handing the dict to the embed
+    # builder — discord.Embed itself doesn't know about file uploads.
+    files: list[discord.File] = []
+    img = (embed_dict.get("image") or {}) if isinstance(embed_dict.get("image"), dict) else {}
+    att_path = img.get("attachment_path") if isinstance(img, dict) else None
+    if att_path:
+        try:
+            files.append(discord.File(att_path, filename=Path(att_path).name))
+        except (OSError, ValueError) as e:
+            log.warning("embed: attachment open failed %s: %s", att_path, e)
+            # Strip the broken image ref so the embed at least renders without it
+            embed_dict = dict(embed_dict)
+            embed_dict.pop("image", None)
     try:
         embed = _dict_to_embed(embed_dict)
-        await channel.send(content=content or None, embed=embed)  # type: ignore[union-attr]
+        await channel.send(  # type: ignore[union-attr]
+            content=content or None,
+            embed=embed,
+            files=files or None,
+        )
     except discord.HTTPException as e:
         log.warning("embed: send failed: %s", e)
+    finally:
+        # discord.File objects hold open file handles — close them after send.
+        for f in files:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
 async def _embed_queue_loop() -> None:
