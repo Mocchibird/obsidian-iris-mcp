@@ -63,9 +63,53 @@ def people_upsert(
     badge: str = "",
     note: str = "",
     page_link: str = "",
+    occupation: str = "",
+    employer: str = "",
+    team: str = "",
+    nicknames: str = "",
+    email: str = "",
+    phone: str = "",
+    socials: str = "",
     reload_db: bool = True,
 ) -> str:
-    """Insert or update a person. category: family|friends|colleagues|other. birthday: 'DD.MM.YYYY' or 'DD.MM' (year optional). page_link: optional path to a dedicated note for this person — if empty, auto-detected from 10_Profile/People/<name>.md when that note exists, so name_link in views renders as a clickable wikilink. reload_db=True (default) signals Obsidian's SQLite DB Plugin to refresh — pass False for bulk writes and reload once at the end."""
+    """Insert or update a person.
+
+    Update semantics: only fields you pass non-empty overwrite the existing
+    row. Passing an empty string for an optional field on an UPDATE leaves
+    the current value alone — that way you can correct one piece of info
+    without having to re-supply everything. (To explicitly clear a field,
+    pass a single space " " — it's stripped, but tracked as "user wants
+    blank". For now, simpler: edit via sqlite_query when you really need
+    to clear.)
+
+    Args:
+        name: Required, unique per row.
+        category: family|friends|colleagues|other.
+        subcategory: free-form (e.g. "uni", "high-school", "church").
+        relationship: free-form ("Mom", "Girlfriend", "Colleague").
+        birthday: 'DD.MM.YYYY' or 'DD.MM' (year optional).
+        location: free-form ("Zurich, CH").
+        badge: emoji or short tag shown in views.
+        note: free-text catch-all for anything not covered by structured
+            fields. Historically used for job titles + nicknames — those
+            now have proper columns (`occupation`, `nicknames`) and should
+            move there over time.
+        page_link: optional path to a dedicated note for this person; if
+            empty, auto-detected from 10_Profile/People/<name>.md when
+            that note exists.
+        occupation: Job title (e.g. "AI Research Intern", "Mother").
+        employer: Company / institution (e.g. "Huawei", "ETH Zurich").
+        team: Team within employer (e.g. "Algorithm Team", "PTO Kernels").
+        nicknames: Comma-separated nicknames (e.g. "Bu, Schwabebe"). For
+            full-text alias lookup the existing aliases table on the note
+            is more powerful; this is for quick view-table display.
+        email: Primary contact email.
+        phone: Primary contact phone (free-format, no validation).
+        socials: Comma-separated handles, free-format
+            (e.g. "@handle on IG, discord:foo#123, signal:+41...").
+        reload_db: When True (default), signals Obsidian's SQLite DB
+            Plugin to refresh. Pass False for bulk writes and reload once.
+    """
     if not name.strip():
         return "err: name required"
     if category and category not in _PEOPLE_VALID_CATEGORIES:
@@ -74,7 +118,7 @@ def people_upsert(
     idx = get_vault_index()
     c = idx.conn
     now = datetime.now().isoformat(timespec="seconds")
-    existing = c.execute("SELECT id, page_link FROM people WHERE name = ?", (name,)).fetchone()
+    existing = c.execute("SELECT * FROM people WHERE name = ?", (name,)).fetchone()
 
     # Auto-detect page_link from conventional path if not supplied.
     if not page_link.strip():
@@ -82,17 +126,46 @@ def people_upsert(
         if safe_path(candidate).exists():
             page_link = candidate
         elif existing and existing["page_link"]:
-            # On update with no new page_link passed, keep the existing one
-            # rather than clobbering with empty.
             page_link = existing["page_link"]
+
+    # Per-column merge: empty string from caller = keep existing value (on
+    # UPDATE) or use empty (on INSERT). This makes partial updates safe.
+    def merge(passed: str, col: str) -> str:
+        if passed.strip():
+            return passed.strip()
+        if existing is not None:
+            try:
+                return existing[col] or ""
+            except (KeyError, IndexError):
+                return ""
+        return ""
 
     if existing:
         c.execute(
             "UPDATE people SET category = ?, subcategory = ?, relationship = ?, "
             "birthday_day = ?, birthday_month = ?, birthday_year = ?, "
-            "location = ?, badge = ?, note = ?, page_link = ?, updated_at = ? WHERE id = ?",
-            (category, subcategory, relationship, bd_day, bd_month, bd_year,
-             location, badge, note, page_link, now, existing["id"]),
+            "location = ?, badge = ?, note = ?, page_link = ?, "
+            "occupation = ?, employer = ?, team = ?, nicknames = ?, "
+            "email = ?, phone = ?, socials = ?, updated_at = ? "
+            "WHERE id = ?",
+            (merge(category, "category"),
+             merge(subcategory, "subcategory"),
+             merge(relationship, "relationship"),
+             bd_day if bd_day is not None else existing["birthday_day"],
+             bd_month if bd_month is not None else existing["birthday_month"],
+             bd_year if bd_year is not None else existing["birthday_year"],
+             merge(location, "location"),
+             merge(badge, "badge"),
+             merge(note, "note"),
+             page_link,
+             merge(occupation, "occupation"),
+             merge(employer, "employer"),
+             merge(team, "team"),
+             merge(nicknames, "nicknames"),
+             merge(email, "email"),
+             merge(phone, "phone"),
+             merge(socials, "socials"),
+             now, existing["id"]),
         )
         c.commit()
         if reload_db: maybe_reload_db_plugin()
@@ -100,10 +173,15 @@ def people_upsert(
     cur = c.execute(
         "INSERT INTO people (name, category, subcategory, relationship, "
         "birthday_day, birthday_month, birthday_year, "
-        "location, badge, note, page_link, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "location, badge, note, page_link, "
+        "occupation, employer, team, nicknames, email, phone, socials, "
+        "created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (name, category, subcategory, relationship, bd_day, bd_month, bd_year,
-         location, badge, note, page_link, now, now),
+         location, badge, note, page_link,
+         occupation.strip(), employer.strip(), team.strip(),
+         nicknames.strip(), email.strip(), phone.strip(), socials.strip(),
+         now, now),
     )
     c.commit()
     if reload_db: maybe_reload_db_plugin()
