@@ -487,20 +487,24 @@ def habit_status_today() -> str:
 
 
 @mcp.tool()
-def habit_heatmap(habit_id: int, weeks: int = 12) -> str:
+def habit_heatmap(habit_id: int, weeks: int = 10) -> str:
     """Render a GitHub-style 7×N heatmap for a habit, where each column
     is a week and each row is a day-of-week (Mon top, Sun bottom).
 
+    The rightmost column is ALWAYS the current week, so each new week
+    shifts the whole grid one column to the left (the oldest week
+    scrolls off). 10 columns = ~2.5 months of recent history, which fits
+    cleanly in a Discord embed field without line-wrapping.
+
     Glyphs:
         🟩 done · ⬜ missed (active day) · ⬛ inactive (before habit
-        created, or off-day for the cadence)
+        created, or off-day for the cadence, or future date)
 
-    Default window is 12 weeks (84 days). Use `weeks=52` for the full
-    GitHub-style year-view; that's wide but renders fine in Obsidian.
+    Use `weeks=52` for the full GitHub-style year-view; that's wide but
+    renders fine in Obsidian. Keep ≤ 10 for Discord embed fields.
 
-    Returns a markdown block with header + grid + legend, suitable for
-    direct dropping into a note OR a Discord embed field. Keep `weeks`
-    ≤ 12 for embed fields (Discord wraps long lines).
+    Returns a markdown block with header (date range + directional
+    marker), grid, and legend.
     """
     weeks = max(1, min(int(weeks), 52))
     idx = get_vault_index()
@@ -550,9 +554,18 @@ def habit_heatmap(habit_id: int, weeks: int = 12) -> str:
                 glyph = _HM_MISSED
             grid[dow].append(glyph)
 
-    # Render: 7 rows with day-of-week labels
+    # Render: 7 rows with day-of-week labels.
+    # Each emoji glyph is double-width, so the directional axis line uses
+    # 2 spaces of padding per column to stay aligned. The "→" anchor is
+    # on the right because the rightmost column is THIS WEEK.
     dow_labels = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-    body_lines = [f"{dow_labels[i]} {''.join(grid[i])}" for i in range(7)]
+    body_lines = [f"`{dow_labels[i]}` {''.join(grid[i])}" for i in range(7)]
+    axis_line = (
+        f"     `{start.strftime('%b %d')}`"
+        + " " * max(0, 2 * (weeks - 2))
+        + "← past · now → "
+        + f"`{end.strftime('%b %d')}`"
+    )
     # Stats below
     total_active_days = sum(
         1 for w in range(weeks) for dow in range(7)
@@ -562,10 +575,19 @@ def habit_heatmap(habit_id: int, weeks: int = 12) -> str:
             h["cadence"], h["cadence_n"], created,
         )
     )
-    done_count = len(done)
+    # Only count done-days that ALSO pass the cadence + creation check —
+    # otherwise back-dated logs from before the habit existed (or on
+    # off-days) inflate the percentage above 100 %.
+    done_count = sum(
+        1 for d in done
+        if (_d := datetime.strptime(d, "%Y-%m-%d").date()) <= today
+        and _cadence_active_on(_d, h["cadence"], h["cadence_n"], created)
+    )
     rate = (done_count / total_active_days * 100) if total_active_days else 0
     icon = (h["icon"] or "·").strip()
-    header = f"**{icon} {h['name']}** — last {weeks} weeks " \
-             f"({done_count}/{total_active_days} active days, {rate:.0f}%)"
-    legend = f"_{_HM_DONE} done  {_HM_MISSED} missed  {_HM_INACTIVE} inactive_"
-    return "\n".join([header, "```", *body_lines, "```", legend])
+    header = (
+        f"**{icon} {h['name']}** — last {weeks} weeks "
+        f"({done_count}/{total_active_days} active days, {rate:.0f}%)"
+    )
+    legend = f"_{_HM_DONE} done  {_HM_MISSED} missed  {_HM_INACTIVE} inactive · each column = one week, rows = Mon→Sun_"
+    return "\n".join([header, "", *body_lines, axis_line, "", legend])
