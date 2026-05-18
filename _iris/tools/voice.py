@@ -620,6 +620,103 @@ def _synthesize_piper(text: str, out_path: str) -> dict:
 
 
 # =============================================================================
+# Edge TTS (Microsoft Azure Neural voices via the Edge browser's API)
+# =============================================================================
+# Cloud-based but free + no API key required. Edge-TTS hits the same endpoint
+# Microsoft Edge uses for its read-aloud feature, exposing ~400 neural voices
+# across 100+ languages. Quality is state-of-the-art — these are the voices
+# you hear when "Read Aloud" is enabled in any Microsoft product.
+#
+# Used by auto-route as the default for Japanese and Korean since Kokoro's
+# multilingual voices are notably weaker for non-English. The per-synth cost
+# is one HTTPS round-trip (~300-500ms) — slower than Kokoro on GPU but the
+# quality jump is worth it for languages that need it.
+#
+# Privacy note: the text sent to Edge TTS is visible to Microsoft (same as
+# any cloud API). Audio of you talking back to Iris (Phase 2.2.1 STT) stays
+# fully local — only TTS output text goes out.
+
+
+def _synthesize_edge(text: str, out_path: str) -> dict:
+    """Synthesize speech via Microsoft Edge TTS to a WAV at ``out_path``.
+
+    Saves as MP3 internally (Edge's native output format) then converts to
+    16-bit mono WAV via ffmpeg so the rest of the pipeline doesn't need to
+    care about the encoding.
+
+    Voice name comes from IRIS_EDGE_VOICE env (default: en-US-AvaNeural).
+    Browse the full voice list at:
+      https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support
+    """
+    import asyncio  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+    try:
+        import edge_tts  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "edge-tts is not installed — rebuild the container with the "
+            "updated pyproject.toml"
+        ) from e
+
+    voice = (os.environ.get("IRIS_EDGE_VOICE") or "en-US-AvaNeural").strip()
+    # Edge TTS rate/pitch are exposed as ±N% strings (e.g. "+10%"). Keep at
+    # defaults unless explicitly overridden.
+    rate = (os.environ.get("IRIS_EDGE_RATE") or "+0%").strip()
+    pitch = (os.environ.get("IRIS_EDGE_PITCH") or "+0Hz").strip()
+
+    mp3_path = out_path + ".edge.mp3"
+    t0 = time.monotonic()
+
+    async def _save() -> None:
+        c = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        await c.save(mp3_path)
+
+    try:
+        asyncio.run(_save())
+    except Exception as e:
+        # Common failures: network timeout, bad voice name, Microsoft
+        # endpoint hiccup. Re-raise so the auto-route can fall back to
+        # Kokoro (still gets the user *some* audio).
+        log.warning("edge-tts request failed: %s", e)
+        raise
+
+    # Convert MP3 → mono 16-bit WAV. ffmpeg is already in the image.
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", mp3_path,
+            "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
+            out_path,
+        ],
+        check=True,
+    )
+    try:
+        os.unlink(mp3_path)
+    except OSError:
+        pass
+
+    # Pull duration via ffprobe-style read — easier just to import soundfile
+    # which we already have for Kokoro.
+    import soundfile as sf  # noqa: PLC0415
+    info = sf.info(out_path)
+    elapsed = time.monotonic() - t0
+    log.info(
+        "edge-tts: synth %d chars · voice=%s → %s "
+        "(%.1fs audio, %.1fs round-trip, %.1fx realtime)",
+        len(text), voice, Path(out_path).name,
+        info.duration, elapsed,
+        (info.duration / elapsed) if elapsed > 0 else 0,
+    )
+    return {
+        "sample_rate": info.samplerate,
+        "duration_sec": info.duration,
+        "byte_count": int(info.frames * 2),
+        "engine": "edge",
+        "voice": voice,
+    }
+
+
+# =============================================================================
 # Multilingual auto-routing — IRIS_TTS_ENGINE=auto
 # =============================================================================
 # Detects Iris's reply language and picks the right engine+voice combo. The
@@ -640,38 +737,82 @@ def _synthesize_piper(text: str, out_path: str) -> dict:
 #   IRIS_TTS_VOICE_KO=kokoro:km_001
 #   IRIS_TTS_VOICE_JA=kokoro:jm_kumo
 
+# Default voice mapping for auto-route. EN stays on Kokoro (locally hosted,
+# good quality, fast). JA/KO route to Microsoft Edge TTS by default — Kokoro's
+# Japanese voice mangles kanji and the Korean voice has noticeable artifacts;
+# Edge's neural voices (Nanami/SunHi) are state-of-the-art for those
+# languages and the cost is one HTTPS round-trip per synth (~300ms).
+#
+# To stay 100% local for JA/KO at the cost of quality, override:
+#   IRIS_TTS_VOICE_JA=kokoro:jf_alpha
+#   IRIS_TTS_VOICE_KO=kokoro:kf_001
 _DEFAULT_VOICE_BY_LANG = {
     "en": "kokoro:af_sarah",
-    "ko": "kokoro:kf_001",
-    "ja": "kokoro:jf_alpha",
+    "ko": "edge:ko-KR-SunHiNeural",
+    "ja": "edge:ja-JP-NanamiNeural",
 }
 
-# Below this many characters, language detection is unreliable — force
-# English (the lingua-franca fallback) so e.g. "Ah!" / "Ja!" / "Si!" don't
-# get routed to the wrong voice. Empirically 10 chars catches most short
-# interjections without losing useful Japanese/Korean sentences (those
-# rarely fit in fewer than ~5 chars including the actual meaningful
-# content + the script's character density).
+# Below this many Latin-script characters, language detection is
+# unreliable — force English (the fallback) so e.g. "Ah!" / "Ja!" / "Si!"
+# don't get routed to the wrong voice. The guard does NOT apply to CJK
+# text: hangul / hiragana / katakana / kanji are dense enough that even
+# 3-4 characters convey unambiguous language signal via script alone, no
+# need to wait for the statistical detector.
 _LANG_DETECT_MIN_CHARS = 10
+
+# Fast script-based language guess. Runs before the statistical detector
+# because if the text contains hangul or kana it's definitionally Korean
+# or Japanese — no ambiguity to resolve. Costs ~1 µs per call.
+_HANGUL_RE = re.compile(r"[가-힯ᄀ-ᇿ㄰-㆏]")
+_HIRAGANA_KATAKANA_RE = re.compile(r"[぀-ゟ゠-ヿｦ-ﾟ]")
+_CJK_IDEOGRAPH_RE = re.compile(r"[一-鿿]")
 
 _lang_detector = None  # lazy-init
 
 
-def _detect_language(text: str) -> str:
-    """Detect EN/KO/JA from text. Falls back to 'en' on errors,
-    indeterminate input (very short / pure punctuation), or text below
-    ``_LANG_DETECT_MIN_CHARS``. Restricted to three candidate languages so
-    detection is fast + accurate on short Discord-reply-length input.
-
-    German was previously a candidate but dropped — it routed to Piper
-    (lower quality) and engine-switching mid-sentence sounded worse than
-    just speaking German text with the English voice. Iris can still
-    *understand and reply in* German; only the TTS layer ignores it.
+def _script_based_detect(text: str) -> str | None:
+    """Return a language code if the text is unambiguous from its script
+    alone (hangul → ko, hiragana/katakana → ja). Returns None if script
+    is ambiguous — caller falls back to statistical detection.
     """
-    global _lang_detector
-    if not text or len(text.strip()) < _LANG_DETECT_MIN_CHARS:
+    if _HANGUL_RE.search(text):
+        return "ko"
+    if _HIRAGANA_KATAKANA_RE.search(text):
+        # Hiragana/katakana are Japanese-exclusive. Even if the text also
+        # contains kanji, the kana presence proves it's Japanese (not
+        # Chinese, which has no kana).
+        return "ja"
+    # Pure-kanji text is ambiguous (could be Chinese or formal Japanese).
+    # Let the statistical detector decide. Our candidate set doesn't
+    # include Chinese, so kanji-heavy Japanese tends to land on 'ja' via
+    # statistical similarity anyway.
+    return None
+
+
+def _detect_language(text: str) -> str:
+    """Detect EN/KO/JA from text. Two-stage:
+      1. Script-based fast path (hangul → ko, kana → ja). Always trusted
+         even on very short text — script alone is unambiguous.
+      2. Statistical detection via lingua, restricted to EN/KO/JA. Guarded
+         by _LANG_DETECT_MIN_CHARS for Latin-script-only text to avoid
+         misrouting 3-char interjections like "Ah!".
+
+    Falls back to 'en' on errors or indeterminate input. German was
+    previously a candidate but dropped — Iris still replies in German
+    via text, the TTS layer just speaks German content with the English
+    voice (preserves engine continuity).
+    """
+    if not text or not text.strip():
+        return "en"
+    # Stage 1: script-based check — no min-length guard needed
+    script_guess = _script_based_detect(text)
+    if script_guess is not None:
+        return script_guess
+    # Stage 2: statistical (only for Latin-only text from here on)
+    if len(text.strip()) < _LANG_DETECT_MIN_CHARS:
         return "en"
     try:
+        global _lang_detector
         if _lang_detector is None:
             from lingua import Language, LanguageDetectorBuilder  # type: ignore
             _lang_detector = LanguageDetectorBuilder.from_languages(
@@ -765,13 +906,45 @@ def _concat_wavs_via_ffmpeg(input_paths: list[str], out_path: str) -> None:
     subprocess.run(cmd, check=True)
 
 
+_VOICE_ENV_BY_ENGINE = {
+    "kokoro": "IRIS_KOKORO_VOICE",
+    "piper":  "IRIS_PIPER_VOICE",
+    "edge":   "IRIS_EDGE_VOICE",
+}
+
+
 def _synthesize_segment(text: str, lang: str, out_path: str) -> dict:
-    """Synthesize one same-language segment using the right engine + voice."""
+    """Synthesize one same-language segment using the right engine + voice.
+
+    Engine dispatch: kokoro / piper / edge. Each reads its voice name from
+    a different env var, so we briefly override the right one for this call
+    and restore it in a finally so we don't pollute global state.
+
+    Fallback chain on engine failure:
+        edge   → kokoro (local) → piper (local)
+        kokoro → piper
+        piper  → no fallback (it's the simplest path; if it fails the whole
+                              synth fails)
+    """
     chosen_engine, voice = _resolve_voice_spec(lang)
-    env_key = "IRIS_KOKORO_VOICE" if chosen_engine == "kokoro" else "IRIS_PIPER_VOICE"
+    env_key = _VOICE_ENV_BY_ENGINE.get(chosen_engine, "IRIS_KOKORO_VOICE")
     prev = os.environ.get(env_key)
     os.environ[env_key] = voice
     try:
+        if chosen_engine == "edge":
+            try:
+                return _synthesize_edge(text, out_path)
+            except Exception:
+                log.exception(
+                    "edge-tts segment synth failed — falling back to Kokoro"
+                )
+                # Strip the env override since we're not using edge anymore
+                # and Kokoro might pick up an invalid voice slug otherwise.
+                try:
+                    return _synthesize_kokoro(text, out_path)
+                except Exception:
+                    log.exception("kokoro fallback also failed — using Piper")
+                    return _synthesize_piper(text, out_path)
         if chosen_engine == "kokoro":
             try:
                 return _synthesize_kokoro(text, out_path)
@@ -793,13 +966,17 @@ def synthesize_to_wav(text: str, out_path: str) -> dict:
         ``piper``  — always use Piper. Lightweight, robotic-ish, ~10× realtime.
         ``kokoro`` — always use Kokoro. 82M-param neural, much better, ~3×
                      realtime CPU / ~30× realtime GPU. Multilingual EN/JA/
-                     KO/ZH/+ but NOT German.
+                     KO/ZH/+ but weaker on JA/KO than Edge.
+        ``edge``   — Microsoft Edge TTS (Azure Neural voices). Cloud, free,
+                     no API key. State-of-the-art quality, especially for
+                     Japanese / Korean / German. ~300-500 ms HTTPS round-trip
+                     per synth. Text leaves the host.
         ``auto``   — detect language per sentence, route per
-                     ``IRIS_TTS_VOICE_<LANG>`` env (defaults: EN/JA/KO →
-                     Kokoro, DE → Piper). Multi-language replies are
+                     ``IRIS_TTS_VOICE_<LANG>`` env (defaults: EN → Kokoro,
+                     JA/KO → Edge for quality). Multi-language replies are
                      split + synthesized per segment + concatenated via
                      ffmpeg so a "Japanese: …\\nKorean: …" reply doesn't
-                     get spoken in one English voice.
+                     get spoken in one voice.
 
     The Discord voice-send pipeline pipes the WAV through ffmpeg to upsample
     to Discord's 48 kHz stereo Opus, so per-engine sample rates differ but
@@ -850,6 +1027,15 @@ def synthesize_to_wav(text: str, out_path: str) -> dict:
                 except OSError:
                     pass
 
+    if engine == "edge":
+        try:
+            return _synthesize_edge(text, out_path)
+        except Exception:
+            log.exception("edge-tts synth failed — falling back to Kokoro")
+            try:
+                return _synthesize_kokoro(text, out_path)
+            except Exception:
+                log.exception("kokoro fallback also failed — using Piper")
     if engine == "kokoro":
         try:
             return _synthesize_kokoro(text, out_path)
