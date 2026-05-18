@@ -37,6 +37,7 @@ dependencies = [
     "kokoro-onnx>=0.5",         # Higher-quality alternative to Piper (82M params, multilingual)
     "soundfile>=0.13",          # WAV/FLAC IO for Kokoro output (numpy array → WAV)
     "lingua-language-detector>=2.0",  # Fast language detection for IRIS_TTS_ENGINE=auto (EN/DE/KO/JA routing)
+    "pykakasi>=2.2",            # Kanji → hiragana preprocessor for Japanese TTS (Kokoro/espeak can't read kanji directly)
     # Note: PyNaCl + davey for Discord voice are pulled via the `discord.py[voice]`
     # extras in docker/requirements.txt — no need to pin them here too.
 ]

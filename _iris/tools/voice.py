@@ -505,23 +505,76 @@ def _kokoro_lang_for_voice(voice: str) -> str:
     return _KOKORO_LANG_BY_PREFIX.get(prefix, "en-us")
 
 
+# pykakasi instance for kanji → hiragana preprocessing. Lazy-loaded; cached
+# at module level so we don't pay the dictionary-load cost per synth call.
+_kakasi = None
+
+
+def _kanji_to_kana(text: str) -> str:
+    """Convert any kanji in Japanese text to hiragana. Hiragana, katakana,
+    punctuation, and non-Japanese chars pass through unchanged.
+
+    Why: Kokoro's Japanese voice uses espeak for phonemization, which has
+    NO kanji → reading lookup table. When espeak hits an unknown CJK char
+    it falls back to outputting "Chinese letter" or the Unicode description
+    as English words, which the voice then reads literally. Pre-converting
+    kanji to hiragana sidesteps this entirely — espeak handles kana fine.
+
+    Note: pykakasi picks one reading per kanji from its dictionary. For
+    homographs (e.g. 一日 → "ついたち" first-of-the-month vs "いちにち" one-day)
+    it's not always context-aware. Way better than the espeak fallback
+    though — you get correct Japanese audio instead of "japanese letter
+    japanese letter chinese letter chinese letter".
+    """
+    global _kakasi
+    if not text:
+        return text
+    try:
+        if _kakasi is None:
+            import pykakasi  # type: ignore
+            _kakasi = pykakasi.kakasi()
+        result = _kakasi.convert(text)
+        return "".join(item["hira"] for item in result)
+    except Exception:
+        log.exception("kanji→kana preprocessing failed — sending raw text to Kokoro")
+        return text
+
+
 def _synthesize_kokoro(text: str, out_path: str) -> dict:
-    """Kokoro synth path — produces a WAV via soundfile."""
+    """Kokoro synth path — produces a WAV via soundfile.
+
+    For Japanese (``lang=ja``) we run text through pykakasi first to
+    convert any kanji to hiragana. Without this, Kokoro reads kanji as
+    literal "chinese letter" English words (espeak has no kanji→yomi
+    lookup). Pre-processing once at the input is way cheaper than
+    fixing the phonemizer downstream.
+    """
     import soundfile as sf  # noqa: PLC0415
 
     voice_name = (os.environ.get("IRIS_KOKORO_VOICE") or "af_sarah").strip()
     speed = float(os.environ.get("IRIS_KOKORO_SPEED", "1.0") or "1.0")
     lang = (os.environ.get("IRIS_KOKORO_LANG") or _kokoro_lang_for_voice(voice_name)).strip()
+
+    # Japanese-specific preprocessing — kanji to hiragana.
+    synth_text = text
+    if lang == "ja":
+        synth_text = _kanji_to_kana(text)
+        if synth_text != text:
+            log.info(
+                "kokoro: japanese preprocess %d→%d chars (kanji→hiragana)",
+                len(text), len(synth_text),
+            )
+
     kokoro = _load_kokoro()
     t0 = time.monotonic()
-    samples, sample_rate = kokoro.create(text, voice=voice_name, speed=speed, lang=lang)
+    samples, sample_rate = kokoro.create(synth_text, voice=voice_name, speed=speed, lang=lang)
     sf.write(out_path, samples, sample_rate)
     elapsed = time.monotonic() - t0
     duration_sec = len(samples) / sample_rate if sample_rate else 0
     log.info(
         "kokoro: synth %d chars · voice=%s lang=%s → %s "
         "(%.1fs audio, %.1fs synth, %.1fx realtime)",
-        len(text), voice_name, lang, Path(out_path).name,
+        len(synth_text), voice_name, lang, Path(out_path).name,
         duration_sec, elapsed,
         (duration_sec / elapsed) if elapsed > 0 else 0,
     )
