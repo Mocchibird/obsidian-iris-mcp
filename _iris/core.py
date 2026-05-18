@@ -862,7 +862,7 @@ class VaultIndex:
     fts        – FTS5 full-text search over note body text
     """
 
-    SCHEMA_VERSION = 11
+    SCHEMA_VERSION = 12
 
     def __init__(self, vault_root: Path):
         self._root = vault_root
@@ -1328,6 +1328,124 @@ class VaultIndex:
             )
         """)
 
+        # ── meals: every logged meal / snack / drink with calories ──────────
+        # Populated by the `log_meal` MCP tool (and never by the vault
+        # indexer — these rows are first-class data, not parsed from notes).
+        # Designed for Hyun-Min's weight-loss tracking use case (starting
+        # 107.5 kg, May 2026): the brief is "log photo-based estimates with
+        # explicit uncertainty + bias slightly high so cutting is safe".
+        #
+        # Columns:
+        #   eaten_at     — ISO 8601 datetime, when the meal was consumed
+        #                  (NOT when it was logged — see created_at).
+        #   description  — free-text ("braised pork + brown rice + salad").
+        #   kcal         — best single estimate. For weight-cutting,
+        #                  prefer the higher end of an uncertainty range.
+        #   kcal_low/    — explicit uncertainty bracket from a photo
+        #     kcal_high    estimate (e.g. 620–720 kcal). Both nullable;
+        #                  set them when source='photo' or 'restaurant'.
+        #   protein_g/carbs_g/fat_g — optional macros (nutrition labels +
+        #                  barcode lookups should fill these; pure photo
+        #                  estimates may leave them NULL).
+        #   source       — 'manual' (typed), 'photo' (vision estimate),
+        #                  'label' (nutrition tag photo, high confidence),
+        #                  'barcode' (DB lookup, highest confidence),
+        #                  'restaurant' (menu lookup, medium confidence).
+        #   confidence   — 'high' (label / barcode), 'medium' (restaurant /
+        #                  known dish), 'low' (ambiguous home-cooked photo).
+        #   photo_path   — vault-relative path to the original photo, so
+        #                  the row links back to the inbox/Attachments copy.
+        #   notes        — free-text context ("after gym", "Bu's cooking").
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS meals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                eaten_at     TEXT NOT NULL,
+                description  TEXT NOT NULL,
+                kcal         INTEGER NOT NULL,
+                kcal_low     INTEGER,
+                kcal_high    INTEGER,
+                protein_g    REAL,
+                carbs_g      REAL,
+                fat_g        REAL,
+                source       TEXT NOT NULL DEFAULT 'manual',
+                confidence   TEXT NOT NULL DEFAULT 'medium',
+                photo_path   TEXT,
+                notes        TEXT,
+                created_at   TEXT NOT NULL
+            )
+        """)
+
+        # ── weights: every weigh-in ─────────────────────────────────────────
+        # Simple log table. The morning-routine smart-scale dream is for
+        # future-Iris; this is the manual baseline.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS weights (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                measured_at  TEXT NOT NULL,
+                kg           REAL NOT NULL,
+                notes        TEXT,
+                source       TEXT NOT NULL DEFAULT 'manual',
+                created_at   TEXT NOT NULL
+            )
+        """)
+
+        # ── health_profile: singleton row of user stats for TDEE estimates ──
+        # Hard-constrained to id=1 so we can never end up with two competing
+        # profiles. The values here are inputs to BMR / TDEE / target-intake
+        # math in tools/health.py — kept minimal because the downstream
+        # formulas (Mifflin-St Jeor + activity multiplier + deficit) only
+        # need: weight (pulled from latest `weights` row), height, age
+        # (computed from DoB so it doesn't go stale), sex (affects BMR
+        # constant), activity level, and target weight-loss rate.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS health_profile (
+                id                     INTEGER PRIMARY KEY CHECK (id = 1),
+                height_cm              REAL,
+                date_of_birth          TEXT,
+                sex                    TEXT,
+                activity_level         TEXT,
+                target_kg              REAL,
+                target_weekly_loss_kg  REAL,
+                notes                  TEXT,
+                updated_at             TEXT NOT NULL
+            )
+        """)
+
+        # ── views: daily nutrition + weekly weight rollups ──────────────────
+        # Materialised views would be nice but SQLite doesn't have them; the
+        # tables are small enough that a regular VIEW + the indexes below
+        # stay snappy for years of daily logging. Both views are surfaced in
+        # the markdown dashboard at `10_Profile/Health/Weight & Nutrition.md`
+        # via the SQL-views plugin pipeline.
+        c.execute("DROP VIEW IF EXISTS meals_daily")
+        c.execute("""
+            CREATE VIEW meals_daily AS
+            SELECT
+                substr(eaten_at, 1, 10) AS day,
+                COUNT(*)                AS meal_count,
+                SUM(kcal)               AS total_kcal,
+                SUM(COALESCE(kcal_high, kcal)) AS total_kcal_high,
+                SUM(COALESCE(protein_g, 0)) AS total_protein_g,
+                SUM(COALESCE(carbs_g, 0))   AS total_carbs_g,
+                SUM(COALESCE(fat_g, 0))     AS total_fat_g
+            FROM meals
+            GROUP BY day
+        """)
+        c.execute("DROP VIEW IF EXISTS weights_weekly")
+        c.execute("""
+            CREATE VIEW weights_weekly AS
+            SELECT
+                strftime('%Y-W%W', measured_at) AS week,
+                MIN(substr(measured_at, 1, 10)) AS first_day,
+                MAX(substr(measured_at, 1, 10)) AS last_day,
+                ROUND(AVG(kg), 2)               AS avg_kg,
+                ROUND(MIN(kg), 2)               AS min_kg,
+                ROUND(MAX(kg), 2)               AS max_kg,
+                COUNT(*)                        AS reading_count
+            FROM weights
+            GROUP BY week
+        """)
+
         # -- useful indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_files_suffix ON files(suffix)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_notes_type ON notes(type)")
@@ -1348,6 +1466,9 @@ class VaultIndex:
         c.execute("CREATE INDEX IF NOT EXISTS idx_access_count ON note_access(access_count)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_model ON note_embeddings(model)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_sql_views_path ON sql_views(note_path)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_meals_eaten ON meals(eaten_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_meals_source ON meals(source)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_weights_measured ON weights(measured_at)")
 
         c.execute(
             "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)",
