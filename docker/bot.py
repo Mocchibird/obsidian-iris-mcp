@@ -1988,12 +1988,6 @@ async def _fire_evening_wrapup() -> None:
     await _send_embed_payload(PING_CHANNEL, embed)
 
 
-# Color literals for the health cards — colour ints are inlined here so we
-# don't have to round-trip through the MCP-side _resolve_color helper.
-COLOR_HEALTH_DAILY  = 0x10B981  # green (matches COLOR_GREEN in discord.py)
-COLOR_HEALTH_WEEKLY = 0x8B5CF6  # violet (matches COLOR_VIOLET in discord.py)
-
-
 async def _fire_health_daily() -> None:
     """Post yesterday's intake + weight recap to the health channel.
 
@@ -2016,7 +2010,7 @@ async def _fire_health_daily() -> None:
     embed = {
         "title": title[:256],
         "description": intro[:4096] if intro else None,
-        "color": COLOR_HEALTH_DAILY,
+        "color": COLOR_GREEN,
         "fields": fields,
         "footer": "health_daily",
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -2046,7 +2040,7 @@ async def _fire_health_weekly() -> None:
     embed = {
         "title": title[:256],
         "description": intro[:4096] if intro else None,
-        "color": COLOR_HEALTH_WEEKLY,
+        "color": COLOR_VIOLET,
         "fields": fields,
         "footer": "health_weekly",
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -2094,7 +2088,6 @@ from bot_embeds import (
     COLOR_YELLOW,
     COLOR_RED,
     COLOR_VIOLET,
-    COLOR_GRAY,
     COLOR_PINK,
     parse_md_sections as _parse_md_sections,
     dict_to_embed as _dict_to_embed,
