@@ -37,6 +37,13 @@ services:
     build:
       context: ${IRIS_REPO_DIR:-..}
       dockerfile: docker/Dockerfile
+      # ── Optional: GPU build ──────────────────────────────────────────────
+      # Uncomment + set IRIS_GPU=1 in .env (or `docker compose build
+      # --build-arg IRIS_GPU=1 iris`) to compile with CUDA support for
+      # Whisper STT + Piper TTS. Adds ~600 MB to the image; requires the
+      # host to have NVIDIA driver + nvidia-container-toolkit installed.
+      args:
+        IRIS_GPU: ${IRIS_GPU:-0}
     image: iris-discord:latest
     container_name: iris-discord
     restart: unless-stopped
@@ -105,11 +112,25 @@ services:
 
     # Resource hints. The bot itself is tiny; claude CLI is also tiny.
     # If embeddings/LLM run in another container, this one stays small.
+    # When GPU is enabled (IRIS_GPU=1), the memory limit goes up because
+    # Whisper large-v3 + Piper hold model weights resident.
     deploy:
       resources:
         limits:
-          memory: 2G
-          cpus: '2.0'
+          memory: 4G
+          cpus: '4.0'
         reservations:
           memory: 512M
           cpus: '0.5'
+          # ── GPU passthrough (uncomment to enable) ───────────────────────
+          # Requires:
+          #   1. NVIDIA driver + nvidia-container-toolkit installed on host
+          #      (test from TrueNAS shell: `docker run --rm --gpus all
+          #       nvidia/cuda:12.0-base nvidia-smi`)
+          #   2. Image built with IRIS_GPU=1 (see the `args` block above)
+          #   3. .env: IRIS_PIPER_USE_CUDA=1, IRIS_WHISPER_DEVICE=cuda
+          #
+          # devices:
+          #   - driver: nvidia
+          #     count: 1            # or 'all'
+          #     capabilities: [gpu]

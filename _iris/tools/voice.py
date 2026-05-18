@@ -65,9 +65,22 @@ def is_audio_file(filename: str) -> bool:
 
 def _load_model():
     """Lazy-load the Whisper model on first call. Reloads if the env-
-    configured model name changes between calls (unlikely but defensive)."""
+    configured model name changes between calls (unlikely but defensive).
+
+    Smart defaults: when IRIS_WHISPER_DEVICE=cuda is set but no
+    IRIS_WHISPER_MODEL is specified, default to ``large-v3`` (best
+    quality, multilingual, ~3 GB VRAM, ~5× realtime on a GTX 1080 Ti
+    class GPU). On CPU we stay with ``base`` since large-v3 on CPU is
+    impractically slow (~0.3× realtime).
+    """
     global _model, _model_name
-    desired = os.environ.get("IRIS_WHISPER_MODEL", "base").strip() or "base"
+    device = os.environ.get("IRIS_WHISPER_DEVICE", "cpu").strip() or "cpu"
+    if env_model := os.environ.get("IRIS_WHISPER_MODEL", "").strip():
+        desired = env_model
+    elif device == "cuda":
+        desired = "large-v3"  # GPU can handle it
+    else:
+        desired = "base"  # sane CPU default
     if _model is not None and _model_name == desired:
         return _model
     try:
@@ -77,7 +90,6 @@ def _load_model():
             "faster-whisper is not installed — rebuild the container with "
             "the updated pyproject.toml (Phase 2.1 added the dep)"
         ) from e
-    device = os.environ.get("IRIS_WHISPER_DEVICE", "cpu").strip() or "cpu"
     # int8 is the right default on CPU (4× faster than float32, near-identical
     # accuracy for speech). float16 is the right default on CUDA.
     default_compute = "float16" if device == "cuda" else "int8"
@@ -87,7 +99,22 @@ def _load_model():
         desired, device, compute,
     )
     t0 = time.monotonic()
-    _model = WhisperModel(desired, device=device, compute_type=compute)
+    try:
+        _model = WhisperModel(desired, device=device, compute_type=compute)
+    except Exception as e:
+        # CUDA load failures (no GPU visible, libs missing) fall back to CPU
+        # rather than crashing the bot. Same pattern as the Piper loader.
+        if device == "cuda":
+            log.warning(
+                "voice: Whisper CUDA load failed (%s) — falling back to CPU. "
+                "Check onnxruntime-gpu install + GPU passthrough.", e,
+            )
+            # Pick a CPU-feasible model since large-v3 is too slow there.
+            fallback_model = "base" if desired == "large-v3" else desired
+            _model = WhisperModel(fallback_model, device="cpu", compute_type="int8")
+            desired = fallback_model
+        else:
+            raise
     log.info("voice: model loaded in %.1fs", time.monotonic() - t0)
     _model_name = desired
     return _model
