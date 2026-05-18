@@ -34,7 +34,8 @@ dependencies = [
     "matplotlib>=3.7",          # PNG chart rendering for Discord embed attachments
     "faster-whisper>=1.0",      # Local Whisper STT (CTranslate2 backend) for voice messages — Phase 2.1
     "piper-tts>=1.2",           # Local neural TTS for voice channel replies — Phase 2.2.0
-    "PyNaCl>=1.5",              # Discord voice send (encryption); also required by Phase 2.2.1 receive path
+    # Note: PyNaCl + davey for Discord voice are pulled via the `discord.py[voice]`
+    # extras in docker/requirements.txt — no need to pin them here too.
 ]
 
 [project.optional-dependencies]

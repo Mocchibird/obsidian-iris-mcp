@@ -1,7 +1,13 @@
 # Phase 1 — text bot dependencies. Iris's own runtime deps (mcp, httpx, etc.)
 # come from pyproject.toml via `pip install -e .` in the Dockerfile.
 
-discord.py>=2.4
+# Voice extras (pulls PyNaCl + davey) — required from discord.py 2.5+ for
+# any voice channel connection, since Discord enforced AEAD encryption +
+# the DAVE end-to-end-encryption protocol. Without the [voice] extras the
+# bot crashes with "davey library needed in order to use voice" on the
+# first `channel.connect()` call. Adds ~5 MB to the container image
+# (libsodium binding + DAVE protocol code).
+discord.py[voice]>=2.4
 claude-agent-sdk>=0.0.18
 # Python tzdata fallback. The system `tzdata` apt package SHOULD make
 # zoneinfo work on Linux, but if its layout differs from what zoneinfo
