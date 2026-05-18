@@ -150,6 +150,38 @@ NOTIFY_INTERVAL_SECS = int(os.environ.get("IRIS_NOTIFY_INTERVAL_SECS", "60"))
 NOTIFY_LEAD_MIN = int(os.environ.get("IRIS_NOTIFY_LEAD_MIN", "15"))
 NOTIFY_MORNING_AT = os.environ.get("IRIS_NOTIFY_MORNING_AT", "08:00").strip() or "off"
 NOTIFY_EVENING_AT = os.environ.get("IRIS_NOTIFY_EVENING_AT", "22:00").strip() or "off"
+
+# ── Health-channel proactive cards ──────────────────────────────────────────
+# When IRIS_DISCORD_HEALTH_CHANNEL is set, Iris posts a daily recap card
+# (yesterday's intake + weight delta) and a weekly summary card (weight
+# change + adherence + intake-vs-target) to that channel. Times default
+# to *after* the regular morning briefing so the cards arrive in order.
+try:
+    HEALTH_CHANNEL = int(os.environ.get("IRIS_DISCORD_HEALTH_CHANNEL", "0") or "0")
+except ValueError:
+    HEALTH_CHANNEL = 0
+NOTIFY_HEALTH_DAILY_AT = os.environ.get(
+    "IRIS_NOTIFY_HEALTH_DAILY_AT", "08:30"
+).strip() or "off"
+# ISO weekday number for weekly fire: 1=Monday … 7=Sunday. Combined with
+# IRIS_NOTIFY_HEALTH_WEEKLY_AT (HH:MM) — both must match for the fire.
+NOTIFY_HEALTH_WEEKLY_AT = os.environ.get(
+    "IRIS_NOTIFY_HEALTH_WEEKLY_AT", "09:00"
+).strip() or "off"
+try:
+    NOTIFY_HEALTH_WEEKLY_DOW = int(
+        os.environ.get("IRIS_NOTIFY_HEALTH_WEEKLY_DOW", "1")
+    )
+except ValueError:
+    NOTIFY_HEALTH_WEEKLY_DOW = 1  # Monday
+# Grace window so a container restart at, say, 09:15 still fires the 08:30
+# card if it was missed. Same idea as the morning-brief grace.
+NOTIFY_HEALTH_DAILY_GRACE_MIN = int(
+    os.environ.get("IRIS_NOTIFY_HEALTH_DAILY_GRACE_MIN", "120")
+)
+NOTIFY_HEALTH_WEEKLY_GRACE_MIN = int(
+    os.environ.get("IRIS_NOTIFY_HEALTH_WEEKLY_GRACE_MIN", "180")
+)
 # Catch-up grace window: if the bot restarts AFTER the scheduled time but
 # within this many minutes of it, still fire the briefing (once). Past the
 # grace window, suppress entirely — better than getting yesterday's morning
@@ -638,11 +670,31 @@ def _load_system_prompt() -> str | None:
         "    hand / standard plate visible).\n"
         "  - Protein cut — pork loin vs. neck, chicken breast vs. thigh "
         "    can be ±50 kcal at the same visible portion.\n"
+        " Photo handling for food: when you log a meal that came from a "
+        "Discord photo, ALWAYS pass the saved inbox path as `photo_path` "
+        "(e.g. `90_Inbox/inbox/20260518_092140_image.png`) — `log_meal` "
+        "automatically:\n"
+        "   1. Renames the file to `YYYY-MM-DD_HHMM_<meal-slug>.<ext>` "
+        "      (slug derived from your `description` arg, so write good "
+        "      descriptions!).\n"
+        "   2. Moves it to `40_Attachments/Food Log/YYYY-MM/`.\n"
+        "   3. Stores the new path in the meal row so the dashboard "
+        "      shows a clickable wikilink.\n"
+        " Don't `move_files` the photo yourself — `log_meal` does it. The "
+        "vault hub note is [[10_Profile/Personal/Health|Health]] and the "
+        "live dashboard is [[10_Profile/Personal/Weight & Nutrition|"
+        "Weight & Nutrition]] — feel free to link those when explaining "
+        "the workflow.\n"
         " Tool inventory:\n"
         "  - `log_meal(description, kcal, eaten_at=\"now\", kcal_low=..., "
         "    kcal_high=..., source=..., confidence=..., photo_path=..., "
-        "    notes=...)` — log a meal/snack/drink.\n"
-        "  - `remove_meal(meal_id)` — undo a mis-logged entry.\n"
+        "    notes=...)` — log a meal/snack/drink. Auto-routes inbox "
+        "    photos (see above).\n"
+        "  - `remove_meal(meal_id)` — undo a mis-logged entry. NOTE: this "
+        "    does NOT undo the photo move — if you remove a meal that "
+        "    routed a photo, the photo stays in `40_Attachments/Food "
+        "    Log/...`; either move it back manually with `move_files` or "
+        "    leave it as archival.\n"
         "  - `recent_meals(days=1)` — drill-down list of recent logs.\n"
         "  - `daily_calories(date=\"today\")` — daily rollup (kcal + macros).\n"
         "  - `log_weight(kg, notes=...)` — record a weigh-in.\n"
@@ -691,7 +743,18 @@ def _load_system_prompt() -> str | None:
         "     activity multiplier, latest weight).\n"
         "   - `tdee_estimate(weight_kg=None)` — BMR + TDEE.\n"
         "   - `target_intake(weekly_loss_kg=None, weight_kg=None)` — "
-        "     deficit-adjusted intake recommendation with BMR floor.\n\n"
+        "     deficit-adjusted intake recommendation with BMR floor.\n"
+        "  Proactive health-channel cards: when "
+        "`IRIS_DISCORD_HEALTH_CHANNEL` is configured, the bot "
+        "automatically posts a daily recap (08:30 by default, summarising "
+        "yesterday) and a weekly summary (Monday 09:00 by default) to "
+        "that channel. They use the same data you log via the tools "
+        "above. If Hyun-Min asks for an on-demand version (\"show me "
+        "today's health card\", \"weekly recap please\"), call "
+        "`embed_health_daily(date=\"today\")` or "
+        "`embed_health_weekly()` — those post a fresh card to the "
+        "current channel (or pass `channel_id=...` to target a "
+        "different one).\n\n"
         "Updating an existing note — append vs edit-in-place (IMPORTANT):\n"
         "When Hyun-Min asks you to add information to a note, your default "
         "should NOT be `append_to_note` — that tool only makes sense for "
@@ -1424,8 +1487,18 @@ async def on_ready() -> None:
         if NOTIFY_EVENING_AT != "off":
             log.info("evening wrap-up at %s daily (grace %d min, active TZ)",
                      NOTIFY_EVENING_AT, NOTIFY_EVENING_GRACE_MIN)
+        if HEALTH_CHANNEL:
+            log.info(
+                "health channel: %s — daily at %s (grace %d), "
+                "weekly on dow=%d at %s (grace %d)",
+                HEALTH_CHANNEL,
+                NOTIFY_HEALTH_DAILY_AT, NOTIFY_HEALTH_DAILY_GRACE_MIN,
+                NOTIFY_HEALTH_WEEKLY_DOW, NOTIFY_HEALTH_WEEKLY_AT,
+                NOTIFY_HEALTH_WEEKLY_GRACE_MIN,
+            )
         client.loop.create_task(_notification_loop())
         client.loop.create_task(_scheduled_briefings_loop())
+        client.loop.create_task(_scheduled_health_loop())
         client.loop.create_task(_snooze_replay_loop())
         client.loop.create_task(_pingback_loop())
         client.loop.create_task(_embed_queue_loop())
@@ -1495,6 +1568,11 @@ _notified: dict[str, None] = {}
 # same day if the bot restarts.
 _last_morning_fired: str = ""
 _last_evening_fired: str = ""
+# Health-channel cards: daily keyed by date (YYYY-MM-DD), weekly by ISO
+# year+week ("YYYY-Www") so a Monday fire only happens once per ISO week
+# even if the bot bounces.
+_last_health_daily_fired: str = ""
+_last_health_weekly_fired: str = ""
 
 
 async def _notification_loop() -> None:
@@ -1775,6 +1853,79 @@ async def _scheduled_briefings_loop() -> None:
         await asyncio.sleep(60)
 
 
+# ── Scheduled health-channel cards ──────────────────────────────────────────
+
+async def _scheduled_health_loop() -> None:
+    """Once a minute, check whether the daily / weekly health card should
+    fire. No-op when IRIS_DISCORD_HEALTH_CHANNEL isn't configured.
+
+    Dedupe keys:
+      - daily  → date string (YYYY-MM-DD), so each calendar day fires once.
+      - weekly → ISO year+week ("YYYY-Www"), so a Monday fire doesn't
+                 repeat if the bot restarts mid-week.
+
+    Grace windows mirror the morning/evening loop: if the bot starts up
+    after the scheduled fire time but inside the grace window, the loop
+    fires on its first normal tick. Past the grace window, the fire is
+    suppressed for that day/week so a 3 PM restart doesn't dump a
+    breakfast card.
+    """
+    global _last_health_daily_fired, _last_health_weekly_fired
+    if HEALTH_CHANNEL == 0:
+        log.info("health channel not set — _scheduled_health_loop exiting")
+        return
+    await asyncio.sleep(15)  # slight stagger vs the briefings loop
+
+    # Startup grace-window suppress for the daily fire
+    try:
+        startup_now = _now_local()
+        if NOTIFY_HEALTH_DAILY_AT != "off":
+            past_min = _minutes_past_target(NOTIFY_HEALTH_DAILY_AT, startup_now)
+            if past_min is not None and past_min > NOTIFY_HEALTH_DAILY_GRACE_MIN:
+                _last_health_daily_fired = startup_now.date().isoformat()
+                log.info(
+                    "health daily missed (%.0f min past %s > grace %d) — suppressed for today",
+                    past_min, NOTIFY_HEALTH_DAILY_AT, NOTIFY_HEALTH_DAILY_GRACE_MIN,
+                )
+        # Weekly: only the right weekday triggers the suppress logic.
+        if (NOTIFY_HEALTH_WEEKLY_AT != "off"
+                and startup_now.isoweekday() == NOTIFY_HEALTH_WEEKLY_DOW):
+            past_min = _minutes_past_target(NOTIFY_HEALTH_WEEKLY_AT, startup_now)
+            if past_min is not None and past_min > NOTIFY_HEALTH_WEEKLY_GRACE_MIN:
+                iso_year, iso_week, _ = startup_now.isocalendar()
+                _last_health_weekly_fired = f"{iso_year}-W{iso_week:02d}"
+                log.info(
+                    "health weekly missed (%.0f min past %s > grace %d) — suppressed for this week",
+                    past_min, NOTIFY_HEALTH_WEEKLY_AT, NOTIFY_HEALTH_WEEKLY_GRACE_MIN,
+                )
+    except Exception:
+        log.exception("scheduled health startup-suppress")
+
+    while not client.is_closed():
+        try:
+            now = _now_local()
+            now_hm = now.strftime("%H:%M")
+            today = now.date().isoformat()
+            iso_year, iso_week, _ = now.isocalendar()
+            this_week = f"{iso_year}-W{iso_week:02d}"
+
+            if (NOTIFY_HEALTH_DAILY_AT != "off"
+                    and now_hm >= NOTIFY_HEALTH_DAILY_AT
+                    and _last_health_daily_fired != today):
+                await _fire_health_daily()
+                _last_health_daily_fired = today
+
+            if (NOTIFY_HEALTH_WEEKLY_AT != "off"
+                    and now.isoweekday() == NOTIFY_HEALTH_WEEKLY_DOW
+                    and now_hm >= NOTIFY_HEALTH_WEEKLY_AT
+                    and _last_health_weekly_fired != this_week):
+                await _fire_health_weekly()
+                _last_health_weekly_fired = this_week
+        except Exception:
+            log.exception("scheduled health loop")
+        await asyncio.sleep(60)
+
+
 async def _fire_morning_briefing() -> None:
     if PING_CHANNEL == 0:
         return
@@ -1835,6 +1986,72 @@ async def _fire_evening_wrapup() -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     await _send_embed_payload(PING_CHANNEL, embed)
+
+
+# Color literals for the health cards — colour ints are inlined here so we
+# don't have to round-trip through the MCP-side _resolve_color helper.
+COLOR_HEALTH_DAILY  = 0x10B981  # green (matches COLOR_GREEN in discord.py)
+COLOR_HEALTH_WEEKLY = 0x8B5CF6  # violet (matches COLOR_VIOLET in discord.py)
+
+
+async def _fire_health_daily() -> None:
+    """Post yesterday's intake + weight recap to the health channel.
+
+    No-op when IRIS_DISCORD_HEALTH_CHANNEL isn't configured. Generates
+    the markdown with `health_daily_summary("yesterday")` so a morning
+    fire reports the previous day's logging (which is what the user
+    actually wants to see — today is still in progress).
+    """
+    if HEALTH_CHANNEL == 0:
+        return
+    try:
+        from _iris.tools.health import health_daily_summary
+        text = await asyncio.to_thread(health_daily_summary, "yesterday")
+    except Exception as e:
+        log.warning("health_daily_summary failed: %s", e)
+        return
+    title, intro, fields = _parse_md_sections(text)
+    if not title or not title.startswith(("🥗", "Health")):
+        title = f"🥗 {title or 'Health · daily'}"
+    embed = {
+        "title": title[:256],
+        "description": intro[:4096] if intro else None,
+        "color": COLOR_HEALTH_DAILY,
+        "fields": fields,
+        "footer": "health_daily",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    await _send_embed_payload(HEALTH_CHANNEL, embed)
+
+
+async def _fire_health_weekly() -> None:
+    """Post last week's intake + weight recap to the health channel.
+
+    Fires on `IRIS_NOTIFY_HEALTH_WEEKLY_DOW` (default 1 = Monday) at
+    `IRIS_NOTIFY_HEALTH_WEEKLY_AT` (default 09:00). The summary uses
+    today's date and the generator walks back 6 days, so a Monday fire
+    naturally captures last Mon-Sun.
+    """
+    if HEALTH_CHANNEL == 0:
+        return
+    try:
+        from _iris.tools.health import health_weekly_summary
+        text = await asyncio.to_thread(health_weekly_summary, "today")
+    except Exception as e:
+        log.warning("health_weekly_summary failed: %s", e)
+        return
+    title, intro, fields = _parse_md_sections(text)
+    if not title or not title.startswith(("📊", "Weekly")):
+        title = f"📊 {title or 'Weekly health'}"
+    embed = {
+        "title": title[:256],
+        "description": intro[:4096] if intro else None,
+        "color": COLOR_HEALTH_WEEKLY,
+        "fields": fields,
+        "footer": "health_weekly",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    await _send_embed_payload(HEALTH_CHANNEL, embed)
 
 
 # ── Embed builders + queue (rich Discord embeds for pings + tool output) ───
