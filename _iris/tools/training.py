@@ -467,27 +467,53 @@ def log_training(
     skill_ids: str = "",
     note_path: str = "",
     notes: str = "",
+    distance_km: Optional[float] = None,
+    kcal_burned: Optional[int] = None,
+    avg_hr: Optional[int] = None,
+    max_hr: Optional[int] = None,
+    steps: Optional[int] = None,
+    elevation_gain_m: Optional[int] = None,
+    avg_pace_sec_per_km: Optional[int] = None,
+    data_source: str = "",
     reload_db: bool = True,
 ) -> str:
-    """Log a training session.
+    """Log a training session — strength, cardio, mobility, outdoor, whatever.
 
-    Lightweight — raw set/rep detail stays in `30_Episodic/Personal/Gym.md`
-    (or wherever you log sessions). This row is for queries like
-    "how many sessions in the last 30 days" and for cross-linking to
-    skill goals via `skill_ids`.
+    The first half (summary/kind/duration/rpe/skill_ids/notes) covers any
+    training kind. The second half (distance_km, kcal_burned, avg_hr,
+    max_hr, steps, elevation_gain_m, avg_pace_sec_per_km, data_source) is
+    optional cardio/outdoor metric data — leave NULL for strength sessions.
+
+    Raw set/rep detail for strength work still goes in
+    `30_Episodic/Personal/Gym.md` (point `note_path` at it). For
+    cardio/outdoor sessions the structured columns ARE the record — no
+    need for a separate markdown note unless there's narrative to add.
 
     Args:
-        summary: Required short description. Ex: "Pull workout — lats +
-            active hang. Avoided overhead pressing per shoulder rehab."
+        summary: Required short description. Ex: "Morning walk along the
+            Limmat" / "Pull workout — lats + active hang".
         kind: 'gym' / 'calisthenics' / 'mobility' / 'physio' / 'cardio' /
-            'outdoor' / 'team_sport' / 'other'.
+            'outdoor' / 'team_sport' / 'other'. Use 'outdoor' for walks,
+            hikes, runs outside; 'cardio' for indoor cycling, treadmill,
+            rower; 'gym' for free weights + machines.
         session_at: ISO datetime, "now" (default), or just date.
         duration_min: Total minutes (warmup + work + cooldown).
         rpe: 1-10 effort scale ("how hard, 10 = max").
-        skill_ids: Comma-separated `skill_goals.id` values that were
-            worked this session.
-        note_path: Vault path to the section / dedicated note containing
-            the detailed set/rep log (e.g. `30_Episodic/Personal/Gym.md`).
+        skill_ids: Comma-separated `skill_goals.id` values worked this
+            session.
+        note_path: Vault path to a dedicated note for narrative detail.
+
+        Cardio / outdoor metrics (all optional):
+        distance_km: Total distance in kilometres (e.g. 5.2 for a 5.2 km walk).
+        kcal_burned: Calories burned per the source app's estimate.
+        avg_hr / max_hr: Heart rate in BPM. Pulled from Apple Health,
+            Strava, Garmin, Fitbit, etc.
+        steps: Step count for walks/hikes/runs.
+        elevation_gain_m: Total ascent in metres.
+        avg_pace_sec_per_km: Average pace in seconds per km (more granular
+            than min/km — e.g. 7:30 min/km = 450 sec/km).
+        data_source: Where the numbers came from ("Apple Health",
+            "Strava", "Garmin", "manual", screenshot OCR, etc.).
     """
     if not summary.strip():
         return "err: summary required"
@@ -497,6 +523,17 @@ def log_training(
         return f"err: rpe must be 1-10 (got {rpe})"
     if duration_min is not None and duration_min < 0:
         return f"err: duration_min must be non-negative (got {duration_min})"
+    # Light sanity checks on cardio columns — catch obvious typos (1000 BPM HR, etc.)
+    if avg_hr is not None and not 30 <= avg_hr <= 250:
+        return f"err: avg_hr {avg_hr} outside plausible range (30-250 bpm)"
+    if max_hr is not None and not 30 <= max_hr <= 250:
+        return f"err: max_hr {max_hr} outside plausible range (30-250 bpm)"
+    if distance_km is not None and distance_km < 0:
+        return f"err: distance_km must be non-negative (got {distance_km})"
+    if kcal_burned is not None and kcal_burned < 0:
+        return f"err: kcal_burned must be non-negative (got {kcal_burned})"
+    if steps is not None and steps < 0:
+        return f"err: steps must be non-negative (got {steps})"
     when = _parse_when(session_at)
     now = _now_iso()
     idx = get_vault_index()
@@ -504,18 +541,35 @@ def log_training(
     cur = c.execute(
         "INSERT INTO training_sessions "
         "(session_at, kind, duration_min, rpe, summary, skill_ids, "
-        " note_path, notes, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " note_path, notes, distance_km, kcal_burned, avg_hr, max_hr, "
+        " steps, elevation_gain_m, avg_pace_sec_per_km, data_source, "
+        " created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             when, kind, duration_min, rpe, summary.strip(),
-            skill_ids.strip(), note_path.strip(),
-            notes.strip(), now,
+            skill_ids.strip(), note_path.strip(), notes.strip(),
+            distance_km, kcal_burned, avg_hr, max_hr,
+            steps, elevation_gain_m, avg_pace_sec_per_km,
+            data_source.strip(), now,
         ),
     )
     c.commit()
     if reload_db:
         maybe_reload_db_plugin()
-    return f"ok inserted id:{cur.lastrowid} kind:{kind} at:{when}"
+    # Build a compact return line — include metrics when present
+    extras: list[str] = []
+    if distance_km is not None:
+        extras.append(f"dist:{distance_km}km")
+    if duration_min is not None:
+        extras.append(f"dur:{duration_min}min")
+    if kcal_burned is not None:
+        extras.append(f"kcal:{kcal_burned}")
+    if avg_hr is not None:
+        extras.append(f"avgHR:{avg_hr}")
+    if steps is not None:
+        extras.append(f"steps:{steps}")
+    extras_str = (" · " + " ".join(extras)) if extras else ""
+    return f"ok inserted id:{cur.lastrowid} kind:{kind} at:{when}{extras_str}"
 
 
 @mcp.tool()
@@ -543,7 +597,8 @@ def recent_training(days: int = 14, limit: int = 30) -> str:
     idx = get_vault_index()
     c = idx.conn
     rows = c.execute(
-        "SELECT id, session_at, kind, duration_min, rpe, summary, skill_ids "
+        "SELECT id, session_at, kind, duration_min, rpe, summary, skill_ids, "
+        " distance_km, kcal_burned, avg_hr, steps, data_source "
         "FROM training_sessions WHERE session_at >= ? "
         "ORDER BY session_at DESC LIMIT ?",
         (cutoff, limit),
@@ -555,8 +610,21 @@ def recent_training(days: int = 14, limit: int = 30) -> str:
         dur = f" · {r['duration_min']}min" if r["duration_min"] else ""
         eff = f" · RPE {r['rpe']}" if r["rpe"] else ""
         skills_tag = f" · skills:{r['skill_ids']}" if r["skill_ids"] else ""
+        # Inline cardio metrics when present so cardio sessions actually
+        # show their interesting data (distance / HR / kcal / steps).
+        cardio_bits: list[str] = []
+        if r["distance_km"] is not None:
+            cardio_bits.append(f"{r['distance_km']:.2f}km")
+        if r["kcal_burned"] is not None:
+            cardio_bits.append(f"{r['kcal_burned']}kcal")
+        if r["avg_hr"] is not None:
+            cardio_bits.append(f"avgHR {r['avg_hr']}")
+        if r["steps"] is not None:
+            cardio_bits.append(f"{r['steps']} steps")
+        cardio_tag = f" · {' · '.join(cardio_bits)}" if cardio_bits else ""
+        src_tag = f" [src:{r['data_source']}]" if r["data_source"] else ""
         parts.append(
-            f"  id:{r['id']} {r['session_at']} [{r['kind']}]{dur}{eff}{skills_tag}\n"
+            f"  id:{r['id']} {r['session_at']} [{r['kind']}]{dur}{eff}{cardio_tag}{skills_tag}{src_tag}\n"
             f"     {r['summary']}"
         )
     return "\n".join(parts)
