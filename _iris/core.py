@@ -1163,6 +1163,12 @@ class VaultIndex:
         c.execute("CREATE INDEX IF NOT EXISTS idx_vocab_due ON vocab(due_at)")
 
         # -- v8: people (family, friends, colleagues — anyone with birthday/contact info)
+        # v12: added occupation/employer/team/nicknames/email/phone/socials
+        # columns. These used to be crammed into `note` ("AI Research Intern",
+        # "Nicknames: Bu, Schwabebe") which made them unqueryable. The
+        # migration below is additive (ALTER TABLE ADD COLUMN) so existing
+        # rows keep their `note` content untouched — Iris can move it to the
+        # structured columns over time as people get edited.
         c.execute("""
             CREATE TABLE IF NOT EXISTS people (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1182,8 +1188,26 @@ class VaultIndex:
                 UNIQUE(name)
             )
         """)
+        # v12 additive migration: structured contact + employment columns.
+        # Try/except per column because SQLite has no ALTER TABLE ADD COLUMN
+        # IF NOT EXISTS — just swallow the duplicate-column error on re-runs.
+        for col, typedef in [
+            ("occupation", "TEXT NOT NULL DEFAULT ''"),  # job title (e.g. "AI Research Intern")
+            ("employer",   "TEXT NOT NULL DEFAULT ''"),  # company / institution (e.g. "Huawei")
+            ("team",       "TEXT NOT NULL DEFAULT ''"),  # team within employer (e.g. "Algorithm Team")
+            ("nicknames",  "TEXT NOT NULL DEFAULT ''"),  # comma-separated, e.g. "Bu, Schwabebe"
+            ("email",      "TEXT NOT NULL DEFAULT ''"),
+            ("phone",      "TEXT NOT NULL DEFAULT ''"),
+            ("socials",    "TEXT NOT NULL DEFAULT ''"),  # comma-separated, e.g. "@handle on IG, discord:foo#123"
+        ]:
+            try:
+                c.execute(f"ALTER TABLE people ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         c.execute("CREATE INDEX IF NOT EXISTS idx_people_category ON people(category)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_people_bday ON people(birthday_month, birthday_day)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_people_employer ON people(employer)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_people_occupation ON people(occupation)")
 
         # View: upcoming birthdays — recreated each startup so the name_link
         # column (wikilink markup, picked up by the sqlite-db-companion plugin)
