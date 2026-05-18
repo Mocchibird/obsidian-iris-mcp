@@ -8,6 +8,11 @@
 # first `channel.connect()` call. Adds ~5 MB to the container image
 # (libsodium binding + DAVE protocol code).
 discord.py[voice]>=2.4
+# Voice receive — adds VoiceRecvClient + AudioSink to discord.py. Lets Iris
+# hear users (Phase 2.2.1). Without this, voice channels are send-only.
+# The library is import-gated in docker/voice_listen.py, so the bot still
+# boots if you skip it; it just silently runs send-only.
+discord-ext-voice-recv>=0.5
 claude-agent-sdk>=0.0.18
 # Python tzdata fallback. The system `tzdata` apt package SHOULD make
 # zoneinfo work on Linux, but if its layout differs from what zoneinfo

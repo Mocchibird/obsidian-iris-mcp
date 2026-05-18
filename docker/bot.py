@@ -61,6 +61,18 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
+# Voice receive — Phase 2.2.1. Iris listens for utterances, Whisper-STTs
+# each one, and routes the transcript through the same agent path as a
+# typed message. If discord-ext-voice-recv isn't installed, VOICE_RECV_AVAILABLE
+# is False and the bot silently runs send-only in voice channels.
+from voice_listen import (  # type: ignore[import-not-found]
+    VOICE_RECV_AVAILABLE,
+    WhisperSink,
+    transcript_passes_wake_word,
+    voice_recv,
+    LISTEN_ENABLED as VOICE_LISTEN_ENABLED,
+)
+
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -720,8 +732,18 @@ def _load_system_prompt() -> str | None:
         "   silence (configurable via `IRIS_DISCORD_VOICE_IDLE_SEC`). "
         "   When that happens it posts a status message in the text "
         "   channel where the join was invoked.\n"
-        " - Phase 2.2.1 (next iteration) will add voice receive + "
-        "   Whisper STT inside the voice channel for full duplex.\n\n"
+        " - **Full duplex (Phase 2.2.1)**: Iris ALSO listens when she's "
+        "   in a voice channel. Each user utterance is segmented by "
+        "   silence (~700ms hang), transcribed via local Whisper, and "
+        "   posted to the invite text channel as `🎤 *<@user>*: <text>`. "
+        "   By default a wake-word gate (`iris`, `hey iris`, `okay "
+        "   iris`) keeps Iris from reacting to every random sentence — "
+        "   only utterances containing one of those words trigger a "
+        "   response. If you (Iris) receive a voice transcript, treat "
+        "   it as if Hyun-Min spoke directly to you — answer "
+        "   conversationally and concisely so the TTS reply sounds "
+        "   natural. The sink is paused while you're speaking so you "
+        "   won't capture echoes of your own TTS.\n\n"
         "Calorie + weight tracking (active goal): Hyun-Min is tracking "
         "intake to lose weight (started May 2026 at 107.5 kg). When a food "
         "photo or text mention comes through, your job is to estimate "
@@ -1139,6 +1161,19 @@ _voice_last_activity: dict[int, float] = {}  # guild_id → time.monotonic()
 _voice_invite_channel: dict[int, int] = {}  # guild_id → text channel id
 _voice_lock = asyncio.Lock()  # serialize join/leave/play per guild
 
+# Phase 2.2.1 — Iris listens. Per-guild WhisperSink instances (populated on
+# join, removed on leave). Sink registers users → utterance buffers internally;
+# we just need a handle so we can pause it while Iris speaks (echo gating) and
+# stop the sweeper task on leave.
+_voice_sinks: dict[int, "WhisperSink"] = {}
+
+# Listen-users ACL — who Iris will respond to in voice. Inherits from the
+# text-channel allow-list if not set explicitly. Empty = anyone in the voice
+# channel can be heard (matches the text-bot default).
+_VOICE_LISTEN_USERS = _parse_csv_ids(
+    os.environ.get("IRIS_VOICE_LISTEN_USERS", "")
+) or ALLOWED_USERS
+
 # Regex matching the common voice-command keywords in the user's message.
 # Applied BEFORE the @mention strip, so works with or without the mention.
 _VOICE_JOIN_RE = re.compile(
@@ -1427,19 +1462,165 @@ async def _handle_voice_join(message: discord.Message) -> str:
             except discord.DiscordException as e:
                 log.exception("voice: move_to failed")
                 return f"Couldn't move to #{channel.name}: {e}"
+        # Use VoiceRecvClient so we can listen as well as speak. Falls
+        # back to plain VoiceClient if the receive extension isn't
+        # installed (Iris stays send-only).
+        connect_cls = voice_recv.VoiceRecvClient if (
+            VOICE_RECV_AVAILABLE and VOICE_LISTEN_ENABLED
+        ) else discord.VoiceClient
         try:
-            vc = await channel.connect(timeout=10, reconnect=True)
+            vc = await channel.connect(
+                timeout=10, reconnect=True, cls=connect_cls,
+            )
         except (discord.ClientException, asyncio.TimeoutError) as e:
             log.exception("voice: connect failed")
             return f"Couldn't join #{channel.name}: {e}"
         _voice_clients[guild_id] = vc
         _voice_last_activity[guild_id] = time.monotonic()
         _voice_invite_channel[guild_id] = message.channel.id
-    log.info("voice: joined #%s (guild=%s)", channel.name, guild_id)
+
+        # Wire up the listener. If the receive extension isn't loaded, this
+        # block is a no-op and Iris runs send-only.
+        if VOICE_RECV_AVAILABLE and VOICE_LISTEN_ENABLED and hasattr(vc, "listen"):
+            try:
+                sink = WhisperSink(
+                    loop=asyncio.get_running_loop(),
+                    on_utterance=_make_utterance_handler(guild_id),
+                )
+                vc.listen(sink)  # type: ignore[union-attr]
+                sink.start_sweeper()
+                _voice_sinks[guild_id] = sink
+                log.info("voice-recv: listening in #%s (guild=%s)",
+                         channel.name, guild_id)
+            except Exception:
+                log.exception("voice-recv: sink install failed — running send-only")
+
+    log.info("voice: joined #%s (guild=%s, listening=%s)",
+             channel.name, guild_id, guild_id in _voice_sinks)
+    if guild_id in _voice_sinks:
+        wake_hint = (
+            " I'm also listening — say _'Iris, …'_ to talk to me."
+            if _voice_listen_has_wake_words()
+            else " I'm also listening — anything you say routes to me."
+        )
+    else:
+        wake_hint = ""
     return (
-        f"Joined #{channel.name}. I'll speak replies aloud while I'm in there. "
+        f"Joined #{channel.name}. I'll speak replies aloud while I'm in there.{wake_hint} "
         f"Say _'leave voice'_ or just `/voice leave` when you're done. 🎙️"
     )
+
+
+def _voice_listen_has_wake_words() -> bool:
+    """True if a wake-word gate is configured (vs always-listen mode)."""
+    from voice_listen import WAKE_WORDS  # noqa: PLC0415
+    return bool(WAKE_WORDS)
+
+
+def _make_utterance_handler(guild_id: int):
+    """Build the per-guild async callback the WhisperSink invokes for each
+    completed utterance. Closes over guild_id so the sink itself stays
+    guild-agnostic.
+    """
+    async def _handle(user_id: int, transcript: str) -> None:
+        await _handle_voice_utterance(guild_id, user_id, transcript)
+    return _handle
+
+
+async def _handle_voice_utterance(
+    guild_id: int, user_id: int, transcript: str,
+) -> None:
+    """Route a transcribed voice utterance through Iris's agent loop.
+
+    Pipeline:
+        Whisper transcript → ACL → wake-word gate → invite channel →
+        Claude agent (per-channel session) → text reply (in channel) →
+        Edge TTS playback (existing _speak_in_voice path).
+
+    The sink is paused for the entire duration of playback so Iris doesn't
+    hear her own TTS bleed back through Discord (also avoids stacking up
+    transcripts of user reactions while she's mid-sentence).
+    """
+    # ACL: who can be heard
+    if _VOICE_LISTEN_USERS and user_id not in _VOICE_LISTEN_USERS:
+        log.info("voice-recv: ignoring utterance from non-allowed user %s", user_id)
+        return
+    # Wake-word gate
+    if not transcript_passes_wake_word(transcript):
+        log.info("voice-recv: no wake word in transcript — ignoring: %r",
+                 transcript[:80])
+        return
+
+    # Find the text channel the user invited Iris from. Replies (text +
+    # TTS playback trigger) land there.
+    text_chan_id = _voice_invite_channel.get(guild_id)
+    if text_chan_id is None:
+        log.warning("voice-recv: no invite channel for guild=%s — dropping", guild_id)
+        return
+    chan = client.get_channel(text_chan_id)
+    if chan is None or not hasattr(chan, "send"):
+        log.warning("voice-recv: invite channel %s gone — dropping", text_chan_id)
+        return
+
+    sink = _voice_sinks.get(guild_id)
+
+    key = text_chan_id
+    lock = await _get_lock(key)
+    if lock.locked():
+        # Someone else is mid-turn (typed message racing with a voice
+        # utterance, or two utterances back-to-back). FIFO via the lock is
+        # fine; just log so we can see queueing in the logs.
+        log.info("voice-recv: queued behind in-flight turn on channel=%s", key)
+
+    async with lock:
+        # Visible transcript so Hyun-Min can see what Whisper heard.
+        try:
+            await chan.send(f"🎤 *<@{user_id}>*: {transcript}")  # type: ignore[union-attr]
+        except discord.HTTPException:
+            log.exception("voice-recv: failed to post transcript marker")
+
+        async with chan.typing():  # type: ignore[union-attr]
+            try:
+                placeholder = await chan.send("…")  # type: ignore[union-attr]
+            except discord.HTTPException:
+                log.exception("voice-recv: placeholder send failed")
+                return
+            stream = StreamingReply(placeholder)
+            try:
+                agent = await _get_or_create_client(key)
+                content = (
+                    f"{_now_context_block()}\n"
+                    f"[voice transcript from <@{user_id}>, "
+                    f"spoken in Discord voice channel — reply will also be "
+                    f"spoken aloud via Edge TTS]\n\n{transcript}"
+                )
+                await agent.query(content)
+                async for msg in agent.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                await stream.append(block.text)
+                await stream.finalize()
+            except Exception:
+                log.exception("voice-recv: agent turn crashed")
+                return
+
+            # Speak the reply. Pause the sink for the entire playback so
+            # we don't capture (a) our own TTS — Discord shouldn't echo
+            # it but better safe — and (b) the user's mid-reply
+            # interjections (no interrupt support in v1).
+            if (
+                _VOICE_CHAT_ENABLED
+                and guild_id in _voice_clients
+                and stream._buffer
+            ):
+                if sink is not None:
+                    sink.pause()
+                try:
+                    await _speak_in_voice(guild_id, stream._buffer)
+                finally:
+                    if sink is not None:
+                        sink.resume()
 
 
 async def _handle_voice_leave(message: discord.Message, *, reason: str = "manual") -> str:
@@ -1449,9 +1630,22 @@ async def _handle_voice_leave(message: discord.Message, *, reason: str = "manual
         vc = _voice_clients.pop(guild_id, None)
         _voice_last_activity.pop(guild_id, None)
         _voice_invite_channel.pop(guild_id, None)
+        sink = _voice_sinks.pop(guild_id, None)
+    if sink is not None:
+        try:
+            sink.stop_sweeper()
+        except Exception:
+            log.exception("voice-recv: sweeper stop failed")
     if vc is None:
         return "I'm not in a voice channel right now."
     try:
+        # Stop listening before disconnect so the sink doesn't try to flush
+        # half-utterances through a closed connection.
+        if hasattr(vc, "stop_listening"):
+            try:
+                vc.stop_listening()  # type: ignore[union-attr]
+            except Exception:
+                log.exception("voice-recv: stop_listening failed")
         if vc.is_playing():
             vc.stop()
         await vc.disconnect(force=False)

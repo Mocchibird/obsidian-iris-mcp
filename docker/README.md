@@ -331,17 +331,25 @@ docker network create ai-models
 
 Both compose files then join it as `external: true`. Order of stack startup doesn't matter.
 
-## Phase 2 — voice
+## Phase 2 — voice (full duplex)
 
-Voice is built in:
+Voice is built in. Both directions:
 
-- Iris joins a Discord voice channel on demand
-- Voice messages: Whisper (STT, local, CPU) transcribes attached `.ogg` clips
-- Text replies in a voice channel are spoken via Microsoft Edge TTS
+- Iris joins a Discord voice channel on demand ("join voice")
+- **Speak** (Phase 2.2.0): text replies are spoken via Microsoft Edge TTS
   (Azure Neural voices, free, no API key). Per-sentence language routing
-  picks an English / Korean / Japanese voice automatically.
-- Streaming synth (Edge MP3 → ffmpeg → Discord) gives ~300-500ms first-audio
+  picks an English / German / Japanese / Korean voice automatically.
+  Streaming synth (Edge MP3 → ffmpeg → Discord) gives ~300-500ms first-audio.
+- **Listen** (Phase 2.2.1): per-user audio is segmented by silence,
+  transcribed via local Whisper, posted to the invite text channel as
+  `🎤 *<@you>*: <text>`, and routed through the same Claude session as a
+  typed message. The reply is spoken back via the existing TTS path → full
+  conversation loop. A wake-word gate (`iris`, `hey iris`, `okay iris`)
+  keeps Iris from reacting to every random sentence.
+- Voice messages (`.ogg` attachments to text messages): also Whisper-STT'd
+  and treated as inline content.
 
 Whisper runs locally; Edge TTS is an outbound HTTPS call to Microsoft's
 public endpoint (no key). The image's `ffmpeg`/`libopus`/`libsndfile1`
-packages are pre-installed for this.
+packages are pre-installed for this. Voice receive pulls in
+`discord-ext-voice-recv` from `docker/requirements.txt`.
