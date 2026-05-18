@@ -175,14 +175,25 @@ def transcribe_audio_internal(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _synthesize_edge(text: str, out_path: str) -> dict:
+def _synthesize_edge(
+    text: str,
+    out_path: str,
+    *,
+    voice: str | None = None,
+    rate: str | None = None,
+    pitch: str | None = None,
+) -> dict:
     """Synthesize speech via Microsoft Edge TTS to a WAV at ``out_path``.
 
     Saves as MP3 internally (Edge's native output) then converts to mono
     16-bit WAV via ffmpeg so the playback pipeline doesn't need to care
     about the encoding.
 
-    Voice name from IRIS_EDGE_VOICE env (default: en-US-AvaNeural).
+    Voice / rate / pitch can be passed explicitly (preferred — the
+    per-segment multi-language path uses this) or fall back to
+    ``IRIS_EDGE_VOICE`` / ``IRIS_EDGE_RATE`` / ``IRIS_EDGE_PITCH`` env
+    vars when the caller doesn't care.
+
     Browse the catalogue at:
       https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support
     """
@@ -195,9 +206,9 @@ def _synthesize_edge(text: str, out_path: str) -> dict:
             "updated pyproject.toml"
         ) from e
 
-    voice = (os.environ.get("IRIS_EDGE_VOICE") or "en-US-AvaNeural").strip()
-    rate = (os.environ.get("IRIS_EDGE_RATE") or "+0%").strip()
-    pitch = (os.environ.get("IRIS_EDGE_PITCH") or "+0Hz").strip()
+    voice = (voice or os.environ.get("IRIS_EDGE_VOICE") or "en-US-AvaNeural").strip()
+    rate = (rate or os.environ.get("IRIS_EDGE_RATE") or "+0%").strip()
+    pitch = (pitch or os.environ.get("IRIS_EDGE_PITCH") or "+0Hz").strip()
 
     mp3_path = out_path + ".edge.mp3"
     t0 = time.monotonic()
@@ -396,19 +407,13 @@ def _concat_wavs_via_ffmpeg(input_paths: list[str], out_path: str) -> None:
 
 def _synthesize_segment(text: str, lang: str, out_path: str) -> dict:
     """Synthesize one same-language segment with the right Edge voice.
-    Pushes the resolved voice into IRIS_EDGE_VOICE for this call so the
-    underlying _synthesize_edge picks it up. Env restored in finally.
+    Passes the resolved voice to ``_synthesize_edge`` explicitly so no
+    one races on the global env (matters when multi-segment synth
+    overlaps with another Edge call — the previous push/pop pattern
+    was sequentially-safe but fragile).
     """
     _engine, voice = _resolve_voice_spec(lang)
-    prev = os.environ.get("IRIS_EDGE_VOICE")
-    os.environ["IRIS_EDGE_VOICE"] = voice
-    try:
-        return _synthesize_edge(text, out_path)
-    finally:
-        if prev is None:
-            os.environ.pop("IRIS_EDGE_VOICE", None)
-        else:
-            os.environ["IRIS_EDGE_VOICE"] = prev
+    return _synthesize_edge(text, out_path, voice=voice)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -490,8 +495,6 @@ def synthesize_speech(
     text_clean = (text or "").strip()
     if not text_clean:
         return "err: text required"
-    if voice.strip():
-        os.environ["IRIS_EDGE_VOICE"] = voice.strip()
     if not out_path.strip():
         slug = re.sub(r"[^a-z0-9]+", "-", text_clean.lower())[:50].strip("-") or "speech"
         ts = time.strftime("%Y-%m-%d_%H%M%S")
@@ -501,7 +504,12 @@ def synthesize_speech(
         p = get_vault_root() / out_path
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
-        meta = synthesize_to_wav(text_clean, str(p))
+        if voice.strip():
+            # Caller pinned a voice → bypass the language-routing path and
+            # synth directly with that voice. Doesn't touch the env.
+            meta = _synthesize_edge(text_clean, str(p), voice=voice.strip())
+        else:
+            meta = synthesize_to_wav(text_clean, str(p))
     except Exception as e:
         log.exception("tts: synthesis failed")
         return f"err: synthesis failed — {e}"
