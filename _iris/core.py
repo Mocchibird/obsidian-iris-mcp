@@ -872,7 +872,23 @@ class VaultIndex:
     def _connect(self) -> sqlite3.Connection:
         if self._conn is not None:
             return self._conn
-        conn = sqlite3.connect(str(self._db_path), timeout=10)
+        # check_same_thread=False is required because we share one connection
+        # across the main asyncio loop AND any worker threads that asyncio.
+        # to_thread() spins up (notably the SQL-view refresh loop, the habit
+        # reminder scanner, and Whisper/Piper synth callbacks). The default
+        # `check_same_thread=True` is conservative for SQLite — actual
+        # concurrent access is safe in WAL mode + a 10s busy timeout as long
+        # as no two writers race. Our writers are externally serialized:
+        # MCP tools run sequentially within the parent process and the
+        # background loops we have only READ, so we satisfy that contract.
+        # Bug surfaced as: "SQLite objects created in a thread can only be
+        # used in that same thread" when the background SQL view refresh
+        # was scheduled via asyncio.to_thread.
+        conn = sqlite3.connect(
+            str(self._db_path),
+            timeout=10,
+            check_same_thread=False,
+        )
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
