@@ -34,6 +34,8 @@ dependencies = [
     "matplotlib>=3.7",          # PNG chart rendering for Discord embed attachments
     "faster-whisper>=1.0",      # Local Whisper STT (CTranslate2 backend) for voice messages — Phase 2.1
     "piper-tts>=1.2",           # Local neural TTS for voice channel replies — Phase 2.2.0
+    "kokoro-onnx>=0.5",         # Higher-quality alternative to Piper (82M params, multilingual)
+    "soundfile>=0.13",          # WAV/FLAC IO for Kokoro output (numpy array → WAV)
     # Note: PyNaCl + davey for Discord voice are pulled via the `discord.py[voice]`
     # extras in docker/requirements.txt — no need to pin them here too.
 ]

@@ -360,21 +360,177 @@ def _load_piper() -> "object":
     return _piper_voice
 
 
-def synthesize_to_wav(text: str, out_path: str) -> dict:
-    """Synthesize ``text`` to a 16-bit mono WAV file at ``out_path``.
+# =============================================================================
+# Kokoro TTS — 82M-param multilingual neural TTS, much better than Piper
+# =============================================================================
+# Single model handles English (US/GB), Japanese, Korean, Chinese, French,
+# Spanish, Italian, Portuguese, Hindi. Apache 2.0. ~310 MB ONNX + ~25 MB
+# voices.bin. Runs ~3× realtime CPU, ~30× realtime GPU. Quality is closer
+# to ElevenLabs/OpenAI than to Piper.
 
-    Returns a dict ``{"sample_rate": int, "duration_sec": float,
-    "byte_count": int}``. Raises on synthesis failure (caller handles).
+_KOKORO_RELEASE_BASE = (
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+)
+_KOKORO_MODEL_FILE = "kokoro-v1.0.onnx"
+_KOKORO_VOICES_FILE = "voices-v1.0.bin"
 
-    The output is the format Piper emits natively (typically 22050 Hz mono
-    int16). The Discord voice-send pipeline pipes this through ffmpeg to
-    upsample to Discord's 48 kHz stereo Opus.
+# A representative subset of available voices. The actual model bundle ships
+# many more (~50+). Names follow Kokoro's convention:
+#   <a|b><f|m>_<name>  →  (American|British)(Female|Male)_<name>
+#   j<f|m>_*           →  Japanese
+#   z<f|m>_*           →  Mandarin
+#   k<f|m>_*           →  Korean
+# Set IRIS_KOKORO_VOICE to any name in voices-v1.0.bin (it accepts more
+# than what's listed here — this is just the curated default set).
+_KOKORO_VOICES_HINT = {
+    # American English
+    "af_sarah":   "American female (warm, conversational) — recommended default",
+    "af_bella":   "American female (clear)",
+    "am_michael": "American male (mid)",
+    "am_adam":    "American male (deeper)",
+    # British English
+    "bf_emma":    "British female",
+    "bm_george":  "British male",
+    # Japanese
+    "jf_alpha":   "Japanese female",
+    "jm_kumo":    "Japanese male",
+    # Korean
+    "kf_001":     "Korean female",
+    "km_001":     "Korean male",
+    # Mandarin
+    "zf_xiaoxiao": "Mandarin female",
+    "zm_yunjian": "Mandarin male",
+}
+
+# Language hint codes accepted by Kokoro.create(lang=...). Auto-detected per-
+# voice but explicit is faster (skips the phonemizer probe).
+_KOKORO_LANG_BY_PREFIX = {
+    "a": "en-us", "b": "en-gb", "j": "ja", "k": "ko",
+    "z": "zh", "f": "fr-fr", "e": "es", "i": "it", "p": "pt-br", "h": "hi",
+}
+
+_kokoro_inst = None  # type: ignore[var-annotated]
+
+
+def _kokoro_use_cuda() -> bool:
+    """Same flag pattern as the Piper version — opt-in via env."""
+    return os.environ.get("IRIS_KOKORO_USE_CUDA", "0").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
+def _ensure_kokoro_models() -> tuple[Path, Path]:
+    """Fetch the Kokoro ONNX model + voices.bin into the persistent cache
+    if not already present. Returns (model_path, voices_path)."""
+    cache = _piper_cache_dir().parent / "kokoro"
+    cache.mkdir(parents=True, exist_ok=True)
+    model_path = cache / _KOKORO_MODEL_FILE
+    voices_path = cache / _KOKORO_VOICES_FILE
+    if model_path.exists() and voices_path.exists():
+        return model_path, voices_path
+    import httpx  # noqa: PLC0415
+    for fname, dst in [(_KOKORO_MODEL_FILE, model_path),
+                       (_KOKORO_VOICES_FILE, voices_path)]:
+        url = f"{_KOKORO_RELEASE_BASE}/{fname}"
+        log.info("kokoro: downloading %s → %s", url, dst)
+        with httpx.stream(
+            "GET", url,
+            timeout=httpx.Timeout(connect=10, read=300, write=10, pool=10),
+            follow_redirects=True,
+        ) as resp:
+            resp.raise_for_status()
+            tmp = dst.with_suffix(dst.suffix + ".part")
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                    f.write(chunk)
+            tmp.replace(dst)
+    return model_path, voices_path
+
+
+def _load_kokoro():
+    """Lazy-load + module-cache the Kokoro model. Picks providers based on
+    IRIS_KOKORO_USE_CUDA — same fallback pattern as Piper.
     """
+    global _kokoro_inst
+    if _kokoro_inst is not None:
+        return _kokoro_inst
+    try:
+        from kokoro_onnx import Kokoro  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "kokoro-onnx is not installed — rebuild the container with the "
+            "updated pyproject.toml"
+        ) from e
+    model_path, voices_path = _ensure_kokoro_models()
+    t0 = time.monotonic()
+    use_cuda = _kokoro_use_cuda()
+    log.info(
+        "kokoro: loading model from %s (device=%s)",
+        model_path.name, "cuda" if use_cuda else "cpu",
+    )
+    if use_cuda:
+        # Kokoro defers to the onnxruntime provider order; pass CUDA first.
+        try:
+            _kokoro_inst = Kokoro(
+                str(model_path), str(voices_path),
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+        except (TypeError, Exception) as e:
+            # Older kokoro-onnx may not accept `providers`. Fall back to
+            # default (CPU) instead of crashing.
+            log.warning(
+                "kokoro: CUDA init failed (%s) — falling back to CPU.", e,
+            )
+            _kokoro_inst = Kokoro(str(model_path), str(voices_path))
+    else:
+        _kokoro_inst = Kokoro(str(model_path), str(voices_path))
+    log.info("kokoro: model loaded in %.1fs", time.monotonic() - t0)
+    return _kokoro_inst
+
+
+def _kokoro_lang_for_voice(voice: str) -> str:
+    """Pick a sensible `lang=` hint from a Kokoro voice name's prefix."""
+    if not voice:
+        return "en-us"
+    prefix = voice[:1].lower()
+    return _KOKORO_LANG_BY_PREFIX.get(prefix, "en-us")
+
+
+def _synthesize_kokoro(text: str, out_path: str) -> dict:
+    """Kokoro synth path — produces a WAV via soundfile."""
+    import soundfile as sf  # noqa: PLC0415
+
+    voice_name = (os.environ.get("IRIS_KOKORO_VOICE") or "af_sarah").strip()
+    speed = float(os.environ.get("IRIS_KOKORO_SPEED", "1.0") or "1.0")
+    lang = (os.environ.get("IRIS_KOKORO_LANG") or _kokoro_lang_for_voice(voice_name)).strip()
+    kokoro = _load_kokoro()
+    t0 = time.monotonic()
+    samples, sample_rate = kokoro.create(text, voice=voice_name, speed=speed, lang=lang)
+    sf.write(out_path, samples, sample_rate)
+    elapsed = time.monotonic() - t0
+    duration_sec = len(samples) / sample_rate if sample_rate else 0
+    log.info(
+        "kokoro: synth %d chars · voice=%s lang=%s → %s "
+        "(%.1fs audio, %.1fs synth, %.1fx realtime)",
+        len(text), voice_name, lang, Path(out_path).name,
+        duration_sec, elapsed,
+        (duration_sec / elapsed) if elapsed > 0 else 0,
+    )
+    return {
+        "sample_rate": int(sample_rate),
+        "duration_sec": float(duration_sec),
+        "byte_count": int(len(samples) * 2),  # int16
+        "engine": "kokoro",
+        "voice": voice_name,
+        "lang": lang,
+    }
+
+
+def _synthesize_piper(text: str, out_path: str) -> dict:
+    """Piper synth path — original implementation, kept as a stable fallback."""
     import wave  # noqa: PLC0415
 
     voice = _load_piper()
-    # Piper streams audio chunks per sentence — we concatenate them into
-    # one WAV. The sample rate is fixed per voice model.
     sample_rate = voice.config.sample_rate
     total_bytes = bytearray()
     t0 = time.monotonic()
@@ -396,7 +552,37 @@ def synthesize_to_wav(text: str, out_path: str) -> dict:
         "sample_rate": sample_rate,
         "duration_sec": duration_sec,
         "byte_count": len(total_bytes),
+        "engine": "piper",
+        "voice": _piper_voice_name,
     }
+
+
+def synthesize_to_wav(text: str, out_path: str) -> dict:
+    """Synthesize ``text`` to a 16-bit mono WAV at ``out_path`` using the
+    engine selected by ``IRIS_TTS_ENGINE`` (default: ``piper``).
+
+    Supported engines:
+        ``piper``  — lightweight, fast, robotic-ish quality. ~10× realtime.
+        ``kokoro`` — 82M-param neural TTS. ~3× realtime CPU / ~30× realtime
+                     GPU. Multilingual (EN/JA/KO/ZH/+more). Better quality.
+
+    Returns a dict with sample_rate / duration_sec / byte_count / engine /
+    voice. Raises on synthesis failure (caller handles fallback).
+
+    The Discord voice-send pipeline pipes the WAV through ffmpeg to
+    upsample to Discord's 48 kHz stereo Opus, so the per-engine sample
+    rate (Piper 22050, Kokoro 24000) doesn't matter for playback.
+    """
+    engine = (os.environ.get("IRIS_TTS_ENGINE") or "piper").strip().lower()
+    if engine == "kokoro":
+        try:
+            return _synthesize_kokoro(text, out_path)
+        except Exception:
+            # On Kokoro failure (model download error, bad voice name, etc.)
+            # fall back to Piper so the user still gets *some* speech rather
+            # than silence. Log loudly so the misconfig gets noticed.
+            log.exception("kokoro synth failed — falling back to Piper")
+    return _synthesize_piper(text, out_path)
 
 
 @mcp.tool()
