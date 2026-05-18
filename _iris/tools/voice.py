@@ -199,7 +199,10 @@ _PIPER_HF_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 # Voice slugs Piper publishes that we support out of the box. The slug encodes
 # language + region + speaker + quality (low/medium/high). For Discord voice
 # we default to medium quality — high is slower without obvious gain on a
-# voice-channel speaker.
+# voice-channel speaker. Only language codes Piper ACTUALLY publishes are
+# included; ja/ko are NOT in the rhasspy/piper-voices repo (would 404). For
+# Japanese / Korean TTS see the system prompt — those need a different
+# engine (Edge TTS / MeloTTS / Coqui XTTS) which isn't wired up here yet.
 _PIPER_VOICE_PATHS = {
     # English, US
     "en_US-lessac-medium":    "en/en_US/lessac/medium/en_US-lessac-medium",
@@ -210,10 +213,12 @@ _PIPER_VOICE_PATHS = {
     "en_GB-alan-medium":      "en/en_GB/alan/medium/en_GB-alan-medium",
     "en_GB-southern_english_female-low":
         "en/en_GB/southern_english_female/low/en_GB-southern_english_female-low",
-    # German — useful given the user's CH/DE context
+    # German (10 voices in repo; Thorsten is the canonical neutral one).
     "de_DE-thorsten-medium":  "de/de_DE/thorsten/medium/de_DE-thorsten-medium",
-    # Japanese
-    "ja_JP-jcommon-medium":   "ja/ja_JP/jcommon/medium/ja_JP-jcommon-medium",
+    "de_DE-thorsten-high":    "de/de_DE/thorsten/high/de_DE-thorsten-high",
+    "de_DE-kerstin-low":      "de/de_DE/kerstin/low/de_DE-kerstin-low",
+    # Chinese (Mandarin). Useful if Hyun-Min ever practices zh.
+    "zh_CN-huayan-medium":    "zh/zh_CN/huayan/medium/zh_CN-huayan-medium",
 }
 
 _piper_voice = None  # type: ignore[var-annotated]
