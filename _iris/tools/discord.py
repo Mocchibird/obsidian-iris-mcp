@@ -309,6 +309,44 @@ def _embed_text_clean(s) -> str:
     return _strip_wikilinks(_unescape_literal_escapes(str(s)))
 
 
+# Discord renders masked markdown links `[label](url)` in embed
+# DESCRIPTIONS and FIELD VALUES — but NOT in titles or footers, which are
+# plain-text-only. For those, the masked syntax shows up literally. We
+# strip it down to just the label when cleaning title/footer text.
+_MASKED_LINK_RE = _re_wl.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+
+def _embed_title_clean(s) -> tuple[str, str | None]:
+    """Like ``_embed_text_clean`` but for embed TITLES, which can't render
+    masked markdown links inline.
+
+    Returns ``(plain_text, http_url_if_singular)``. If the cleaned title
+    contains exactly one masked link AND that link is http(s), the URL is
+    returned separately so the caller can promote it to the embed's
+    ``url`` parameter — Discord makes the title clickable via that
+    mechanism (the proper one for embed titles).
+
+    Non-http URLs (e.g. ``obsidian://``) aren't promoted because Discord
+    rejects them on Embed.url; the title is still rendered as plain text
+    with the link label visible.
+    """
+    if s is None:
+        return "", None
+    cleaned = _strip_wikilinks(_unescape_literal_escapes(str(s)))
+    matches = list(_MASKED_LINK_RE.finditer(cleaned))
+    promoted_url: str | None = None
+    # If there's exactly one masked link AND the URL is http(s), promote
+    # it to embed.url so the title becomes clickable.
+    if len(matches) == 1:
+        candidate_url = matches[0].group(2).strip()
+        if candidate_url.lower().startswith(("http://", "https://")):
+            promoted_url = candidate_url
+    # Strip every masked link down to just its label so the title doesn't
+    # show literal `[Foo](https://…)` text.
+    cleaned = _MASKED_LINK_RE.sub(lambda m: m.group(1), cleaned)
+    return cleaned, promoted_url
+
+
 def _build_embed_dict(
     *,
     title: str,
@@ -333,10 +371,16 @@ def _build_embed_dict(
        links (when ``IRIS_OBSIDIAN_URL_PREFIX`` is set) or plain display
        names (when not). Callers don't have to remember to rewrite.
     """
-    out: dict = {
-        "title": _embed_text_clean(title)[:256] if title else None,
-        "color": int(color),
-    }
+    # Titles can't render masked links — strip them to plain labels and,
+    # if there's exactly one http(s) link in the title, promote it to the
+    # embed's `url` parameter (which makes the title clickable via
+    # Discord's proper mechanism).
+    promoted_url: str | None = None
+    if title:
+        clean_title, promoted_url = _embed_title_clean(title)
+        out: dict = {"title": clean_title[:256], "color": int(color)}
+    else:
+        out = {"title": None, "color": int(color)}
     if description:
         out["description"] = _embed_text_clean(description)[:4096]
     if fields:
@@ -350,7 +394,13 @@ def _build_embed_dict(
             })
         out["fields"] = clean_fields
     if footer:
-        out["footer"] = _embed_text_clean(footer)[:2048]
+        # Footers also don't render masked links — same plain-label treatment.
+        clean_footer, _ = _embed_title_clean(footer)
+        out["footer"] = clean_footer[:2048]
+    # Promote the singular title-URL to embed.url only if the caller didn't
+    # already pass an explicit url= (caller wins; this is just a fallback).
+    if promoted_url and not url:
+        url = promoted_url
     if timestamp:
         out["timestamp"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     if url:

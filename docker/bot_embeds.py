@@ -268,23 +268,44 @@ def dict_to_embed(payload: dict) -> discord.Embed:
             return None
         return strip_wikilinks(unescape_literal_escapes(str(s)))
 
+    # Titles + footers can't render masked `[label](url)` markdown links
+    # in Discord — only descriptions and field values can. For title/footer
+    # we strip the link syntax down to just the label, and if the title
+    # contains exactly one http(s) link, promote it to the embed `url`
+    # parameter so the title is clickable via that mechanism instead.
+    _MASKED_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+    def _clean_title(s):
+        if s is None:
+            return None, None
+        cleaned = _clean(s)
+        matches = list(_MASKED_LINK_RE.finditer(cleaned))
+        promoted = None
+        if len(matches) == 1:
+            cand = matches[0].group(2).strip()
+            if cand.lower().startswith(("http://", "https://")):
+                promoted = cand
+        cleaned = _MASKED_LINK_RE.sub(lambda m: m.group(1), cleaned)
+        return cleaned, promoted
+
     raw_title = payload.get("title")
     raw_desc = payload.get("description")
+    clean_title_text, title_promoted_url = _clean_title(raw_title)
     # Discord rejects the WHOLE embed if `url` has a non-http(s) scheme —
-    # e.g. obsidian:// returns 400 Bad Request with:
-    #   "In embeds.0.url: Scheme 'obsidian' is not supported.
-    #    Scheme must be one of ('http', 'https')."
-    # Defense-in-depth: silently drop non-http URLs here so a bad payload
-    # from a future caller doesn't break the message. Obsidian deep-links
-    # should be exposed as masked links inside fields/description instead
-    # — those API paths accept any URI scheme.
+    # e.g. obsidian:// returns 400 Bad Request. Defense-in-depth: silently
+    # drop non-http URLs. Obsidian deep-links belong inside fields/
+    # description (those API paths accept any scheme).
     raw_url = payload.get("url")
     safe_url = raw_url if (
         isinstance(raw_url, str)
         and raw_url.lower().startswith(("http://", "https://"))
     ) else None
+    # Promote title-URL only when the caller didn't already pass an
+    # explicit url (caller wins).
+    if not safe_url and title_promoted_url:
+        safe_url = title_promoted_url
     e = discord.Embed(
-        title=(_clean(raw_title)[:256] if raw_title else None),
+        title=(clean_title_text[:256] if clean_title_text else None),
         description=(_clean(raw_desc)[:4096] if raw_desc else None),
         color=int(payload.get("color") or COLOR_GRAY),
         url=safe_url,
@@ -303,7 +324,10 @@ def dict_to_embed(payload: dict) -> discord.Embed:
         )
     footer = payload.get("footer")
     if footer:
-        e.set_footer(text=_clean(footer)[:2048])
+        # Footers also don't render masked links — same plain-label treatment.
+        footer_clean, _ = _clean_title(footer)
+        if footer_clean:
+            e.set_footer(text=footer_clean[:2048])
     return e
 
 
