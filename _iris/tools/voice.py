@@ -557,23 +557,129 @@ def _synthesize_piper(text: str, out_path: str) -> dict:
     }
 
 
+# =============================================================================
+# Multilingual auto-routing — IRIS_TTS_ENGINE=auto
+# =============================================================================
+# Detects Iris's reply language and picks the right engine+voice combo. The
+# detection is restricted to four languages (EN/DE/KO/JA) for speed and
+# accuracy on short Discord-reply-length text.
+#
+# Default voice mapping (override per-language via env):
+#   en → kokoro:af_sarah          (warm American female)
+#   de → piper:de_DE-thorsten-medium  (Kokoro has no German)
+#   ko → kokoro:kf_001
+#   ja → kokoro:jf_alpha
+#
+# Override examples in .env:
+#   IRIS_TTS_VOICE_EN=kokoro:af_bella
+#   IRIS_TTS_VOICE_DE=piper:de_DE-kerstin-low
+#   IRIS_TTS_VOICE_KO=kokoro:km_001
+#   IRIS_TTS_VOICE_JA=kokoro:jm_kumo
+
+_DEFAULT_VOICE_BY_LANG = {
+    "en": "kokoro:af_sarah",
+    "de": "piper:de_DE-thorsten-medium",  # Kokoro has no German voices
+    "ko": "kokoro:kf_001",
+    "ja": "kokoro:jf_alpha",
+}
+
+_lang_detector = None  # lazy-init
+
+
+def _detect_language(text: str) -> str:
+    """Detect EN/DE/KO/JA from text. Falls back to 'en' on errors or
+    indeterminate input (very short / pure punctuation). Restricted to
+    four candidate languages so detection is fast + accurate on short
+    Discord-reply-length input.
+    """
+    global _lang_detector
+    if not text or not text.strip():
+        return "en"
+    try:
+        if _lang_detector is None:
+            from lingua import Language, LanguageDetectorBuilder  # type: ignore
+            _lang_detector = LanguageDetectorBuilder.from_languages(
+                Language.ENGLISH, Language.GERMAN,
+                Language.KOREAN, Language.JAPANESE,
+            ).build()
+        from lingua import Language  # type: ignore
+        detected = _lang_detector.detect_language_of(text)
+        if detected is None:
+            return "en"
+        return {
+            Language.ENGLISH: "en",
+            Language.GERMAN: "de",
+            Language.KOREAN: "ko",
+            Language.JAPANESE: "ja",
+        }.get(detected, "en")
+    except Exception:
+        log.exception("language detection failed — defaulting to 'en'")
+        return "en"
+
+
+def _resolve_voice_spec(lang: str) -> tuple[str, str]:
+    """Return (engine, voice) for a detected language. Reads
+    IRIS_TTS_VOICE_<LANG> from env first, falls back to the default map.
+
+    Spec format: ``engine:voice_slug`` (e.g. ``kokoro:af_sarah``,
+    ``piper:de_DE-thorsten-medium``). Bare voice name (no colon) is
+    treated as Kokoro by default.
+    """
+    env_key = f"IRIS_TTS_VOICE_{lang.upper()}"
+    spec = (os.environ.get(env_key) or _DEFAULT_VOICE_BY_LANG.get(lang)
+            or "kokoro:af_sarah").strip()
+    if ":" in spec:
+        engine, voice = spec.split(":", 1)
+    else:
+        engine, voice = "kokoro", spec
+    return engine.strip().lower(), voice.strip()
+
+
 def synthesize_to_wav(text: str, out_path: str) -> dict:
-    """Synthesize ``text`` to a 16-bit mono WAV at ``out_path`` using the
-    engine selected by ``IRIS_TTS_ENGINE`` (default: ``piper``).
+    """Synthesize ``text`` to a 16-bit mono WAV at ``out_path``.
 
-    Supported engines:
-        ``piper``  — lightweight, fast, robotic-ish quality. ~10× realtime.
-        ``kokoro`` — 82M-param neural TTS. ~3× realtime CPU / ~30× realtime
-                     GPU. Multilingual (EN/JA/KO/ZH/+more). Better quality.
+    Engine selection (via ``IRIS_TTS_ENGINE``):
+        ``piper``  — always use Piper. Lightweight, robotic-ish, ~10× realtime.
+        ``kokoro`` — always use Kokoro. 82M-param neural, much better, ~3×
+                     realtime CPU / ~30× realtime GPU. Multilingual EN/JA/
+                     KO/ZH/+ but NOT German.
+        ``auto``   — detect language, route per ``IRIS_TTS_VOICE_<LANG>``
+                     env (defaults: EN/JA/KO → Kokoro, DE → Piper).
+                     Restricted to four languages for fast / accurate
+                     detection on short replies.
 
-    Returns a dict with sample_rate / duration_sec / byte_count / engine /
-    voice. Raises on synthesis failure (caller handles fallback).
-
-    The Discord voice-send pipeline pipes the WAV through ffmpeg to
-    upsample to Discord's 48 kHz stereo Opus, so the per-engine sample
-    rate (Piper 22050, Kokoro 24000) doesn't matter for playback.
+    The Discord voice-send pipeline pipes the WAV through ffmpeg to upsample
+    to Discord's 48 kHz stereo Opus, so per-engine sample rates differ but
+    the playback is consistent.
     """
     engine = (os.environ.get("IRIS_TTS_ENGINE") or "piper").strip().lower()
+    if engine == "auto":
+        lang = _detect_language(text)
+        chosen_engine, voice = _resolve_voice_spec(lang)
+        log.info("tts auto-route: lang=%s engine=%s voice=%s", lang, chosen_engine, voice)
+        # Push the resolved voice into the env so the engine-specific
+        # synth function picks it up. Restore after the call so we don't
+        # mutate global state for future calls in different languages.
+        env_key = "IRIS_KOKORO_VOICE" if chosen_engine == "kokoro" else "IRIS_PIPER_VOICE"
+        prev = os.environ.get(env_key)
+        os.environ[env_key] = voice
+        try:
+            if chosen_engine == "kokoro":
+                try:
+                    meta = _synthesize_kokoro(text, out_path)
+                except Exception:
+                    log.exception("kokoro synth failed in auto-route — falling back to Piper")
+                    meta = _synthesize_piper(text, out_path)
+            else:
+                meta = _synthesize_piper(text, out_path)
+            meta["detected_lang"] = lang
+            return meta
+        finally:
+            if prev is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = prev
+
     if engine == "kokoro":
         try:
             return _synthesize_kokoro(text, out_path)

@@ -36,6 +36,7 @@ dependencies = [
     "piper-tts>=1.2",           # Local neural TTS for voice channel replies — Phase 2.2.0
     "kokoro-onnx>=0.5",         # Higher-quality alternative to Piper (82M params, multilingual)
     "soundfile>=0.13",          # WAV/FLAC IO for Kokoro output (numpy array → WAV)
+    "lingua-language-detector>=2.0",  # Fast language detection for IRIS_TTS_ENGINE=auto (EN/DE/KO/JA routing)
     # Note: PyNaCl + davey for Discord voice are pulled via the `discord.py[voice]`
     # extras in docker/requirements.txt — no need to pin them here too.
 ]
