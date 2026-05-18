@@ -858,7 +858,7 @@ class VaultIndex:
     fts        – FTS5 full-text search over note body text
     """
 
-    SCHEMA_VERSION = 14
+    SCHEMA_VERSION = 15
 
     def __init__(self, vault_root: Path):
         self._root = vault_root
@@ -1545,6 +1545,31 @@ class VaultIndex:
                 created_at    TEXT NOT NULL
             )
         """)
+        # v15 additive migration: cardio / outdoor-workout metric columns.
+        # The original table only captured kind/duration/RPE/summary, which
+        # is fine for strength work but loses the interesting data on a
+        # 30-min outdoor walk: distance, pace, kcal burned, heart rate,
+        # steps, elevation. All nullable because they only apply to
+        # cardio/outdoor kinds — strength sessions just leave them NULL.
+        # `data_source` tags where the numbers came from (Apple Health,
+        # Strava, Fitbit, manual, etc.) so we can sanity-check provenance
+        # later if a row looks suspicious.
+        for col, typedef in [
+            ("distance_km",       "REAL"),
+            ("kcal_burned",       "INTEGER"),
+            ("avg_hr",            "INTEGER"),  # bpm
+            ("max_hr",            "INTEGER"),  # bpm
+            ("steps",             "INTEGER"),
+            ("elevation_gain_m",  "INTEGER"),
+            ("avg_pace_sec_per_km", "INTEGER"),  # easier to query than min/km
+            ("data_source",       "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE training_sessions ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        c.execute("CREATE INDEX IF NOT EXISTS idx_training_kind ON training_sessions(kind)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_training_source ON training_sessions(data_source)")
 
         # Views: a single "training" view that joins sessions with the
         # primary skill they worked (when set), and an "active_goals" view
