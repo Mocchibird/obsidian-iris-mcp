@@ -737,17 +737,27 @@ def _synthesize_edge(text: str, out_path: str) -> dict:
 #   IRIS_TTS_VOICE_KO=kokoro:km_001
 #   IRIS_TTS_VOICE_JA=kokoro:jm_kumo
 
-# Default voice mapping for auto-route. EN stays on Kokoro (locally hosted,
-# good quality, fast). JA/KO route to Microsoft Edge TTS by default — Kokoro's
-# Japanese voice mangles kanji and the Korean voice has noticeable artifacts;
-# Edge's neural voices (Nanami/SunHi) are state-of-the-art for those
-# languages and the cost is one HTTPS round-trip per synth (~300ms).
+# Default voice mapping for auto-route. All three default to Microsoft
+# Edge TTS — quality is consistent across languages, no GPU needed, and
+# we sidestep Kokoro's two real problems:
+#   1. Kokoro CUDA fails on Pascal-era GPUs (GTX 10xx series) with a
+#      cuDNN 5003 error — has to fall back to CPU at ~0.8× realtime
+#      which is unusable for English-length replies.
+#   2. Kokoro's JA voice can't pronounce kanji without pre-processing
+#      and its KO voice has audible artifacts.
 #
-# To stay 100% local for JA/KO at the cost of quality, override:
+# Edge runs in the cloud (text → Microsoft → audio back), one HTTPS
+# round-trip per synth (~200-500 ms first byte, sub-second total for a
+# typical Discord reply). Streaming playback (see _speak_via_edge_streaming
+# in bot.py) starts the audio while bytes are still arriving, so even
+# the network cost is hidden.
+#
+# To stay 100% local at the cost of quality, override per language:
+#   IRIS_TTS_VOICE_EN=kokoro:af_sarah
 #   IRIS_TTS_VOICE_JA=kokoro:jf_alpha
 #   IRIS_TTS_VOICE_KO=kokoro:kf_001
 _DEFAULT_VOICE_BY_LANG = {
-    "en": "kokoro:af_sarah",
+    "en": "edge:en-US-AvaNeural",
     "ko": "edge:ko-KR-SunHiNeural",
     "ja": "edge:ja-JP-NanamiNeural",
 }
