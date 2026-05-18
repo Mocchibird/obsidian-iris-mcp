@@ -270,6 +270,28 @@ def _ensure_piper_model(voice_name: str) -> tuple[Path, Path]:
     return onnx_path, json_path
 
 
+def _piper_use_cuda() -> bool:
+    """True if IRIS_PIPER_USE_CUDA env says to use GPU. Requires:
+      1. NVIDIA GPU + nvidia-container-toolkit set up on the host
+      2. onnxruntime-gpu installed in the container (replaces onnxruntime).
+         Add a build-layer like:
+             RUN pip uninstall -y onnxruntime && pip install onnxruntime-gpu
+         to your Dockerfile, OR set IRIS_PIPER_USE_CUDA=1 + a custom
+         requirements file.
+      3. `deploy.resources.reservations.devices` block in docker-compose
+         exposing the GPU to the container.
+
+    Honest note: Piper is already ~10× realtime on CPU, so GPU saves
+    maybe 0.5s on a typical reply. The voice QUALITY won't change —
+    same model, same architecture, just faster inference. The quality
+    jump comes from switching engine (Kokoro / XTTS) rather than GPU-
+    accelerating Piper.
+    """
+    return os.environ.get("IRIS_PIPER_USE_CUDA", "0").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
 def _load_piper() -> "object":
     """Lazy-load + module-cache the Piper voice. Same pattern as the
     Whisper loader: pay cold-start cost once per process, then reuse.
@@ -286,9 +308,26 @@ def _load_piper() -> "object":
             "updated pyproject.toml (Phase 2.2.0 added the dep)"
         ) from e
     onnx_path, _json_path = _ensure_piper_model(desired)
+    use_cuda = _piper_use_cuda()
     t0 = time.monotonic()
-    log.info("piper: loading voice %r from %s", desired, onnx_path)
-    _piper_voice = PiperVoice.load(str(onnx_path))
+    log.info(
+        "piper: loading voice %r from %s (device=%s)",
+        desired, onnx_path, "cuda" if use_cuda else "cpu",
+    )
+    try:
+        _piper_voice = PiperVoice.load(str(onnx_path), use_cuda=use_cuda)
+    except Exception as e:
+        # If CUDA was requested but onnxruntime-gpu isn't installed (or no
+        # GPU visible), fall back to CPU instead of crashing the bot.
+        if use_cuda:
+            log.warning(
+                "piper: CUDA load failed (%s) — falling back to CPU. "
+                "Check that onnxruntime-gpu is installed + GPU is passthrough'd.",
+                e,
+            )
+            _piper_voice = PiperVoice.load(str(onnx_path), use_cuda=False)
+        else:
+            raise
     log.info("piper: voice loaded in %.1fs", time.monotonic() - t0)
     _piper_voice_name = desired
     return _piper_voice
