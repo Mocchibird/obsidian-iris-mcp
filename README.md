@@ -23,6 +23,7 @@ Iris is an [MCP](https://modelcontextprotocol.io) server that indexes an Obsidia
 - **Training + injury tracking**: skill goals (handstand, pull-ups, muscle-up, asian squat, etc.) with cached progression plans, session log, injury records with restriction lists that gate Iris's training recommendations (so the shoulder-rehab phase doesn't get a "do overhead pressing" suggestion)
 - **Habit tracker**: daily check-offs with GitHub-style 🟩⬜⬛ heatmaps, cadence-aware reminders (Iris pings the bot's PING_CHANNEL once when a habit's target time passes without being logged), per-day idempotent logging, optional cross-links to skill goals or injuries (so a "shoulder rehab" habit auto-clears when the injury is healed)
 - **Matplotlib chart embeds**: line / bar / pie charts rendered server-side and posted to Discord with the PNG attached inline (weight trend, daily kcal vs target, macro split, habit duration over time, habit consistency, and a generic SQL-driven escape hatch). PNGs archive under `40_Attachments/Charts/YYYY-MM/` so they're browsable in Obsidian too.
+- **Voice messages** (Phase 2.1): Discord voice messages (🎙️) are auto-transcribed via local `faster-whisper` STT and treated as text input — no audio data leaves the host. Model + device + compute type configurable via `IRIS_WHISPER_MODEL` / `IRIS_WHISPER_DEVICE` / `IRIS_WHISPER_COMPUTE`. Real-time voice-channel chat is Phase 2.2.
 - _(optional)_ Track anime watch lists with MyAnimeList sync
 
 ---
@@ -220,6 +221,7 @@ _iris/
     ├── training.py             # skill_goals + injuries + training_sessions — skill-coach role with injury-aware recommendations
     ├── habits.py               # daily habits + idempotent done-logging + GitHub-style heatmap renderer + cadence-aware reminders
     ├── charts.py               # matplotlib PNG chart embeds (weight / kcal / macros / habit duration / consistency / generic SQL)
+    ├── voice.py                # faster-whisper STT for Discord voice messages (Phase 2.1)
     ├── people.py               # people_upsert (occupation, employer, team, nicknames, email, phone, socials)
     ├── anime.py                # anime list + full MAL OAuth sync (search, ranking, seasonal, user list, push/pull)
     ├── vocab.py                # vocab_upsert, vocab_review (SM-2 spaced repetition)

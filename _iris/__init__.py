@@ -17,6 +17,7 @@ Package layout:
             training.py     # skill goals, injuries, training sessions — injury-aware coaching
             habits.py       # daily habit tracker + GitHub-style heatmap + reminder loop
             charts.py       # matplotlib PNG chart embeds — weight/kcal/macros/habits/generic SQL
+            voice.py        # faster-whisper STT for Discord voice messages (Phase 2.1)
             import_export.py# import_file, mass_import, triage_inbox, summarize_note_with_llm
             links.py        # find_issues, link_candidates, duplicates
             notes.py        # note CRUD, frontmatter, tags, templates
